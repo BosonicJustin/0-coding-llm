@@ -18,11 +18,11 @@ Downloaded SFT data is quarantined until benchmark decontamination, schema
 normalization, length analysis, split construction, and a separate SFT
 publication manifest are complete.
 
-## Live state at 2026-08-30 15:51 UTC
+## Live state at 2026-08-30 15:58 UTC
 
 - `curation-fast-v1` is alive in detached `tmux` on the CPU pod.
-- The curator is in `inventory`: 3,093,946 / 51,328,930 documents (6.0277%),
-  33 archives have completed, and archive 34 is in progress, with no storage
+- The curator is in `inventory`: 3,183,945 / 51,328,930 documents (6.2030%),
+  34 archives have completed, and archive 35 is in progress, with no storage
   violation.
 - Quality/benchmark filtering, exact/normalized canonicalization,
   leakage-safe grouping, split assignment, and quota selection are later
@@ -32,7 +32,12 @@ publication manifest are complete.
 - Raw `nvidia/OpenCodeInstruct` at commit
   `8f3ba5bafe4d6e8db46082cf7ae6741bc370604d` is downloaded under the
   post-training root: 50 Parquet shards, 6,861,113,102 bytes, and 5,000,000
-  metadata-verified rows. It is not yet approved as SFT training input.
+  metadata-verified rows. A streaming SHA-256 inventory completed successfully
+  and published `SOURCE.json` plus `COMPLETION.json`. It is still quarantined
+  and is not yet approved as SFT training input.
+- The public repository is deployed separately at `/workspace/0-coding-llm`
+  on commit `44a365b`; the active curator continues from its original checkout
+  so deployment cannot mutate its running code.
 
 ## Monitoring without mutating state
 

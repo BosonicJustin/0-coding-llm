@@ -793,3 +793,25 @@ The intended first multi-GPU gate and production run use a single RunPod pod
 with six local GPUs, launched as one NCCL process per GPU with
 `torchrun --standalone --nproc-per-node=6`. This is a single-node topology;
 multi-node rendezvous and fault handling are outside the initial experiment.
+
+### OpenCodeInstruct raw snapshot certification
+
+On 2026-08-30 the separate post-training snapshot of
+`nvidia/OpenCodeInstruct@8f3ba5bafe4d6e8db46082cf7ae6741bc370604d`
+was certified in place. The verifier streamed every file and accepted exactly
+50 train Parquet shards, 5,000,000 metadata rows, and 6,861,113,102 compressed
+data bytes. Its per-file inventory identity is
+`aeec9c739bafbf17cbea36399d509eab8e2c73fea7ad99d8c147c2a8d1d2290f`.
+The authoritative `SOURCE.json` SHA-256 is
+`05e01330a6dbf7003e22df3442a4d4d3fd571bca01e0319c17c97bcfabc6ebf6`.
+
+The raw snapshot remains under `/workspace/posttraining-data`, outside every
+pre-training discovery root. Certification proves download identity and
+integrity only; benchmark decontamination, tokenizer-length analysis, schema
+normalization, split construction, and SFT publication remain pending.
+
+The same public commit was cloned to the server in a checkout separate from
+the live curator. In the server's data environment, all 10 SFT downloader tests
+passed. In its PyTorch 2.13 CPU environment, 95 focused loader, trainer,
+launcher, and SFT tests passed with one optional skip. No package was added to
+the active curation environment.
