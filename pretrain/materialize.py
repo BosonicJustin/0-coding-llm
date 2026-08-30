@@ -3105,7 +3105,7 @@ class CorpusMaterializer:
                 selected = int(decision["selected_tokens"])
                 destination = item["destination"]
                 self.destinations[destination].writer.add_document(
-                    token_ids[:selected]
+                    token_ids if selected == len(token_ids) else token_ids[:selected]
                 )
                 start = int(item["logical_stream_start"])
                 language = decision["provenance"].get("language")

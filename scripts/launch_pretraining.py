@@ -22,9 +22,12 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -37,6 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from model import ModelConfig  # noqa: E402
 from pretrain import data as training_data  # noqa: E402
 from pretrain.tokenizer_identity import (  # noqa: E402
     TokenizerIdentityError,
@@ -70,6 +74,12 @@ _EPHEMERAL_FILESYSTEMS = frozenset(
     {"aufs", "devtmpfs", "overlay", "ramfs", "squashfs", "tmpfs"}
 )
 _CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+_PYTHON_HASH_SEED = "0"
+_FP32_BYTES = 4
+_MINIMUM_1P3B_DDP_DEVICE_BYTES = 32 * 1024**3
+_DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 30 * 60
+_STOP_REQUEST_ENVIRONMENT_VARIABLE = "PRETRAIN_STOP_REQUEST_FILE"
+_INTERNAL_SUPERVISOR_FLAG = "--internal-supervise-torchrun"
 _PROTECTED_TRAINER_OPTIONS = frozenset(
     {
         "--checkpoint",
@@ -80,8 +90,10 @@ _PROTECTED_TRAINER_OPTIONS = frozenset(
         "--eval-batches",
         "--eval-every",
         "--global-microbatch-rows",
+        "--graceful-shutdown-timeout-seconds",
         "--gradient-accumulation-steps",
         "--model-size",
+        "--no-activation-checkpointing",
         "--no-eval-at-start",
         "--order-manifest",
         "--precision",
@@ -166,9 +178,27 @@ class RuntimeInspection:
     cuda_devices: int
     world_size: int
     bf16_supported_devices: list[int]
+    cuda_device_profiles: list[dict[str, Any]]
     launcher_module: str
     deterministic_algorithms: bool
     cublas_workspace_config: str
+    python_hash_seed: str
+
+
+@dataclass(frozen=True)
+class ModelMemoryInspection:
+    model_size: str
+    parameter_count: int
+    fp32_parameter_bytes: int
+    fp32_gradient_bytes: int
+    fp32_adam_moment_bytes: int
+    persistent_training_state_bytes: int
+    minimum_device_memory_bytes: int
+    smallest_visible_device_memory_bytes: int
+    smallest_available_device_memory_bytes: int
+    admission_headroom_bytes: int
+    measured_full_topology_smoke_required: bool
+    basis: str
 
 
 def _sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -180,11 +210,22 @@ def _sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def _interpreter_identity() -> dict[str, str]:
-    executable = Path(sys.executable).resolve(strict=True)
-    metadata = executable.stat()
+    # Preserve the invocation path: resolving ``venv/bin/python`` to its base
+    # interpreter bypasses the virtual environment on the subsequent exec and
+    # can silently select a different PyTorch/CUDA installation. ``stat`` and
+    # the content hash still follow the symlink to authenticate the real binary.
+    executable = Path(os.path.abspath(sys.executable))
+    try:
+        resolved_executable = executable.resolve(strict=True)
+        metadata = resolved_executable.stat()
+    except OSError as exc:
+        raise PreflightError(
+            f"Current Python executable cannot be resolved: {executable}: {exc}"
+        ) from exc
     if not stat.S_ISREG(metadata.st_mode):
         raise PreflightError(
-            f"Current Python executable is not a regular file: {executable}"
+            "Current Python executable does not resolve to a regular file: "
+            f"{executable} -> {resolved_executable}"
         )
     implementation = getattr(sys.implementation, "name", "unknown")
     return {
@@ -879,6 +920,12 @@ def inspect_runtime(
             "CUBLAS_WORKSPACE_CONFIG conflicts with deterministic production value "
             f"{_CUBLAS_WORKSPACE_CONFIG!r}: found {configured_workspace!r}"
         )
+    configured_hash_seed = environment.get("PYTHONHASHSEED")
+    if configured_hash_seed not in (None, _PYTHON_HASH_SEED):
+        raise PreflightError(
+            "PYTHONHASHSEED conflicts with deterministic production value "
+            f"{_PYTHON_HASH_SEED!r}: found {configured_hash_seed!r}"
+        )
     nested = sorted(name for name in ("LOCAL_RANK", "RANK", "WORLD_SIZE") if name in environment)
     if nested:
         raise PreflightError(
@@ -911,12 +958,75 @@ def inspect_runtime(
     if not distributed.is_nccl_available():
         raise PreflightError("NCCL is unavailable in this PyTorch build")
     supported: list[int] = []
+    device_profiles: list[dict[str, Any]] = []
     for index in range(devices):
         with torch_module.cuda.device(index):
-            if not torch_module.cuda.is_bf16_supported():
+            if not torch_module.cuda.is_bf16_supported(
+                including_emulation=False
+            ):
                 name = torch_module.cuda.get_device_name(index)
                 raise PreflightError(f"CUDA device {index} ({name}) does not support BF16")
+        try:
+            name = str(torch_module.cuda.get_device_name(index))
+            capability = [
+                int(value)
+                for value in torch_module.cuda.get_device_capability(index)
+            ]
+            properties = torch_module.cuda.get_device_properties(index)
+            total_memory = int(properties.total_memory)
+            multiprocessors = int(properties.multi_processor_count)
+            with torch_module.cuda.device(index):
+                free_memory, allocator_total = torch_module.cuda.mem_get_info()
+            free_memory = int(free_memory)
+            allocator_total = int(allocator_total)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise PreflightError(
+                f"Cannot inspect CUDA device {index} topology and memory: {exc}"
+            ) from exc
+        if len(capability) != 2 or any(value < 0 for value in capability):
+            raise PreflightError(
+                f"CUDA device {index} reported an invalid compute capability: "
+                f"{capability!r}"
+            )
+        if (
+            total_memory < 1
+            or free_memory < 1
+            or allocator_total < 1
+            or free_memory > allocator_total
+            or multiprocessors < 1
+            or not name
+        ):
+            raise PreflightError(
+                f"CUDA device {index} reported invalid hardware properties"
+            )
+        device_profiles.append(
+            {
+                "index": index,
+                "name": name,
+                "compute_capability": capability,
+                "total_memory_bytes": total_memory,
+                "available_memory_bytes": free_memory,
+                "allocator_total_memory_bytes": allocator_total,
+                "multiprocessor_count": multiprocessors,
+            }
+        )
         supported.append(index)
+    hardware_identities = {
+        (
+            profile["name"],
+            tuple(profile["compute_capability"]),
+            profile["total_memory_bytes"],
+            profile["allocator_total_memory_bytes"],
+            profile["multiprocessor_count"],
+        )
+        for profile in device_profiles
+    }
+    if len(hardware_identities) != 1:
+        raise PreflightError(
+            "Visible CUDA devices are heterogeneous; production DDP requires the "
+            "same GPU name, compute capability, physical/allocator-visible VRAM, "
+            f"and SM count: {device_profiles}"
+        )
     return RuntimeInspection(
         python_executable=interpreter["python_executable"],
         python_executable_sha256=interpreter["python_executable_sha256"],
@@ -927,9 +1037,102 @@ def inspect_runtime(
         cuda_devices=devices,
         world_size=nproc_per_node,
         bf16_supported_devices=supported,
+        cuda_device_profiles=device_profiles,
         launcher_module="torch.distributed.run",
         deterministic_algorithms=True,
         cublas_workspace_config=_CUBLAS_WORKSPACE_CONFIG,
+        python_hash_seed=_PYTHON_HASH_SEED,
+    )
+
+
+def inspect_model_memory(
+    runtime: RuntimeInspection,
+    *,
+    model_size: str,
+    vocab_size: int,
+    max_seq_len: int,
+) -> ModelMemoryInspection:
+    """Reject a topology that cannot hold the replicated FP32 AdamW state.
+
+    This is deliberately only an admission floor.  Activations, FlexAttention,
+    CUDA graphs/compiler workspaces, the first DDP bucket construction, and the
+    fused optimizer's peak temporaries depend on the frozen batch geometry and
+    selected PyTorch/CUDA build.  A measured full-topology smoke remains a
+    separate launch gate.
+    """
+
+    if model_size not in ("tiny", "1.3b"):
+        raise PreflightError(f"Unsupported model size for memory inspection: {model_size}")
+    if not _is_plain_int(vocab_size, minimum=1) or not _is_plain_int(
+        max_seq_len, minimum=1
+    ):
+        raise PreflightError("Model vocabulary and sequence length must be positive")
+    if not runtime.cuda_device_profiles:
+        raise PreflightError("Runtime inspection contains no CUDA device profiles")
+    if model_size == "1.3b":
+        model_config = ModelConfig(
+            vocab_size=vocab_size,
+            max_seq_len=max_seq_len,
+            activation_checkpointing=True,
+        )
+        admission_floor = _MINIMUM_1P3B_DDP_DEVICE_BYTES
+    else:
+        # Mirrors ``pretrain.train.tiny_model_config`` without importing the
+        # training entry point into the fail-fast launcher.
+        model_config = ModelConfig(
+            vocab_size=vocab_size,
+            dim=32,
+            hidden_dim=88,
+            n_layers=2,
+            n_heads=4,
+            n_kv_heads=2,
+            max_seq_len=max_seq_len,
+            loss_chunk_size=min(32, max_seq_len),
+        )
+        admission_floor = 0
+    parameter_count = model_config.expected_parameter_count
+    parameter_bytes = parameter_count * _FP32_BYTES
+    gradient_bytes = parameter_bytes
+    adam_moment_bytes = 2 * parameter_bytes
+    persistent_bytes = parameter_bytes + gradient_bytes + adam_moment_bytes
+    minimum_device_bytes = max(admission_floor, persistent_bytes)
+    smallest_device = min(
+        int(profile["total_memory_bytes"])
+        for profile in runtime.cuda_device_profiles
+    )
+    smallest_available = min(
+        int(profile["available_memory_bytes"])
+        for profile in runtime.cuda_device_profiles
+    )
+    if (
+        smallest_device < minimum_device_bytes
+        or smallest_available < minimum_device_bytes
+    ):
+        raise PreflightError(
+            f"{model_size} replicated DDP is not admitted on the visible GPUs: "
+            f"smallest device has {smallest_device} total and {smallest_available} "
+            f"currently available bytes, but the FP32 model, "
+            f"gradients, and Adam moments require {persistent_bytes} persistent "
+            f"bytes and the production admission floor is {minimum_device_bytes} "
+            "bytes before geometry-dependent activation/workspace peaks"
+        )
+    return ModelMemoryInspection(
+        model_size=model_size,
+        parameter_count=parameter_count,
+        fp32_parameter_bytes=parameter_bytes,
+        fp32_gradient_bytes=gradient_bytes,
+        fp32_adam_moment_bytes=adam_moment_bytes,
+        persistent_training_state_bytes=persistent_bytes,
+        minimum_device_memory_bytes=minimum_device_bytes,
+        smallest_visible_device_memory_bytes=smallest_device,
+        smallest_available_device_memory_bytes=smallest_available,
+        admission_headroom_bytes=smallest_available - persistent_bytes,
+        measured_full_topology_smoke_required=True,
+        basis=(
+            "FP32 parameters + FP32 gradients + two FP32 Adam moments; the "
+            "1.3B path additionally requires at least 32 GiB physical VRAM per "
+            "replica. This is not a substitute for the frozen-geometry smoke."
+        ),
     )
 
 
@@ -1194,6 +1397,7 @@ def render_torchrun_command(
         "--standalone",
         "--nnodes=1",
         f"--nproc-per-node={runtime.world_size}",
+        "--max-restarts=0",
         "-m",
         "pretrain.train",
         "--order-manifest",
@@ -1224,6 +1428,11 @@ def render_torchrun_command(
         "--wandb-project",
         wandb_project,
     ]
+    if model_size == "1.3b":
+        # The memory admission model and accepted production geometry both
+        # assume whole-block activation checkpointing. Do not leave this as an
+        # implicit model-size default that a passthrough flag could reverse.
+        command.append("--activation-checkpointing")
     if eval_at_start:
         command.append("--eval-at-start")
     if checkpoint.resume_path is not None:
@@ -1242,17 +1451,196 @@ def render_torchrun_command(
     return command
 
 
-def exec_torchrun(command: Sequence[str], environment: Mapping[str, str]) -> None:
-    """Replace this process so PID/PID1 signals reach torchrun and its workers."""
+def _publish_stop_request(path: Path, signum: int) -> None:
+    """Atomically publish one supervisor-to-worker stop request."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(f"{int(signum)}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _terminate_torchrun(process: subprocess.Popen[Any]) -> int:
+    """Give TorchElastic its normal cleanup window, then kill its whole session.
+
+    The child is always a session/process-group leader because it was started
+    with ``start_new_session=True``. If TorchElastic itself is wedged, killing
+    only that parent would orphan its worker ranks and their checkpoint lease.
+    """
+
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return int(process.wait())
+    try:
+        return int(process.wait(timeout=35))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return int(process.wait())
+
+
+def supervise_torchrun(
+    command: Sequence[str],
+    environment: Mapping[str, str],
+    *,
+    graceful_shutdown_timeout_seconds: int,
+) -> int:
+    """Keep torchrun alive while workers finish a potentially large checkpoint.
+
+    TorchElastic's own signal shutdown waits only about 30 seconds before it
+    SIGKILLs workers. A mature replicated 1.3B checkpoint written to network
+    storage can legitimately take longer. This supervisor consumes the pod's
+    signal, publishes it through a rank-shared local request file, and lets the
+    trainer ranks stop collectively at a clean optimizer boundary. Only after
+    the explicit grace period does it terminate torchrun itself.
+    """
 
     if not command:
         raise PreflightError("Cannot execute an empty launch command")
-    executable = command[0]
+    if not _is_plain_int(graceful_shutdown_timeout_seconds, minimum=1):
+        raise PreflightError("graceful shutdown timeout must be a positive integer")
+    requested_signal = 0
+    previous_handlers: dict[int, Any] = {}
+
+    def request_stop(signum: int, frame: Any) -> None:
+        nonlocal requested_signal
+        del frame
+        if requested_signal == 0:
+            requested_signal = int(signum)
+
+    handled = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        handled.append(signal.SIGHUP)
+    if hasattr(signal, "SIGUSR1"):
+        handled.append(signal.SIGUSR1)
+    with tempfile.TemporaryDirectory(prefix="pretrain-torchrun-supervisor-") as root:
+        stop_request = Path(root) / "stop-request"
+        child_environment = dict(environment)
+        child_environment[_STOP_REQUEST_ENVIRONMENT_VARIABLE] = str(stop_request)
+        for signum in handled:
+            value = int(signum)
+            previous_handlers[value] = signal.getsignal(signum)
+            signal.signal(signum, request_stop)
+        try:
+            try:
+                # Isolate torchrun from terminal-generated process-group
+                # signals. The supervisor alone receives them and grants the
+                # workers enough time to checkpoint through the request file.
+                process = subprocess.Popen(
+                    list(command),
+                    env=child_environment,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise PreflightError(
+                    f"Cannot start validated launcher {command[0]}: {exc}"
+                ) from exc
+            request_published = False
+            shutdown_deadline: float | None = None
+            forced_shutdown = False
+            while True:
+                try:
+                    return_code = process.wait(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if requested_signal and not request_published:
+                    try:
+                        _publish_stop_request(stop_request, requested_signal)
+                    except OSError as exc:
+                        _terminate_torchrun(process)
+                        raise PreflightError(
+                            f"Cannot publish graceful stop request: {exc}"
+                        ) from exc
+                    request_published = True
+                    shutdown_deadline = (
+                        time.monotonic() + graceful_shutdown_timeout_seconds
+                    )
+                if (
+                    shutdown_deadline is not None
+                    and time.monotonic() >= shutdown_deadline
+                ):
+                    forced_shutdown = True
+                    print(
+                        "warning: graceful preemption deadline expired; terminating "
+                        "torchrun and allowing its final worker-kill fallback",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return_code = _terminate_torchrun(process)
+                    break
+            if requested_signal:
+                if forced_shutdown:
+                    print(
+                        "warning: graceful-stop checkpoint may not have completed",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                return 128 + requested_signal
+            return int(return_code)
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+
+
+def exec_clean_supervisor(
+    *,
+    python_executable: str,
+    command: Sequence[str],
+    environment: Mapping[str, str],
+    graceful_shutdown_timeout_seconds: int,
+) -> None:
+    """Exec a fresh, CUDA-context-free copy that supervises torchrun.
+
+    Production preflight necessarily queries every GPU. Keeping that process
+    alive as the supervisor would also keep its CUDA contexts resident on all
+    training devices. ``exec`` releases those contexts while preserving the
+    launcher PID and the exact validated command/environment.
+    """
+
+    argv = [
+        python_executable,
+        str(Path(__file__).resolve()),
+        _INTERNAL_SUPERVISOR_FLAG,
+        str(graceful_shutdown_timeout_seconds),
+        "--",
+        *command,
+    ]
     try:
-        os.execvpe(executable, list(command), dict(environment))
+        os.execvpe(python_executable, argv, dict(environment))
     except OSError as exc:
-        raise PreflightError(f"Cannot exec validated launcher {executable}: {exc}") from exc
+        raise PreflightError(
+            f"Cannot exec clean pre-training supervisor {python_executable}: {exc}"
+        ) from exc
     raise AssertionError("os.execvpe unexpectedly returned")
+
+
+def _internal_supervisor_main(argv: Sequence[str]) -> int:
+    if len(argv) < 3 or argv[1] != "--":
+        raise PreflightError("Invalid internal supervisor invocation")
+    try:
+        timeout = int(argv[0])
+    except ValueError as exc:
+        raise PreflightError("Invalid internal supervisor timeout") from exc
+    return supervise_torchrun(
+        argv[2:],
+        os.environ,
+        graceful_shutdown_timeout_seconds=timeout,
+    )
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1308,6 +1696,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-size", choices=("tiny", "1.3b"), default="1.3b")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--checkpoint-every", type=int, required=True)
+    parser.add_argument(
+        "--graceful-shutdown-timeout-seconds",
+        type=int,
+        default=_DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+        help=(
+            "time allowed for all ranks to finish a clean-boundary preemption "
+            "checkpoint before torchrun is terminated"
+        ),
+    )
     parser.add_argument("--eval-every", type=int, required=True)
     parser.add_argument("--eval-batches", type=int, required=True)
     parser.add_argument(
@@ -1345,6 +1742,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise PreflightError("workers must be non-negative")
         if args.checkpoint_every < 1:
             raise PreflightError("checkpoint_every must be positive for production")
+        if args.graceful_shutdown_timeout_seconds < 1:
+            raise PreflightError(
+                "graceful_shutdown_timeout_seconds must be positive"
+            )
         if args.eval_every < 1:
             raise PreflightError("eval_every must be positive for production")
         if not args.wandb_project.strip():
@@ -1371,6 +1772,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_split="validation",
             local_data_root=args.local_data_root,
             global_microbatch_rows=train_order.geometry["global_microbatch_rows"],
+        )
+        model_memory = inspect_model_memory(
+            runtime,
+            model_size=args.model_size,
+            vocab_size=train_order.vocab_size,
+            max_seq_len=train_order.sequence_length,
         )
         validate_order_pair(
             train_order,
@@ -1461,10 +1868,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "validation": validation_evidence,
             },
             "runtime": asdict(runtime),
+            "model_memory": asdict(model_memory),
             "process_handoff": {
-                "strategy": "execvpe",
+                "strategy": "exec-clean-supervisor-then-isolated-torchrun",
                 "preserves_launcher_pid": True,
-                "signal_forwarding_wrapper": False,
+                "signal_forwarding_wrapper": True,
+                "preflight_cuda_contexts_survive": False,
+                "graceful_shutdown_timeout_seconds": (
+                    args.graceful_shutdown_timeout_seconds
+                ),
+                "reason": (
+                    "torchrun's approximately 30-second worker shutdown timeout "
+                    "can be shorter than a mature durable checkpoint"
+                ),
             },
             "storage": {
                 "local_data": asdict(local_mount),
@@ -1502,16 +1918,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         launch_environment = dict(os.environ)
         launch_environment["CUBLAS_WORKSPACE_CONFIG"] = _CUBLAS_WORKSPACE_CONFIG
+        launch_environment["PYTHONHASHSEED"] = _PYTHON_HASH_SEED
         launch_environment["WANDB_MODE"] = args.wandb_mode
         if args.wandb_mode != "disabled":
             launch_environment["WANDB_DIR"] = str(Path(checkpoint.checkpoint).parent)
         os.chdir(PROJECT_ROOT)
-        exec_torchrun(command, launch_environment)
-        raise AssertionError("exec_torchrun unexpectedly returned")
+        exec_clean_supervisor(
+            python_executable=runtime.python_executable,
+            command=command,
+            environment=launch_environment,
+            graceful_shutdown_timeout_seconds=(
+                args.graceful_shutdown_timeout_seconds
+            ),
+        )
+        raise AssertionError("exec_clean_supervisor unexpectedly returned")
     except PreflightError as exc:
         parser.error(str(exc))
     return 2
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == _INTERNAL_SUPERVISOR_FLAG:
+        try:
+            result = _internal_supervisor_main(sys.argv[2:])
+        except PreflightError as exc:
+            print(f"internal supervisor error: {exc}", file=sys.stderr, flush=True)
+            result = 2
+        raise SystemExit(result)
     raise SystemExit(main())

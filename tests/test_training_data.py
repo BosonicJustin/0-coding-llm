@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import copy
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -157,6 +159,54 @@ class PackedShardTest(unittest.TestCase):
             self.assertEqual(batch["labels"].tolist(), [[0, 8, 9, 10]])
             self.assertEqual(batch["document_ids"].tolist(), [[0, 0, 0, 0]])
 
+    def test_writer_token_validation_fast_and_fallback_paths_fail_closed(self) -> None:
+        invalid_documents = (
+            ([-1, 2], ValueError, "outside"),
+            (np.asarray([1, 256], dtype=np.int64), ValueError, "outside"),
+            ([1, 2.0], TypeError, "must be an integer"),
+            (np.asarray([1, "2"], dtype=object), TypeError, "must be an integer"),
+            ([[1, 2], [3, 4]], TypeError, "must be an integer"),
+            ([np.bool_(True), 2], TypeError, "must be an integer"),
+            ([torch.tensor(1), 2], TypeError, "must be an integer"),
+            (
+                np.ma.array([1, 2], mask=[False, True]),
+                TypeError,
+                "must be an integer",
+            ),
+            (np.asmatrix([[1, 2, 3]]), TypeError, "must be an integer"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index, (document, exception, pattern) in enumerate(invalid_documents):
+                writer = self._resumable_writer(root / str(index))
+                with self.assertRaisesRegex(exception, pattern):
+                    writer.add_document(document)
+                writer._close_temporary_shard(remove=True)
+
+            valid = self._resumable_writer(root / "valid")
+            # bool is an int subclass and was accepted by the scalar writer;
+            # retain that behavior while normalizing it to uint16/Python int.
+            valid.add_document([True, np.int64(2), 3])
+            manifest = valid.finish()
+            self.assertEqual(manifest["documents"], 1)
+
+    def test_exact_python_int_list_avoids_numpy_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            writer = self._resumable_writer(
+                Path(temporary) / "python",
+                sequence_length=32,
+                vocab_size=1_000,
+            )
+            # Keep the document below one packed row so this observes only
+            # input normalization; row serialization legitimately uses NumPy.
+            with mock.patch(
+                "pretrain.data.np.asarray",
+                side_effect=AssertionError("exact-int list was coerced"),
+            ):
+                writer.add_document([257, 258, 259])
+            self.assertEqual(writer._tokens, [257, 258, 259, 0])
+            writer.finish()
+
     def test_long_document_rows_overlap_only_at_target_input_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "python"
@@ -190,6 +240,46 @@ class PackedShardTest(unittest.TestCase):
                 handle.write(b"x")
             with self.assertRaisesRegex(IOError, "Size mismatch"):
                 validate_packed_manifest(manifest_path)
+            # The high-throughput loader normally skips full SHA-256 scans,
+            # but it must still fail on cheap structural corruption rather
+            # than letting np.memmap silently ignore appended bytes.
+            with self.assertRaisesRegex(IOError, "Size mismatch"):
+                PackedShardDataset(manifest_path, verify_checksums=False)
+
+    def test_dataset_rechecks_payload_size_when_a_worker_first_opens_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = build_domain(root, "python", 2)
+            dataset = PackedShardDataset(manifest_path, verify_checksums=False)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            tokens_path = manifest_path.parent / manifest["shards"][0]["tokens"]["path"]
+            with tokens_path.open("ab") as handle:
+                handle.write(b"xx")
+            with self.assertRaisesRegex(IOError, "Size mismatch"):
+                dataset[0]
+            dataset.close()
+
+    def test_packed_manifest_rejects_noncanonical_paths_and_duplicate_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest_path = build_domain(root, "python", 2)
+            original = manifest_path.read_text(encoding="utf-8")
+            manifest = json.loads(original)
+            manifest["shards"][0]["tokens"]["path"] = "../escaped.tokens.bin"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Non-canonical token shard path"):
+                validate_packed_manifest(manifest_path, verify_checksums=False)
+
+            manifest_path.write_text(
+                original.replace(
+                    '"domain": "python"',
+                    '"domain": "python", "domain": "english"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Duplicate JSON key 'domain'"):
+                validate_packed_manifest(manifest_path, verify_checksums=False)
 
     def test_writer_refuses_nonempty_destination(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -271,6 +361,160 @@ class PackedShardTest(unittest.TestCase):
             )
             self.assertFalse((resumed_output / ".packing-journal.json").exists())
             validate_packed_manifest(resumed_output / "manifest.json")
+
+    def test_vectorized_row_drain_is_byte_identical_to_scalar_oracle(self) -> None:
+        documents = [
+            [1],
+            [2, 3, 4, 5, 6, 7, 8],
+            [9, 0, 10],
+            list(range(11, 54)),
+            [54, 55],
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scalar_output = root / "scalar"
+            vector_output = root / "vector"
+            scalar = self._resumable_writer(
+                scalar_output,
+                sequence_length=7,
+                rows_per_shard=5,
+            )
+            vector = self._resumable_writer(
+                vector_output,
+                sequence_length=7,
+                rows_per_shard=5,
+            )
+            scalar._drain_batch_rows = 1
+            vector._drain_batch_rows = 256
+            for index, document in enumerate(documents):
+                cursor = {"source": "fixture", "next_document": index + 1}
+                scalar.add_document(document, source_cursor=cursor)
+                vector.add_document(document, source_cursor=cursor)
+            self.assertEqual(scalar.finish(), vector.finish())
+            self.assertEqual(
+                self._directory_bytes(scalar_output),
+                self._directory_bytes(vector_output),
+            )
+            validate_packed_manifest(vector_output / "manifest.json")
+
+    def test_row_drain_batch_size_may_change_across_exact_resume(self) -> None:
+        rng = np.random.default_rng(20260830)
+        documents = [
+            rng.integers(1, 255, size=size, dtype=np.uint16).tolist()
+            for size in (900, 3, 177, 41, 1200, 2, 319)
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline_output = root / "baseline"
+            baseline = self._resumable_writer(
+                baseline_output,
+                sequence_length=17,
+                rows_per_shard=7,
+            )
+            for index, document in enumerate(documents):
+                baseline.add_document(
+                    document,
+                    source_cursor={"source": "fixture", "next_document": index + 1},
+                )
+            baseline.finish()
+            expected = self._directory_bytes(baseline_output)
+
+            for initial_batch, resumed_batch in ((1, 256), (256, 1)):
+                with self.subTest(
+                    initial_batch=initial_batch,
+                    resumed_batch=resumed_batch,
+                ):
+                    output = root / f"resume-{initial_batch}-{resumed_batch}"
+
+                    class ForcedInterruption(RuntimeError):
+                        pass
+
+                    with self.assertRaises(ForcedInterruption):
+                        with self._resumable_writer(
+                            output,
+                            sequence_length=17,
+                            rows_per_shard=7,
+                        ) as interrupted:
+                            interrupted._drain_batch_rows = initial_batch
+                            for index, document in enumerate(documents[:3]):
+                                interrupted.add_document(
+                                    document,
+                                    source_cursor={
+                                        "source": "fixture",
+                                        "next_document": index + 1,
+                                    },
+                                )
+                            for document in documents[3:5]:
+                                interrupted.add_document(document)
+                            raise ForcedInterruption("synthetic process death")
+
+                    resumed = self._resumable_writer(
+                        output,
+                        resume=True,
+                        sequence_length=17,
+                        rows_per_shard=7,
+                    )
+                    resumed._drain_batch_rows = resumed_batch
+                    self.assertEqual(
+                        resumed.source_cursor,
+                        {"source": "fixture", "next_document": 3},
+                    )
+                    for index, document in enumerate(documents[3:], start=3):
+                        resumed.add_document(
+                            document,
+                            source_cursor={
+                                "source": "fixture",
+                                "next_document": index + 1,
+                            },
+                        )
+                    resumed.finish()
+                    self.assertEqual(self._directory_bytes(output), expected)
+                    validate_packed_manifest(output / "manifest.json")
+
+    def test_clean_open_shard_skips_redundant_payload_fsyncs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "python"
+            writer = self._resumable_writer(output, rows_per_shard=100)
+            writer.add_document(list(range(1, 9)))
+            with mock.patch("pretrain.data.os.fsync", wraps=os.fsync) as fsync:
+                writer._sync_open_shard()
+                self.assertEqual(fsync.call_count, 2)
+                writer._sync_open_shard()
+                self.assertEqual(fsync.call_count, 2)
+            writer.finish()
+
+    def test_failed_payload_fsync_cannot_advance_durable_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "python"
+            writer = self._resumable_writer(output, rows_per_shard=100)
+            writer.add_document(list(range(1, 9)))
+            journal = output / ".packing-journal.json"
+            original_journal = journal.read_bytes()
+            calls = 0
+            real_fsync = os.fsync
+
+            def fail_second(descriptor: int) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("synthetic starts fsync failure")
+                real_fsync(descriptor)
+
+            with mock.patch("pretrain.data.os.fsync", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "synthetic starts fsync failure"):
+                    writer.checkpoint(
+                        {"source": "fixture", "next_document": 1}
+                    )
+            self.assertTrue(writer._open_shard_dirty)
+            self.assertEqual(journal.read_bytes(), original_journal)
+            self.assertIsNone(writer.source_cursor)
+            writer.checkpoint({"source": "fixture", "next_document": 1})
+            self.assertFalse(writer._open_shard_dirty)
+            self.assertEqual(
+                writer.source_cursor,
+                {"source": "fixture", "next_document": 1},
+            )
+            writer.finish()
 
     def test_resume_fails_closed_on_construction_identity_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -468,6 +712,33 @@ class PackedShardTest(unittest.TestCase):
                 handle.write(np.asarray([9], dtype="<u2").tobytes())
             with self.assertRaisesRegex(ValueError, "not preceded by EOS"):
                 validate_packed_manifest(manifest_path, verify_checksums=False)
+
+    def test_collator_performs_online_boundary_and_padding_validation(self) -> None:
+        row = {
+            "tokens": np.asarray([10, 11, 0, 20, 21], dtype="<u2"),
+            "starts": np.asarray([0b00001001], dtype=np.uint8),
+            "domain_id": 0,
+            "row_id": 0,
+            "sample_reference": 0,
+        }
+        collator = PackedBatchCollator(4, vocab_size=100, eos_token_id=0)
+        batch = collator([row])
+        self.assertEqual(batch["labels"].tolist(), [[11, 0, IGNORE_INDEX, 21]])
+
+        bad_boundary = {**row, "starts": np.asarray([0b00000101], dtype=np.uint8)}
+        with self.assertRaisesRegex(ValueError, "not preceded by EOS"):
+            collator([bad_boundary])
+
+        bad_padding = {**row, "starts": np.asarray([0b10001001], dtype=np.uint8)}
+        with self.assertRaisesRegex(ValueError, "unused segment-start bits"):
+            collator([bad_padding])
+
+        bad_token = {
+            **row,
+            "tokens": np.asarray([100, 11, 0, 20, 21], dtype="<u2"),
+        }
+        with self.assertRaisesRegex(ValueError, "outside the vocabulary"):
+            collator([bad_token])
 
 
 class TrainingOrderTest(unittest.TestCase):
@@ -864,6 +1135,40 @@ class TrainingOrderTest(unittest.TestCase):
                     root / "order" / "manifest.json", global_microbatch_rows=2
                 )
 
+    def test_fast_loader_rejects_same_size_boundary_corruption_online(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifests = build_three_domains(root / "packed")
+            build_training_order(manifests, root / "order", seed=1)
+
+            python_manifest = json.loads(
+                manifests["python"].read_text(encoding="utf-8")
+            )
+            starts_path = (
+                manifests["python"].parent
+                / python_manifest["shards"][0]["starts"]["path"]
+            )
+            original_size = starts_path.stat().st_size
+            with starts_path.open("r+b") as handle:
+                first = handle.read(1)[0]
+                handle.seek(0)
+                handle.write(bytes([first | 0x80]))
+            self.assertEqual(starts_path.stat().st_size, original_size)
+
+            loader, sampler = create_training_dataloader(
+                root / "order" / "manifest.json",
+                global_microbatch_rows=2,
+                num_workers=0,
+                pin_memory=False,
+                verify_payload_checksums=False,
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "unused segment-start bits"):
+                    list(loader)
+            finally:
+                sampler.close()
+                loader.dataset.close()
+
     def test_resume_state_binds_every_data_identity_and_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1009,6 +1314,87 @@ class TrainingOrderTest(unittest.TestCase):
             self.assertEqual(state["completed_global_microbatches"], 1)
             self.assertEqual(state["dropped_rows"], 2)
 
+    def test_six_rank_global_shuffle_and_restart_cover_exact_order_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            counts = {"python": 12, "other_code": 12, "english": 6}
+            manifests = {
+                domain: build_domain(root / "packed", domain, counts[domain])
+                for domain in DOMAIN_ORDER
+            }
+            build_training_order(
+                manifests,
+                root / "order",
+                seed=2026,
+                expected_weights={
+                    "python": 0.4,
+                    "other_code": 0.4,
+                    "english": 0.2,
+                },
+                frozen_global_microbatch_rows=6,
+                frozen_gradient_accumulation_steps=2,
+            )
+            order_manifest = root / "order" / "manifest.json"
+            order = np.fromfile(root / "order" / "order.bin", dtype="<u8")
+
+            samplers = [
+                DistributedBatchSampler(
+                    order_manifest,
+                    global_microbatch_rows=6,
+                    gradient_accumulation_steps=2,
+                    rank=rank,
+                    world_size=6,
+                )
+                for rank in range(6)
+            ]
+            try:
+                rank_batches = [list(sampler) for sampler in samplers]
+                self.assertEqual({len(batches) for batches in rank_batches}, {4})
+                for batch_index in range(4):
+                    rank_slices = [
+                        set(rank_batches[rank][batch_index]) for rank in range(6)
+                    ]
+                    self.assertTrue(
+                        all(
+                            rank_slices[left].isdisjoint(rank_slices[right])
+                            for left in range(6)
+                            for right in range(left + 1, 6)
+                        )
+                    )
+                    observed = set().union(*rank_slices)
+                    expected = set(
+                        int(value)
+                        for value in order[
+                            batch_index * 6 : (batch_index + 1) * 6
+                        ]
+                    )
+                    self.assertEqual(observed, expected)
+
+                state = samplers[0].state_dict(completed_global_microbatches=2)
+                self.assertEqual(state["world_size"], 6)
+                self.assertEqual(state["next_order_row"], 12)
+            finally:
+                for sampler in samplers:
+                    sampler.close()
+
+            restarted = [
+                DistributedBatchSampler(
+                    order_manifest,
+                    global_microbatch_rows=6,
+                    gradient_accumulation_steps=2,
+                    rank=rank,
+                    world_size=6,
+                    resume_state=state,
+                )
+                for rank in range(6)
+            ]
+            try:
+                for rank, sampler in enumerate(restarted):
+                    self.assertEqual(list(sampler), rank_batches[rank][2:])
+            finally:
+                for sampler in restarted:
+                    sampler.close()
+
     def test_dataloader_uses_order_and_emits_complete_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1050,6 +1436,75 @@ class TrainingOrderTest(unittest.TestCase):
             )
             batch = next(iter(loader))
             self.assertEqual(tuple(batch["input_ids"].shape), (5, 4))
+
+    @unittest.skipIf(
+        sys.platform == "darwin",
+        "sandboxed macOS blocks PyTorch's torch_shm_manager; production is Linux",
+    )
+    def test_prefetched_worker_batches_are_discarded_on_exact_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            counts = {"python": 12, "other_code": 12, "english": 6}
+            manifests = {
+                domain: build_domain(root / "packed", domain, counts[domain])
+                for domain in DOMAIN_ORDER
+            }
+            build_training_order(
+                manifests,
+                root / "order",
+                seed=73,
+                frozen_global_microbatch_rows=6,
+                frozen_gradient_accumulation_steps=2,
+            )
+            order_manifest = root / "order" / "manifest.json"
+            order = np.fromfile(root / "order" / "order.bin", dtype="<u8")
+
+            loader, sampler = create_training_dataloader(
+                order_manifest,
+                global_microbatch_rows=6,
+                gradient_accumulation_steps=2,
+                num_workers=2,
+                pin_memory=False,
+                prefetch_factor=2,
+                persistent_workers=True,
+            )
+            iterator = iter(loader)
+            try:
+                next(iterator)
+                next(iterator)
+                # Workers are permitted to have requested later batches. The
+                # durable cursor records only optimizer-consumed microbatches.
+                state = sampler.state_dict(completed_global_microbatches=2)
+            finally:
+                shutdown = getattr(iterator, "_shutdown_workers", None)
+                if shutdown is not None:
+                    shutdown()
+                sampler.close()
+                loader.dataset.close()
+
+            resumed_loader, resumed_sampler = create_training_dataloader(
+                order_manifest,
+                global_microbatch_rows=6,
+                gradient_accumulation_steps=2,
+                resume_state=state,
+                num_workers=2,
+                pin_memory=False,
+                prefetch_factor=2,
+                persistent_workers=True,
+            )
+            resumed_iterator = iter(resumed_loader)
+            try:
+                resumed_batch = next(resumed_iterator)
+                np.testing.assert_array_equal(
+                    resumed_batch["sample_references"].numpy(),
+                    order[12:18].astype(np.int64),
+                )
+            finally:
+                shutdown = getattr(resumed_iterator, "_shutdown_workers", None)
+                if shutdown is not None:
+                    shutdown()
+                resumed_sampler.close()
+                resumed_loader.dataset.close()
 
 
 if __name__ == "__main__":

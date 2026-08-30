@@ -4,6 +4,22 @@
 It consumes only immutable packed batches from `pretrain.data`; raw archives,
 text filtering, tokenization, and packing never occur in the hot training path.
 
+## Training environment
+
+Install the CUDA-matched PyTorch wheel for the selected GPU image, then install
+the standalone training requirements:
+
+```bash
+pip install -r requirements-train.txt
+python -c "import model, pretrain.data, pretrain.train, pretrain.tokenizer_identity; from tokenizers import Tokenizer"
+python scripts/launch_pretraining.py --help >/dev/null
+```
+
+`tokenizers` is a required training dependency, not merely a preprocessing
+dependency: production preflight and every trainer rank authenticate the frozen
+token-to-ID mapping before allocating the model. `requirements-data.txt` is
+only needed on hosts that curate or materialize data.
+
 ## Correctness invariants
 
 - Packed rows remain attention-isolated by `document_ids`; physical batch rows
@@ -72,13 +88,16 @@ than ambiguously migrated.
 gates. The first runs the production DDP wrapper with two accumulated
 microbatches and different supervised-token counts on each rank, then proves
 synchronized replicas, optimizer state, counters, global metrics, and
-numerical equivalence to a single-process global-batch reference. The second
-runs an uninterrupted two-update format-v4 order alongside a step-one atomic
-checkpoint; it terminates both workers, starts two fresh workers, restores the
-rank RNG states and immutable-order cursor, and requires bit-for-bit identical
-final models, optimizer state, counters, metrics, RNG states, and next-row
-position. These tests need permission to bind a localhost Gloo socket; a
-restricted sandbox may block them even though they use `file://` rendezvous.
+numerical equivalence to a single-process global-batch reference. Both gates
+enable the same non-reentrant whole-block activation checkpointing used by the
+1.3B path, so its interaction with DDP `no_sync()` is covered as well. The
+second runs an uninterrupted two-update format-v4 order alongside a step-one
+atomic checkpoint; it terminates both workers, starts two fresh workers,
+restores the rank RNG states and immutable-order cursor, and requires
+bit-for-bit identical final models, optimizer state, counters, metrics, RNG
+states, and next-row position. These tests need permission to bind a localhost
+Gloo socket; a restricted sandbox may block them even though they use
+`file://` rendezvous.
 
 The harness supports FP32 and BF16 autocast. FP16 is intentionally rejected:
 summed-token accumulation needs a carefully tested dynamic-loss-scaling and
@@ -103,6 +122,12 @@ Artifacts are written to `runs/overfit-single-chunk/`:
 - `checkpoint.pt`: a resumable full-state checkpoint;
 - `result.json`: initial/final loss, ratio, model configuration, batch hash,
   parameter count, and data identity.
+
+`result.json` is replaced with `status: running` before optimization begins, so
+an interrupted rerun cannot leave an older passing artifact behind. A completed
+acceptance failure is persisted with `status: failed` and explicit failure
+codes, and the command exits nonzero. Only `status: passed` is acceptable
+evidence for the production gate.
 
 Exercise one fixed batch from the real packed corpus on a GPU with the small
 debug architecture first:
@@ -228,8 +253,17 @@ are proven:
   payload has its recorded byte size; the local-data path is an explicitly
   read-only mount so no writer can change an mmap payload after preflight;
 - visible CUDA devices exactly equal `--nproc-per-node`, NCCL is available,
-  every device supports BF16, and the frozen global microbatch is divisible by
-  world size;
+  every device supports native (non-emulated) BF16, all replicas have the same
+  GPU name, compute capability, VRAM, and SM count, and the frozen global
+  microbatch is divisible by world size;
+- the FP32 1.3B DDP replica passes a 32 GiB-per-device admission floor. Its
+  parameters, gradients, and two Adam moments alone occupy 20,536,918,016 bytes
+  per GPU before activations, compiler/FlexAttention workspaces, and first-step
+  DDP/optimizer peaks. Both physical and currently available memory must clear
+  the floor; passing it does not replace the measured frozen-geometry memory
+  smoke. The launcher explicitly enables whole-block activation checkpointing
+  for this path and forbids a passthrough that disables it because this memory
+  model depends on it;
 - the checkpoint is under an explicit durable root on a different filesystem
   device from the local packed copy, and at least twice the measured checkpoint
   generation upper bound is free;
@@ -251,17 +285,32 @@ copy, remount, payload metadata change, or validator-code change requires fresh
 certification. A dry run may show missing evidence; `--execute` may not.
 
 The interpreter is part of that identity: receipts and preflight reports record
-the resolved Python executable and its SHA-256. The command is always
-`<that-python> -m torch.distributed.run ...`; a different `torchrun` earlier on
-`PATH` cannot select an uncertified Python/PyTorch/CUDA environment. On execute,
-the wrapper replaces itself with that process. This preserves the launcher PID,
-so scheduler or container signals reach torchrun instead of leaving workers
-orphaned behind an exited wrapper.
+the virtual-environment Python invocation path and the SHA-256 of its resolved
+binary. Preserving the invocation path is essential: executing only the base
+binary behind `venv/bin/python` would bypass the certified environment. The
+command is always `<that-python> -m torch.distributed.run ...`; a different
+`torchrun` earlier on `PATH` cannot select an uncertified
+Python/PyTorch/CUDA environment. Execution
+executes a fresh copy of the production launcher as the supervisor, preserving
+its PID while releasing every CUDA context used during GPU preflight, and then
+starts torchrun in a separate session with restarts disabled. On `SIGHUP`,
+`SIGINT`, `SIGTERM`, or `SIGUSR1`, the supervisor writes a rank-shared local
+stop request instead of terminating
+torchrun immediately. Every rank then finishes the current optimizer update and
+the durable checkpoint collectively. This avoids TorchElastic's approximately
+30-second worker-shutdown fallback killing a legitimate large network-volume
+checkpoint; the default supervisor grace period is 30 minutes and can be
+changed with `--graceful-shutdown-timeout-seconds`. The pod/container's own
+termination grace must be at least that long. If both the grace period and
+TorchElastic's cleanup window expire, the supervisor kills the complete child
+process group so failed ranks and the checkpoint lease cannot be orphaned.
+`SIGKILL` sent directly to the supervisor remains unrecoverable.
 
 The production wrapper always passes `--deterministic` and launches with
-`CUBLAS_WORKSPACE_CONFIG=:4096:8`. A conflicting pre-existing setting is an
-error. Nondeterministic performance experiments must bypass this production
-wrapper and use the raw entry point explicitly.
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` and `PYTHONHASHSEED=0`. A conflicting
+pre-existing setting is an error, and both values are part of the recorded
+runtime/checkpoint identity. Nondeterministic performance experiments must
+bypass this production wrapper and use the raw entry point explicitly.
 
 Prepare unique durable directories and first render a dry run on the final GPU
 pod. `CHECKPOINT_GENERATION_BYTES` must be a measured conservative upper bound,
@@ -384,7 +433,8 @@ Rank zero emits JSON metrics:
 - `train/perplexity`, `train/learning_rate`, and `train/grad_norm`;
 - cumulative `train/rows`, `train/input_tokens`, `train/supervised_tokens`
   (also emitted as `train/loss_tokens`), and `train/microbatches`;
-- input/supervised token throughput and seconds per optimizer step.
+- input/supervised token throughput, seconds per optimizer step, and the
+  slowest rank's DataLoader wait seconds/fraction for each update.
 
 At the configured cadence it also emits global and per-domain
 `validation/loss`, perplexity, row/token counts, and throughput. Evaluation
@@ -406,7 +456,11 @@ The generated W&B run ID is stored inside the same atomic model checkpoint. On
 resume the CLI reuses that ID automatically; `--wandb-run-id` can override it
 deliberately. Coupling it to the model generation avoids attaching old weights
 to a newer sidecar after a crash, and keeps a resumed optimizer run on one W&B
-history instead of silently creating disconnected charts.
+history instead of silently creating disconnected charts. Preflight still
+rejects a missing enabled dependency or missing online credentials. If W&B's
+local service or network fails after that gate, rank zero warns and continues
+with JSON console metrics; tracking is never allowed to prevent a
+scheduled or preemption checkpoint.
 
 For the 1.284B FP32-parameter AdamW run, one mature checkpoint is approximately
 15.4 GB (about 5.1 GB of weights plus 10.3 GB of moments, before container

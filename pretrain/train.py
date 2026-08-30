@@ -28,7 +28,7 @@ import signal
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -257,6 +257,25 @@ class TrainConfig:
     fused_adamw: bool | None = None
 
     def __post_init__(self) -> None:
+        finite_fields = (
+            "learning_rate",
+            "min_learning_rate",
+            "weight_decay",
+            "beta1",
+            "beta2",
+            "adam_eps",
+            "max_grad_norm",
+        )
+        nonfinite = [
+            field
+            for field in finite_fields
+            if not math.isfinite(float(getattr(self, field)))
+        ]
+        if nonfinite:
+            raise ValueError(
+                "Optimizer hyperparameters must be finite: "
+                + ", ".join(nonfinite)
+            )
         if self.max_steps < 1:
             raise ValueError("max_steps must be positive")
         if self.global_microbatch_rows < 1:
@@ -473,6 +492,24 @@ class WandbLogger:
             self._run.finish()
 
 
+def initialize_optional_metric_logger(
+    factory: Callable[[], MetricLogger],
+) -> tuple[MetricLogger, str | None]:
+    """Initialize non-authoritative tracking without making training depend on it.
+
+    Data, validation, and checkpoint failures remain fatal. Experiment-tracker
+    startup is intentionally different: credentials may expire or a local W&B
+    service may fail after the production preflight. The caller broadcasts the
+    returned diagnostic so every rank crosses setup in the same order, while
+    rank zero falls back to console-only metrics.
+    """
+
+    try:
+        return factory(), None
+    except Exception as exc:
+        return NullLogger(), f"{type(exc).__name__}: {exc}"
+
+
 class GracefulStopController:
     """Convert process signals into a checkpoint request at the next safe step.
 
@@ -496,6 +533,38 @@ class GracefulStopController:
         if self._requested_signal == 0:
             self._requested_signal = value
 
+    def poll_external_request(self) -> None:
+        """Observe a supervisor request file without doing I/O in a handler."""
+
+        if self._requested_signal:
+            return
+        raw_path = os.environ.get("PRETRAIN_STOP_REQUEST_FILE")
+        if not raw_path:
+            return
+        path = Path(raw_path)
+        try:
+            raw_signal = path.read_text(encoding="ascii", errors="strict").strip()
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(f"Cannot read external stop request {path}: {exc}") from exc
+        try:
+            requested = int(raw_signal)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"External stop request {path} is not an integer signal"
+            ) from exc
+        allowed = {int(signal.SIGINT), int(signal.SIGTERM)}
+        if hasattr(signal, "SIGHUP"):
+            allowed.add(int(signal.SIGHUP))
+        if hasattr(signal, "SIGUSR1"):
+            allowed.add(int(signal.SIGUSR1))
+        if requested not in allowed:
+            raise RuntimeError(
+                f"External stop request {path} has unsupported signal {requested}"
+            )
+        self.request(requested)
+
     def _handle(self, signum: int, frame: Any) -> None:
         del frame
         self.request(signum)
@@ -504,6 +573,8 @@ class GracefulStopController:
         if self._previous_handlers:
             raise RuntimeError("Graceful stop handlers are already installed")
         handled = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            handled.append(signal.SIGHUP)
         if hasattr(signal, "SIGUSR1"):
             handled.append(signal.SIGUSR1)
         for signum in handled:
@@ -1057,6 +1128,9 @@ class ValidationRunner:
         started = time.perf_counter()
         was_training = model.training
         local_loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        local_model_loss_tokens = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
         local_loss_tokens = 0
         local_input_tokens = 0
         local_rows = 0
@@ -1104,9 +1178,14 @@ class ValidationRunner:
                         )
                     if output.loss_sum is None or output.num_loss_tokens is None:
                         raise RuntimeError("Model did not return validation loss statistics")
-                    if token_count < 1 or int(output.num_loss_tokens) != token_count:
+                    if token_count < 1:
+                        raise ValueError("Validation microbatch has no supervised tokens")
+                    if (
+                        output.num_loss_tokens.dtype != torch.int64
+                        or output.num_loss_tokens.numel() != 1
+                    ):
                         raise ValueError(
-                            "Model validation-token counter disagrees with the batch"
+                            "Model validation-token counter must be one int64 scalar"
                         )
                     domain_ids = batch.get("domain_ids")
                     if domain_ids is None or output.loss_sums_per_row is None:
@@ -1138,6 +1217,7 @@ class ValidationRunner:
                         minlength=len(DOMAIN_ORDER),
                     ).to(torch.int64)
                     local_loss_sum += output.loss_sum.detach().double()
+                    local_model_loss_tokens += output.num_loss_tokens.detach()
                     local_loss_tokens += token_count
                     local_input_tokens += batch["input_ids"].numel()
                     local_rows += batch["input_ids"].shape[0]
@@ -1151,6 +1231,7 @@ class ValidationRunner:
                 local_loss_tokens,
                 local_input_tokens,
                 local_rows,
+                float(local_model_loss_tokens),
             ],
             dtype=torch.float64,
             device=self.device,
@@ -1167,12 +1248,22 @@ class ValidationRunner:
         if self.world_size > 1:
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
         values = stats.cpu().tolist()
-        loss_sum, loss_tokens_value, input_tokens_value, rows_value = values[:4]
+        (
+            loss_sum,
+            loss_tokens_value,
+            input_tokens_value,
+            rows_value,
+            model_loss_tokens_value,
+        ) = values[:5]
         loss_tokens = int(loss_tokens_value)
         input_tokens = int(input_tokens_value)
         rows = int(rows_value)
         if completed_batches != self.max_batches or loss_tokens < 1:
             raise RuntimeError("Validation did not produce the configured complete sample")
+        if int(model_loss_tokens_value) != loss_tokens:
+            raise ValueError(
+                "Model validation-token counter disagrees with packed batches"
+            )
         if not math.isfinite(loss_sum):
             raise FloatingPointError("Non-finite validation loss")
         elapsed = time.perf_counter() - started
@@ -1198,7 +1289,7 @@ class ValidationRunner:
             "validation/supervised_tokens_per_second": loss_tokens / elapsed,
         }
         width = len(DOMAIN_ORDER)
-        cursor = 4
+        cursor = 5
         domain_loss_sums = values[cursor : cursor + width]
         cursor += width
         domain_loss_tokens = values[cursor : cursor + width]
@@ -1366,7 +1457,7 @@ class Trainer:
         if (
             config.precision == "bfloat16"
             and self.device.type == "cuda"
-            and not torch.cuda.is_bf16_supported()
+            and not torch.cuda.is_bf16_supported(including_emulation=False)
         ):
             raise ValueError("This CUDA device does not support bfloat16 training")
         if self.device.type not in ("cpu", "cuda"):
@@ -1399,15 +1490,21 @@ class Trainer:
                 torch.is_deterministic_algorithms_warn_only_enabled()
             ),
             "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
         }
         if self.device.type == "cuda":
             index = self.device.index
             if index is None:
                 index = torch.cuda.current_device()
+            properties = torch.cuda.get_device_properties(index)
             signature.update(
                 {
                     "cuda_device_name": torch.cuda.get_device_name(index),
                     "cuda_capability": list(torch.cuda.get_device_capability(index)),
+                    "cuda_total_memory_bytes": int(properties.total_memory),
+                    "cuda_multiprocessor_count": int(
+                        properties.multi_processor_count
+                    ),
                     "cuda_runtime": torch.version.cuda,
                     "cudnn_version": torch.backends.cudnn.version(),
                     "cublas_workspace_config": os.environ.get(
@@ -1775,6 +1872,7 @@ class Trainer:
         self,
         local_loss_sum: torch.Tensor,
         local_loss_tokens: int,
+        local_model_loss_tokens: torch.Tensor,
         local_input_tokens: int,
         local_domain_loss_sums: torch.Tensor | None = None,
         local_domain_loss_tokens: torch.Tensor | None = None,
@@ -1796,17 +1894,31 @@ class Trainer:
             value is None for value in domain_values
         ):
             raise ValueError("Per-domain window statistics are only partially supplied")
-        parts = [local_loss_sum.reshape(1), counts]
+        if (
+            local_model_loss_tokens.device != self.device
+            or local_model_loss_tokens.dtype != torch.int64
+            or local_model_loss_tokens.numel() != 1
+        ):
+            raise ValueError("Model loss-token accumulator must be one int64 device scalar")
+        parts = [
+            local_loss_sum.reshape(1),
+            counts,
+            local_model_loss_tokens.reshape(1).to(torch.float64),
+        ]
         if local_domain_loss_sums is not None:
             parts.extend(value.to(torch.float64) for value in domain_values if value is not None)
         stats = torch.cat(parts)
         if self.world_size > 1:
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
         values = stats.cpu().tolist()
+        if int(values[3]) != int(values[1]):
+            raise ValueError(
+                "Model supervised-token counter disagrees with packed batches"
+            )
         domain_stats: dict[str, dict[str, float | int]] | None = None
         if local_domain_loss_sums is not None:
             width = len(DOMAIN_ORDER)
-            cursor = 3
+            cursor = 4
             loss_sums = values[cursor : cursor + width]
             cursor += width
             loss_tokens = values[cursor : cursor + width]
@@ -1825,12 +1937,22 @@ class Trainer:
             }
         return float(values[0]), int(values[1]), int(values[2]), domain_stats
 
-    def _max_elapsed(self, elapsed: float) -> float:
+    def _max_step_timings(
+        self,
+        elapsed: float,
+        data_wait: float,
+    ) -> tuple[float, float, float]:
+        wait_fraction = data_wait / elapsed
         if self.world_size == 1:
-            return elapsed
-        value = torch.tensor(elapsed, dtype=torch.float64, device=self.device)
-        dist.all_reduce(value, op=dist.ReduceOp.MAX)
-        return float(value)
+            return elapsed, data_wait, wait_fraction
+        values = torch.tensor(
+            [elapsed, data_wait, wait_fraction],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        dist.all_reduce(values, op=dist.ReduceOp.MAX)
+        result = values.cpu().tolist()
+        return float(result[0]), float(result[1]), float(result[2])
 
     def _validate_batch_source(
         self,
@@ -1896,6 +2018,8 @@ class Trainer:
             self.logger = NullLogger()
 
     def _distributed_stop_signal(self) -> int:
+        if self.stop_controller is not None:
+            self.stop_controller.poll_external_request()
         requested = (
             0 if self.stop_controller is None else self.stop_controller.requested_signal
         )
@@ -1991,7 +2115,11 @@ class Trainer:
 
             local_loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
             local_loss_tokens = 0
+            local_model_loss_tokens = torch.zeros(
+                (), dtype=torch.int64, device=self.device
+            )
             local_input_tokens = 0
+            local_data_wait_seconds = 0.0
             local_domain_loss_sums = torch.zeros(
                 len(DOMAIN_ORDER), dtype=torch.float64, device=self.device
             )
@@ -2008,7 +2136,12 @@ class Trainer:
             consumed_microbatches = 0
             try:
                 for accumulation_index in range(self.config.gradient_accumulation_steps):
-                    batch, token_count = self._move_batch(next(iterator))
+                    data_wait_started = time.perf_counter()
+                    raw_batch = next(iterator)
+                    local_data_wait_seconds += (
+                        time.perf_counter() - data_wait_started
+                    )
+                    batch, token_count = self._move_batch(raw_batch)
                     consumed_microbatches += 1
                     should_sync = (
                         accumulation_index + 1 == self.config.gradient_accumulation_steps
@@ -2037,13 +2170,17 @@ class Trainer:
                             raise RuntimeError("Model did not return training loss statistics")
                         if token_count < 1:
                             raise ValueError("Microbatch contains no supervised tokens")
-                        if int(output.num_loss_tokens) != token_count:
+                        if (
+                            output.num_loss_tokens.dtype != torch.int64
+                            or output.num_loss_tokens.numel() != 1
+                        ):
                             raise ValueError(
-                                "Model supervised-token counter disagrees with the batch"
+                                "Model supervised-token counter must be one int64 scalar"
                             )
                         output.loss_sum.backward()
                     local_loss_sum += output.loss_sum.detach().double()
                     local_loss_tokens += token_count
+                    local_model_loss_tokens += output.num_loss_tokens.detach()
                     local_input_tokens += batch["input_ids"].numel()
                     domain_ids = batch.get("domain_ids")
                     if domain_ids is None:
@@ -2093,6 +2230,7 @@ class Trainer:
                 self._reduce_window_stats(
                     local_loss_sum,
                     local_loss_tokens,
+                    local_model_loss_tokens,
                     local_input_tokens,
                     local_domain_loss_sums if domain_metrics_available else None,
                     local_domain_loss_tokens if domain_metrics_available else None,
@@ -2167,7 +2305,6 @@ class Trainer:
                 max_norm=self.config.max_grad_norm,
                 error_if_nonfinite=True,
             )
-            grad_norm = float(grad_norm_tensor)
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -2189,7 +2326,11 @@ class Trainer:
                     )
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
-            elapsed = self._max_elapsed(time.perf_counter() - started)
+            grad_norm = float(grad_norm_tensor)
+            elapsed, data_wait_seconds, data_wait_fraction = self._max_step_timings(
+                time.perf_counter() - started,
+                local_data_wait_seconds,
+            )
             token_loss = global_loss_sum / global_loss_tokens
             last_metrics = {
                 "train/step": self.state.completed_steps,
@@ -2207,6 +2348,8 @@ class Trainer:
                 "perf/input_tokens_per_second": global_input_tokens / elapsed,
                 "perf/loss_tokens_per_second": global_loss_tokens / elapsed,
                 "perf/step_seconds": elapsed,
+                "perf/data_wait_seconds": data_wait_seconds,
+                "perf/data_wait_fraction": data_wait_fraction,
             }
             if self.device.type == "cuda":
                 last_metrics.update(
@@ -2498,6 +2641,48 @@ def _close_loader(loader: Any, sampler: DistributedBatchSampler) -> None:
         close_dataset()
 
 
+def _finalize_training_run(trainer: Trainer) -> int:
+    """Publish final state, then catch a stop received during that publication.
+
+    Every rank calls both collectives in the same order.  This closes the
+    otherwise vulnerable window between ``Trainer.train`` returning and the
+    caller restoring the process signal handlers.
+    """
+
+    stop_already_reported = bool(trainer.stop_signal)
+    trainer.save_checkpoint()
+    requested_stop = trainer._distributed_stop_signal()
+    if requested_stop:
+        trainer.stop_signal = requested_stop
+        if not stop_already_reported:
+            trainer._log_metrics(
+                {
+                    "train/step": trainer.state.completed_steps,
+                    "system/graceful_stop_signal": requested_stop,
+                }
+            )
+        return 128 + requested_stop
+    return 0
+
+
+def _bind_wandb_run_id(trainer: Trainer, run_id: str | None) -> None:
+    """Make a tracker identity checkpoint-authoritative on every rank.
+
+    A resume can be preempted before its first new optimizer update. If W&B had
+    to create or deliberately replace the run ID, invalidate the same-step
+    checkpoint cache so that clean stop still publishes that identity.
+    """
+
+    if run_id is None:
+        return
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("W&B run ID must be a non-empty string")
+    if trainer.checkpoint_metadata.get("wandb_run_id") == run_id:
+        return
+    trainer.checkpoint_metadata["wandb_run_id"] = run_id
+    trainer._last_checkpoint = None
+
+
 def _run_initialized_training(
     *,
     args: argparse.Namespace,
@@ -2618,6 +2803,31 @@ def _run_initialized_training(
                 activation_checkpointing=activation_checkpointing,
             )
 
+        # Validate the complete optimizer trajectory before allocating the
+        # multi-gigabyte production model on every rank.
+        train_config = TrainConfig(
+            max_steps=args.steps,
+            global_microbatch_rows=args.global_microbatch_rows,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            min_learning_rate=args.min_learning_rate,
+            warmup_steps=min(args.warmup_steps, args.steps),
+            weight_decay=args.weight_decay,
+            beta1=args.beta1,
+            beta2=args.beta2,
+            adam_eps=args.adam_eps,
+            max_grad_norm=args.max_grad_norm,
+            precision=precision,
+            seed=args.seed,
+            deterministic=args.deterministic,
+            compile_model=args.compile,
+            log_every=args.log_every,
+            checkpoint_every=args.checkpoint_every,
+            eval_every=args.eval_every,
+            eval_at_start=args.eval_at_start,
+            fused_adamw=args.fused_adamw,
+        )
+
         model: torch.nn.Module | None = None
         model_error: BaseException | None = None
         try:
@@ -2645,29 +2855,6 @@ def _run_initialized_training(
                 rank=rank,
                 world_size=world_size,
             )
-
-        train_config = TrainConfig(
-            max_steps=args.steps,
-            global_microbatch_rows=args.global_microbatch_rows,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            learning_rate=args.learning_rate,
-            min_learning_rate=args.min_learning_rate,
-            warmup_steps=min(args.warmup_steps, args.steps),
-            weight_decay=args.weight_decay,
-            beta1=args.beta1,
-            beta2=args.beta2,
-            adam_eps=args.adam_eps,
-            max_grad_norm=args.max_grad_norm,
-            precision=precision,
-            seed=args.seed,
-            deterministic=args.deterministic,
-            compile_model=args.compile,
-            log_every=args.log_every,
-            checkpoint_every=args.checkpoint_every,
-            eval_every=args.eval_every,
-            eval_at_start=args.eval_at_start,
-            fused_adamw=args.fused_adamw,
-        )
 
         validation_runner: ValidationRunner | None = None
         validation_error: BaseException | None = None
@@ -2780,9 +2967,11 @@ def _run_initialized_training(
 
         wandb_logger: MetricLogger = NullLogger()
         wandb_initialization_error: str | None = None
+        initialized_wandb_run_id: str | None = None
         if rank == 0:
             args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-            try:
+
+            def create_wandb_logger() -> MetricLogger:
                 wandb_run_id = args.wandb_run_id or trainer.checkpoint_metadata.get(
                     "wandb_run_id"
                 )
@@ -2790,35 +2979,44 @@ def _run_initialized_training(
                     raise ValueError(
                         "Checkpoint wandb_run_id metadata must be a string"
                     )
-                with preserve_host_rng_state():
-                    wandb_logger = WandbLogger(
-                        mode=args.wandb_mode,
-                        project=args.wandb_project,
-                        entity=args.wandb_entity,
-                        name=args.wandb_run_name,
-                        group=args.wandb_group,
-                        tags=args.wandb_tags,
-                        run_id=wandb_run_id,
-                        config=run_config,
-                        directory=args.checkpoint.parent,
-                    )
+                return WandbLogger(
+                    mode=args.wandb_mode,
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    name=args.wandb_run_name,
+                    group=args.wandb_group,
+                    tags=args.wandb_tags,
+                    run_id=wandb_run_id,
+                    config=run_config,
+                    directory=args.checkpoint.parent,
+                )
+
+            with preserve_host_rng_state():
+                wandb_logger, wandb_initialization_error = (
+                    initialize_optional_metric_logger(create_wandb_logger)
+                )
+            if wandb_initialization_error is None:
                 if (
                     isinstance(wandb_logger, WandbLogger)
                     and wandb_logger.run_id is not None
                 ):
-                    trainer.checkpoint_metadata["wandb_run_id"] = (
-                        wandb_logger.run_id
-                    )
-            except Exception as exc:
-                wandb_initialization_error = f"{type(exc).__name__}: {exc}"
+                    initialized_wandb_run_id = wandb_logger.run_id
         if world_size > 1:
-            initialization_status = [wandb_initialization_error]
+            initialization_status = [
+                wandb_initialization_error,
+                initialized_wandb_run_id,
+            ]
             dist.broadcast_object_list(initialization_status, src=0)
-            wandb_initialization_error = initialization_status[0]
-        if wandb_initialization_error is not None:
-            raise RuntimeError(
-                f"Rank-zero W&B initialization failed: "
-                f"{wandb_initialization_error}"
+            wandb_initialization_error, initialized_wandb_run_id = (
+                initialization_status
+            )
+        _bind_wandb_run_id(trainer, initialized_wandb_run_id)
+        if rank == 0 and wandb_initialization_error is not None:
+            print(
+                "warning: W&B initialization failed; continuing with JSON "
+                f"console metrics only: {wandb_initialization_error}",
+                file=sys.stderr,
+                flush=True,
             )
         logger = (
             CompositeLogger(ConsoleLogger(), wandb_logger)
@@ -2851,7 +3049,6 @@ def _run_initialized_training(
         )
         assert loader is not None and sampler is not None
 
-        exit_code = 0
         with stop_controller:
             if (
                 trainer.validation_runner is not None
@@ -2860,10 +3057,7 @@ def _run_initialized_training(
             ):
                 trainer.evaluate_validation()
             trainer.train(loader)
-            if trainer.stop_signal:
-                exit_code = 128 + trainer.stop_signal
-            else:
-                trainer.save_checkpoint()
+            exit_code = _finalize_training_run(trainer)
         return exit_code
     finally:
         active_exception = sys.exc_info()[0] is not None

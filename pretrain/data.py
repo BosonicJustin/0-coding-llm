@@ -124,7 +124,7 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
+            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -180,8 +180,23 @@ def _canonical_json_mapping(
 
 
 def _load_json(path: Path) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON key {key!r} in {path}")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(value: str) -> None:
+        raise ValueError(f"Non-finite JSON number {value!r} in {path}")
+
     with path.open("r", encoding="utf-8") as handle:
-        value = json.load(handle)
+        value = json.load(
+            handle,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_nonfinite,
+        )
     if not isinstance(value, dict):
         raise ValueError(f"Expected a JSON object in {path}")
     return value
@@ -292,6 +307,10 @@ class PackedShardWriter:
         self._rows_in_open_shard = 0
         self._tokens_digest: Any | None = None
         self._starts_digest: Any | None = None
+        # Runtime-only write aggregation. It does not affect packed bytes or
+        # the construction identity, so a resume may use a different value.
+        self._drain_batch_rows = 256
+        self._open_shard_dirty = False
         self._source_cursor: dict[str, Any] | None = None
         self._finished = False
         self.resumed = False
@@ -639,6 +658,9 @@ class PackedShardWriter:
             self._starts_handle = self._temporary_starts.open("ab")
             self._tokens_digest = digests["tokens"]
             self._starts_digest = digests["starts"]
+            # The journal authenticates exactly the restored prefix. No data
+            # handle needs another fsync until a subsequent write occurs.
+            self._open_shard_dirty = False
         else:
             if self._rows != len(self._shards) * self.rows_per_shard:
                 raise ValueError("Packing journal total rows disagree with completed shards")
@@ -701,10 +723,15 @@ class PackedShardWriter:
         }
 
     def _sync_open_shard(self) -> None:
+        if not self._open_shard_dirty:
+            return
         for handle in (self._tokens_handle, self._starts_handle):
             if handle is not None:
                 handle.flush()
                 os.fsync(handle.fileno())
+        # Clear only after both payloads are durable. If either fsync raises,
+        # the dirty state remains set and a later checkpoint retries both.
+        self._open_shard_dirty = False
 
     def _write_journal(self, source_cursor: dict[str, Any] | None) -> None:
         self._sync_open_shard()
@@ -734,19 +761,90 @@ class PackedShardWriter:
     ) -> None:
         if self._finished:
             raise RuntimeError("Cannot add documents after finish()")
-        if isinstance(token_ids, np.ndarray):
-            values = token_ids.reshape(-1).tolist()
+        scalar_values: list[Any] | None = None
+        exact_int_sequence = False
+        if type(token_ids) is np.ndarray:
+            # Only the base ndarray has NumPy's well-defined flattening and
+            # scalar conversion semantics. Subclasses can reinterpret either
+            # operation (for example, MaskedArray inserts None and matrix
+            # preserves a nested axis), so they retain the scalar oracle below.
+            candidate: np.ndarray[Any, Any] | None = token_ids.reshape(-1)
         else:
-            values = list(token_ids)
-        if not values:
+            # Preserve the previous Sequence contract: nested Python lists are
+            # invalid token elements, while an ndarray is explicitly flattened.
+            # Validate element types/ranges before NumPy coercion: coercion can
+            # otherwise turn unsupported values such as np.bool_ or scalar
+            # torch tensors into integers and silently broaden the input API.
+            scalar_values = (
+                token_ids.reshape(-1).tolist()
+                if isinstance(token_ids, np.ndarray)
+                else list(token_ids)
+            )
+            if not scalar_values:
+                raise ValueError("Empty documents are not packable")
+            exact_int_sequence = True
+            for token_id in scalar_values:
+                if not isinstance(token_id, (int, np.integer)):
+                    raise TypeError(
+                        f"Token ID must be an integer, got {type(token_id).__name__}"
+                    )
+                if not 0 <= int(token_id) < self.vocab_size:
+                    raise ValueError(
+                        f"Token ID {token_id} is outside [0, {self.vocab_size})"
+                    )
+                exact_int_sequence &= type(token_id) is int
+            if exact_int_sequence:
+                # The dominant tokenizer output is already a list of exact
+                # Python ints. Keep those objects directly: a NumPy round trip
+                # would allocate an int64 array, a uint16 array, and a second
+                # PyLong for every token without changing validation or bytes.
+                candidate = None
+            else:
+                try:
+                    converted = np.asarray(scalar_values)
+                except (OverflowError, TypeError, ValueError):
+                    candidate = None
+                else:
+                    candidate = converted if converted.ndim == 1 else None
+        value_count = len(scalar_values) if candidate is None else int(candidate.size)
+        if value_count == 0:
             raise ValueError("Empty documents are not packable")
-        for token_id in values:
-            if not isinstance(token_id, (int, np.integer)):
-                raise TypeError(f"Token ID must be an integer, got {type(token_id).__name__}")
-            if not 0 <= int(token_id) < self.vocab_size:
-                raise ValueError(f"Token ID {token_id} is outside [0, {self.vocab_size})")
 
-        self._tokens.extend(int(value) for value in values)
+        # Tokenizers normally return a homogeneous integer list. Sequence
+        # inputs retain one exact scalar validation pass above, while NumPy
+        # performs range validation for native arrays and normalizes both
+        # common paths to uint16/Python ints in C. Exotic/object ndarray inputs
+        # retain the exact fail-closed scalar validation below.
+        if exact_int_sequence:
+            assert scalar_values is not None
+            values = scalar_values
+        elif candidate is not None and candidate.dtype.kind in ("b", "i", "u"):
+            if scalar_values is None:
+                invalid = np.logical_or(candidate < 0, candidate >= self.vocab_size)
+                if np.any(invalid):
+                    token_id = candidate[int(np.flatnonzero(invalid)[0])]
+                    raise ValueError(
+                        f"Token ID {token_id} is outside [0, {self.vocab_size})"
+                    )
+            values = candidate.astype(TOKEN_DTYPE, copy=False).tolist()
+        else:
+            raw_values = scalar_values if candidate is None else candidate.tolist()
+            assert raw_values is not None
+            values = []
+            for token_id in raw_values:
+                if scalar_values is None:
+                    if not isinstance(token_id, (int, np.integer)):
+                        raise TypeError(
+                            "Token ID must be an integer, got "
+                            f"{type(token_id).__name__}"
+                        )
+                    if not 0 <= int(token_id) < self.vocab_size:
+                        raise ValueError(
+                            f"Token ID {token_id} is outside "
+                            f"[0, {self.vocab_size})"
+                        )
+                values.append(int(token_id))
+        self._tokens.extend(values)
         self._starts.extend([True] + [False] * (len(values) - 1))
         self._tokens.append(self.eos_token_id)
         self._starts.append(False)
@@ -769,19 +867,52 @@ class PackedShardWriter:
         self._tokens_digest = hashlib.sha256()
         self._starts_digest = hashlib.sha256()
         self._rows_in_open_shard = 0
+        self._open_shard_dirty = False
 
     def _drain_rows(self) -> None:
         while len(self._tokens) - self._buffer_offset >= self.tokens_per_row:
             self._open_shard()
             start = self._buffer_offset
-            end = start + self.tokens_per_row
-            row_tokens = np.asarray(self._tokens[start:end], dtype=TOKEN_DTYPE)
-            row_starts = np.asarray(self._starts[start:end], dtype=np.bool_)
+            available = len(self._tokens) - start
+            available_rows = (available - 1) // self.sequence_length
+            shard_rows = self.rows_per_shard - self._rows_in_open_shard
+            batch_rows = min(available_rows, shard_rows, self._drain_batch_rows)
+            if batch_rows < 1:
+                raise AssertionError("Packed row drain made no progress")
+
+            # Consecutive rows overlap by one look-ahead token. Convert one
+            # contiguous stream span and expose the exact T-step windows as a
+            # strided view, avoiding per-row NumPy conversion and write calls.
+            span = batch_rows * self.sequence_length + 1
+            stream_tokens = np.asarray(
+                self._tokens[start : start + span], dtype=TOKEN_DTYPE
+            )
+            stream_starts = np.asarray(
+                self._starts[start : start + span], dtype=np.bool_
+            )
+            row_tokens = np.lib.stride_tricks.as_strided(
+                stream_tokens,
+                shape=(batch_rows, self.tokens_per_row),
+                strides=(
+                    self.sequence_length * stream_tokens.dtype.itemsize,
+                    stream_tokens.dtype.itemsize,
+                ),
+                writeable=False,
+            )
+            row_starts = np.lib.stride_tricks.as_strided(
+                stream_starts,
+                shape=(batch_rows, self.tokens_per_row),
+                strides=(
+                    self.sequence_length * stream_starts.dtype.itemsize,
+                    stream_starts.dtype.itemsize,
+                ),
+                writeable=False,
+            ).copy()
             # Every physical row is an independent attention container, even
             # when it begins in the middle of a long source document.
-            row_starts[0] = True
-            packed_starts = np.packbits(row_starts, bitorder="little")
-            if packed_starts.size != self.starts_bytes_per_row:
+            row_starts[:, 0] = True
+            packed_starts = np.packbits(row_starts, axis=1, bitorder="little")
+            if packed_starts.shape != (batch_rows, self.starts_bytes_per_row):
                 raise AssertionError("Unexpected packed starts width")
 
             token_bytes = row_tokens.tobytes(order="C")
@@ -790,14 +921,15 @@ class PackedShardWriter:
             self._starts_handle.write(start_bytes)
             self._tokens_digest.update(token_bytes)
             self._starts_digest.update(start_bytes)
-            masked = int(np.count_nonzero(row_starts[1:]))
+            self._open_shard_dirty = True
+            masked = int(np.count_nonzero(row_starts[:, 1:]))
             self._masked_boundary_labels += masked
-            self._valid_loss_tokens += self.sequence_length - masked
-            self._rows += 1
-            self._rows_in_open_shard += 1
+            self._valid_loss_tokens += batch_rows * self.sequence_length - masked
+            self._rows += batch_rows
+            self._rows_in_open_shard += batch_rows
             # Advance by T, retaining the look-ahead token as the first input
             # token of the next row.
-            self._buffer_offset += self.sequence_length
+            self._buffer_offset += batch_rows * self.sequence_length
 
             if self._rows_in_open_shard == self.rows_per_shard:
                 self._finalize_open_shard()
@@ -831,6 +963,7 @@ class PackedShardWriter:
             handle.close()
         self._tokens_handle = None
         self._starts_handle = None
+        self._open_shard_dirty = False
 
         shard_index = len(self._shards)
         token_name = f"shard-{shard_index:06d}.tokens.bin"
@@ -869,6 +1002,7 @@ class PackedShardWriter:
         self._temporary_starts = None
         self._tokens_digest = None
         self._starts_digest = None
+        self._open_shard_dirty = False
         _fsync_directory(self.output_dir)
 
     def finish(
@@ -928,6 +1062,10 @@ class PackedShardWriter:
 
 
 def _parse_packed_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[_Shard]]:
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise IOError(
+            f"Packed manifest must be a regular non-symlink file: {manifest_path}"
+        )
     manifest = _load_json(manifest_path)
     if manifest.get("format") != "packed-document-causal":
         raise ValueError(f"Unsupported packed format in {manifest_path}")
@@ -949,7 +1087,7 @@ def _parse_packed_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[_S
         "unstored_tail_tokens",
     )
     for key in required_nonnegative:
-        if not isinstance(manifest.get(key), int) or manifest[key] < 0:
+        if type(manifest.get(key)) is not int or manifest[key] < 0:
             raise ValueError(f"Invalid {key!r} in {manifest_path}")
     sequence_length = manifest["sequence_length"]
     if sequence_length < 2 or manifest["tokens_per_row"] != sequence_length + 1:
@@ -966,6 +1104,8 @@ def _parse_packed_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[_S
         )
     if manifest.get("domain") not in DOMAIN_ORDER:
         raise ValueError(f"Invalid domain in {manifest_path}")
+    if not isinstance(manifest.get("split"), str) or not manifest["split"]:
+        raise ValueError(f"Invalid split in {manifest_path}")
     rows_per_shard = manifest.get("rows_per_shard")
     if (
         not isinstance(rows_per_shard, int)
@@ -1037,10 +1177,32 @@ def _parse_packed_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[_S
             raise ValueError(f"Invalid shard payload metadata in {manifest_path}")
         token_relative = tokens.get("path")
         starts_relative = starts.get("path")
-        if not isinstance(token_relative, str) or not token_relative:
-            raise ValueError(f"Invalid token shard path in {manifest_path}")
-        if not isinstance(starts_relative, str) or not starts_relative:
-            raise ValueError(f"Invalid starts shard path in {manifest_path}")
+        expected_token_relative = f"shard-{expected_index:06d}.tokens.bin"
+        expected_starts_relative = f"shard-{expected_index:06d}.starts.bin"
+        if token_relative != expected_token_relative:
+            raise ValueError(
+                f"Non-canonical token shard path in {manifest_path}: "
+                f"expected {expected_token_relative!r}"
+            )
+        if starts_relative != expected_starts_relative:
+            raise ValueError(
+                f"Non-canonical starts shard path in {manifest_path}: "
+                f"expected {expected_starts_relative!r}"
+            )
+        expected_token_bytes = (
+            rows * manifest["tokens_per_row"] * TOKEN_DTYPE.itemsize
+        )
+        expected_starts_bytes = rows * manifest["starts_bytes_per_row"]
+        if tokens.get("bytes") != expected_token_bytes:
+            raise ValueError(
+                f"Invalid recorded token shard size in {manifest_path} at shard "
+                f"{expected_index}"
+            )
+        if starts.get("bytes") != expected_starts_bytes:
+            raise ValueError(
+                f"Invalid recorded starts shard size in {manifest_path} at shard "
+                f"{expected_index}"
+            )
         token_path = manifest_path.parent / token_relative
         starts_path = manifest_path.parent / starts_relative
         shards.append(
@@ -1081,7 +1243,20 @@ def validate_packed_manifest(
     """
 
     path = Path(manifest_path)
+    if path.is_symlink() or not path.is_file():
+        raise IOError(f"Packed manifest must be a regular non-symlink file: {path}")
     manifest, shards = _parse_packed_manifest(path)
+    expected_names = {"manifest.json"}
+    for shard in shards:
+        expected_names.update((shard.tokens_path.name, shard.starts_path.name))
+    unexpected_names = sorted(
+        entry.name for entry in path.parent.iterdir() if entry.name not in expected_names
+    )
+    if unexpected_names:
+        raise ValueError(
+            f"Packed directory contains unknown files in {path.parent}: "
+            f"{unexpected_names}"
+        )
     token_bytes_per_row = manifest["tokens_per_row"] * TOKEN_DTYPE.itemsize
     starts_bytes_per_row = manifest["starts_bytes_per_row"]
     vocab_size = manifest["vocab_size"]
@@ -1100,8 +1275,10 @@ def validate_packed_manifest(
             (shard.tokens_path, expected_tokens, payload["tokens"].get("bytes")),
             (shard.starts_path, expected_starts, payload["starts"].get("bytes")),
         ):
-            if not file_path.is_file():
-                raise FileNotFoundError(file_path)
+            if file_path.is_symlink() or not file_path.is_file():
+                raise IOError(
+                    f"Packed payload must be a regular non-symlink file: {file_path}"
+                )
             actual = file_path.stat().st_size
             if actual != expected or recorded != expected:
                 raise IOError(
@@ -1212,14 +1389,34 @@ class PackedShardDataset(Dataset[dict[str, Any]]):
         self.sequence_length = self.manifest["sequence_length"]
         self.tokens_per_row = self.manifest["tokens_per_row"]
         self.starts_bytes_per_row = self.manifest["starts_bytes_per_row"]
+        self.vocab_size = self.manifest["vocab_size"]
+        self.eos_token_id = self.manifest["eos_token_id"]
         self.domain = self.manifest["domain"]
         self.split = self.manifest["split"]
         self._ends: list[int] = []
         total = 0
         for shard in self._shards:
+            self._require_exact_shard_files(shard)
             total += shard.rows
             self._ends.append(total)
         self._maps: dict[int, tuple[np.memmap[Any, Any], np.memmap[Any, Any]]] = {}
+
+    def _require_exact_shard_files(self, shard: _Shard) -> None:
+        expected = (
+            (shard.tokens_path, shard.rows * self.tokens_per_row * TOKEN_DTYPE.itemsize),
+            (shard.starts_path, shard.rows * self.starts_bytes_per_row),
+        )
+        for path, expected_bytes in expected:
+            if path.is_symlink() or not path.is_file():
+                raise IOError(
+                    f"Packed payload must be a regular non-symlink file: {path}"
+                )
+            actual_bytes = path.stat().st_size
+            if actual_bytes != expected_bytes:
+                raise IOError(
+                    f"Size mismatch for {path}: expected {expected_bytes}, "
+                    f"found {actual_bytes}"
+                )
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -1243,11 +1440,17 @@ class PackedShardDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return self.manifest["rows"]
 
-    def _open_maps(self, shard_index: int) -> tuple[np.memmap[Any, Any], np.memmap[Any, Any]]:
+    def _open_maps(
+        self, shard_index: int
+    ) -> tuple[np.memmap[Any, Any], np.memmap[Any, Any]]:
         maps = self._maps.get(shard_index)
         if maps is not None:
             return maps
         shard = self._shards[shard_index]
+        # Recheck at first access in each worker. This catches truncation,
+        # replacement with a symlink, and appended garbage that occurred after
+        # the parent process constructed/pickled the dataset.
+        self._require_exact_shard_files(shard)
         tokens = np.memmap(
             shard.tokens_path,
             dtype=TOKEN_DTYPE,
@@ -1313,6 +1516,8 @@ class DomainMixtureDataset(Dataset[dict[str, Any]]):
                 if dataset.manifest.get(key) != first.get(key):
                     raise ValueError(f"All domain manifests must agree on {key}")
         self.sequence_length = first["sequence_length"]
+        self.vocab_size = first["vocab_size"]
+        self.eos_token_id = first["eos_token_id"]
         self.split = first["split"]
 
     def __len__(self) -> int:
@@ -1335,25 +1540,86 @@ class DomainMixtureDataset(Dataset[dict[str, Any]]):
 class PackedBatchCollator:
     """Build model inputs, shifted labels, positions, and document IDs."""
 
-    def __init__(self, sequence_length: int) -> None:
+    def __init__(
+        self,
+        sequence_length: int,
+        *,
+        vocab_size: int | None = None,
+        eos_token_id: int | None = None,
+    ) -> None:
+        if not isinstance(sequence_length, (int, np.integer)) or isinstance(
+            sequence_length, bool
+        ):
+            raise TypeError("sequence_length must be an integer")
         self.sequence_length = int(sequence_length)
         self.tokens_per_row = self.sequence_length + 1
+        self.starts_bytes_per_row = math.ceil(self.tokens_per_row / 8)
+        if self.sequence_length < 2:
+            raise ValueError("sequence_length must be at least 2")
+        if (vocab_size is None) != (eos_token_id is None):
+            raise ValueError(
+                "vocab_size and eos_token_id must be supplied together for "
+                "online semantic validation"
+            )
+        for field, value in (("vocab_size", vocab_size), ("eos_token_id", eos_token_id)):
+            if value is not None and (
+                not isinstance(value, (int, np.integer)) or isinstance(value, bool)
+            ):
+                raise TypeError(f"{field} must be an integer")
+        self.vocab_size = None if vocab_size is None else int(vocab_size)
+        self.eos_token_id = None if eos_token_id is None else int(eos_token_id)
+        if self.vocab_size is not None:
+            if not 1 <= self.vocab_size <= np.iinfo(TOKEN_DTYPE).max + 1:
+                raise ValueError("vocab_size must fit in uint16")
+            assert self.eos_token_id is not None
+            if not 0 <= self.eos_token_id < self.vocab_size:
+                raise ValueError("eos_token_id must be inside the vocabulary")
 
     def __call__(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         if not rows:
             raise ValueError("Cannot collate an empty batch")
         tokens = np.stack([row["tokens"] for row in rows], axis=0)
         starts_bytes = np.stack([row["starts"] for row in rows], axis=0)
-        if tokens.shape[1] != self.tokens_per_row:
-            raise ValueError(f"Expected {self.tokens_per_row} tokens per row, found {tokens.shape[1]}")
+        expected_token_shape = (len(rows), self.tokens_per_row)
+        expected_starts_shape = (len(rows), self.starts_bytes_per_row)
+        if tokens.shape != expected_token_shape:
+            raise ValueError(
+                f"Expected token batch shape {expected_token_shape}, found {tokens.shape}"
+            )
+        if starts_bytes.shape != expected_starts_shape:
+            raise ValueError(
+                f"Expected starts batch shape {expected_starts_shape}, "
+                f"found {starts_bytes.shape}"
+            )
+        if not np.issubdtype(tokens.dtype, np.integer):
+            raise TypeError("Packed token rows must contain integers")
+        if not np.issubdtype(starts_bytes.dtype, np.integer):
+            raise TypeError("Packed start rows must contain bytes")
+        if np.any(starts_bytes < 0) or np.any(starts_bytes > 0xFF):
+            raise ValueError("Packed segment-start values must fit in one byte")
+        if self.vocab_size is not None and (
+            np.any(tokens < 0) or np.any(tokens >= self.vocab_size)
+        ):
+            raise ValueError("Packed batch contains a token outside the vocabulary")
+        final_byte_bits = self.tokens_per_row % 8
+        if final_byte_bits:
+            unused_high_bits_mask = (0xFF << final_byte_bits) & 0xFF
+            if np.any(starts_bytes[:, -1] & unused_high_bits_mask):
+                raise ValueError("Packed batch has nonzero unused segment-start bits")
         starts = np.unpackbits(
-            starts_bytes,
+            starts_bytes.astype(np.uint8, copy=False),
             axis=1,
             count=self.tokens_per_row,
             bitorder="little",
         ).astype(np.bool_, copy=False)
         if not np.all(starts[:, 0]):
             raise ValueError("Every packed row must begin a new attention segment")
+        if self.eos_token_id is not None:
+            invalid_boundaries = np.logical_and(
+                starts[:, 1:], tokens[:, :-1] != self.eos_token_id
+            )
+            if np.any(invalid_boundaries):
+                raise ValueError("Packed batch has a segment start not preceded by EOS")
 
         input_starts = starts[:, : self.sequence_length]
         indices = np.arange(self.sequence_length, dtype=np.int32)[None, :]
@@ -1949,6 +2215,10 @@ def _load_order_manifest(
     *,
     verify_checksum: bool,
 ) -> tuple[dict[str, Any], Path]:
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise IOError(
+            f"Order manifest must be a regular non-symlink file: {manifest_path}"
+        )
     manifest = _load_json(manifest_path)
     if manifest.get("format") != "global-packed-row-order":
         raise ValueError(f"Unsupported order format in {manifest_path}")
@@ -2428,7 +2698,11 @@ def _load_order_manifest(
     )
     order_path = manifest_path.parent / relative_order_path
     expected_bytes = rows * REFERENCE_DTYPE.itemsize
-    if not order_path.is_file() or order_path.stat().st_size != expected_bytes:
+    if (
+        order_path.is_symlink()
+        or not order_path.is_file()
+        or order_path.stat().st_size != expected_bytes
+    ):
         raise IOError(f"Order file size mismatch: {order_path}")
     if order_payload.get("bytes") != expected_bytes:
         raise ValueError("Recorded order byte count is inconsistent")
@@ -2875,6 +3149,15 @@ class DistributedBatchSampler(Sampler[list[int]]):
         self.manifest, order_path = _load_order_manifest(
             self.order_manifest_path, verify_checksum=verify_checksum
         )
+        for field, value in (
+            ("global_microbatch_rows", global_microbatch_rows),
+            ("gradient_accumulation_steps", gradient_accumulation_steps),
+            ("rank", rank),
+            ("world_size", world_size),
+            ("start_global_microbatch", start_global_microbatch),
+        ):
+            if not isinstance(value, (int, np.integer)) or isinstance(value, bool):
+                raise TypeError(f"{field} must be an integer")
         self.global_microbatch_rows = int(global_microbatch_rows)
         self.gradient_accumulation_steps = int(gradient_accumulation_steps)
         self.rank = int(rank)
@@ -3154,7 +3437,17 @@ def _resolve_order_manifests(order_manifest_path: Path) -> dict[str, Path]:
     resolved: dict[str, Path] = {}
     for domain in DOMAIN_ORDER:
         payload = manifest["dataset_manifests"].get(domain, {})
-        path = (order_manifest_path.parent / payload.get("path", "")).resolve()
+        relative = payload.get("path", "")
+        if Path(relative).is_absolute():
+            raise ValueError(
+                f"Packed dataset manifest path must be relative for {domain}"
+            )
+        candidate = order_manifest_path.parent / relative
+        if candidate.is_symlink():
+            raise IOError(
+                f"Packed dataset manifest must not be a symlink: {candidate}"
+            )
+        path = candidate.resolve()
         if not path.is_file():
             raise FileNotFoundError(path)
         if _sha256(path) != payload.get("sha256"):
@@ -3210,7 +3503,11 @@ def load_diagnostic_order_prefix(
     )
     try:
         samples = [dataset[reference] for reference in order[:rows]]
-        return PackedBatchCollator(dataset.sequence_length)(samples)
+        return PackedBatchCollator(
+            dataset.sequence_length,
+            vocab_size=dataset.vocab_size,
+            eos_token_id=dataset.eos_token_id,
+        )(samples)
     finally:
         mmap_handle = getattr(order, "_mmap", None)
         if mmap_handle is not None:
@@ -3243,6 +3540,27 @@ def create_training_dataloader(
     a bare offset because it binds that cursor to all data identities.
     """
 
+    if not isinstance(num_workers, (int, np.integer)) or isinstance(
+        num_workers, bool
+    ):
+        raise TypeError("num_workers must be an integer")
+    if int(num_workers) < 0:
+        raise ValueError("num_workers must be non-negative")
+    if int(num_workers) > 0:
+        if (
+            not isinstance(prefetch_factor, (int, np.integer))
+            or isinstance(prefetch_factor, bool)
+        ):
+            raise TypeError("prefetch_factor must be an integer")
+        if int(prefetch_factor) < 1:
+            raise ValueError(
+                "prefetch_factor must be positive when workers are enabled"
+            )
+    if not isinstance(pin_memory, bool):
+        raise TypeError("pin_memory must be boolean")
+    if not isinstance(persistent_workers, bool):
+        raise TypeError("persistent_workers must be boolean")
+
     order_path = Path(order_manifest_path)
     sampler = DistributedBatchSampler(
         order_path,
@@ -3266,7 +3584,11 @@ def create_training_dataloader(
     kwargs: dict[str, Any] = {
         "dataset": dataset,
         "batch_sampler": sampler,
-        "collate_fn": PackedBatchCollator(dataset.sequence_length),
+        "collate_fn": PackedBatchCollator(
+            dataset.sequence_length,
+            vocab_size=dataset.vocab_size,
+            eos_token_id=dataset.eos_token_id,
+        ),
         "num_workers": int(num_workers),
         "pin_memory": bool(pin_memory),
         "persistent_workers": int(num_workers) > 0 and bool(persistent_workers),

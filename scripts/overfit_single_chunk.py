@@ -47,6 +47,15 @@ from pretrain.train import (
 from pretrain.tokenizer_identity import verify_tokenizer_identity, vocabulary_sha256
 
 
+class OverfitGateError(AssertionError):
+    """A completed overfit run that failed one or more acceptance criteria."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        self.result = dict(result)
+        failures = self.result.get("failures", [])
+        super().__init__(f"Fixed-chunk overfit gate failed: {failures}")
+
+
 def synthetic_tokenizer_identities(vocab_size: int) -> tuple[str, str]:
     """Return reproducible identities for the diagnostic numeric vocabulary."""
 
@@ -236,8 +245,8 @@ def run_overfit(
     )
     trainer.save_checkpoint()
     ratio = final_loss / baseline_loss
-    result = {
-        "status": "passed",
+    result: dict[str, Any] = {
+        "status": "pending",
         "order_manifest": str(order_manifest.resolve()),
         "fixed_batch_identity": fixed_stream.identity,
         "input_shape": list(fixed_stream.batch["input_ids"].shape),
@@ -253,12 +262,17 @@ def run_overfit(
         "tokenizer_manifest_sha256": tokenizer_manifest_sha256,
         "tokenizer_vocabulary_sha256": tokenizer_vocabulary_sha256,
     }
+    failures: list[str] = []
     if not all(math.isfinite(value) for value in (baseline_loss, resume_start_loss, final_loss)):
-        raise AssertionError(f"Non-finite overfit losses: {result}")
+        failures.append("non_finite_loss")
     if not final_loss < baseline_loss:
-        raise AssertionError(f"Fixed-chunk loss did not fall: {result}")
+        failures.append("final_loss_not_below_initial_loss")
     if ratio > required_loss_ratio:
-        raise AssertionError(f"Fixed-chunk loss did not fall enough: {result}")
+        failures.append("loss_ratio_above_required_threshold")
+    result["failures"] = failures
+    result["status"] = "failed" if failures else "passed"
+    if failures:
+        raise OverfitGateError(result)
     return result
 
 
@@ -365,33 +379,50 @@ def main() -> int:
         directory=args.output_dir,
     )
     logger = CompositeLogger(ConsoleLogger(), wandb_logger)
+    result_path = args.output_dir / "result.json"
+    _atomic_write_json(
+        result_path,
+        {
+            "status": "running",
+            "order_manifest": str(order_manifest.resolve()),
+            "model_size": args.model_size,
+            "device": str(device),
+            "steps": args.steps,
+            "seed": args.seed,
+        },
+    )
+    exit_code = 0
     try:
-        result = run_overfit(
-            order_manifest=order_manifest,
-            model_config=model_config,
-            device=device,
-            parameter_dtype=parameter_dtype,
-            precision=precision,
-            steps=args.steps,
-            checkpoint_every=args.checkpoint_every,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            required_loss_ratio=args.required_loss_ratio,
-            seed=args.seed,
-            checkpoint_path=args.output_dir / "checkpoint.pt",
-            resume_path=args.resume,
-            logger=logger,
-            compile_model=args.compile,
-            tokenizer_manifest_sha256=tokenizer_manifest_sha256,
-            tokenizer_vocabulary_sha256=tokenizer_vocabulary_sha256,
-        )
-        _atomic_write_json(args.output_dir / "result.json", result)
+        try:
+            result = run_overfit(
+                order_manifest=order_manifest,
+                model_config=model_config,
+                device=device,
+                parameter_dtype=parameter_dtype,
+                precision=precision,
+                steps=args.steps,
+                checkpoint_every=args.checkpoint_every,
+                batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
+                required_loss_ratio=args.required_loss_ratio,
+                seed=args.seed,
+                checkpoint_path=args.output_dir / "checkpoint.pt",
+                resume_path=args.resume,
+                logger=logger,
+                compile_model=args.compile,
+                tokenizer_manifest_sha256=tokenizer_manifest_sha256,
+                tokenizer_vocabulary_sha256=tokenizer_vocabulary_sha256,
+            )
+        except OverfitGateError as exc:
+            result = exc.result
+            exit_code = 1
+        _atomic_write_json(result_path, result)
         print(json.dumps(result, indent=2, sort_keys=True), flush=True)
     finally:
         logger.finish()
         if synthetic_context is not None:
             synthetic_context.cleanup()
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

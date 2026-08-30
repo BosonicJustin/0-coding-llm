@@ -31,9 +31,9 @@ input_ids       [B, T] int64
 labels          [B, T] int64, with cross-segment targets set to -100
 position_ids    [B, T] int64, reset to zero at each segment
 document_ids    [B, T] int64, incremented at each segment
-domain_ids      [B]
-row_ids         [B]
-sample_refs     [B]
+domain_ids       [B]
+row_ids          [B]
+sample_references [B]
 ```
 
 Suppose two documents share one physical row:
@@ -74,6 +74,10 @@ payload token for vocabulary range, requires the first segment-start bit in
 every row, requires every in-row document start to be preceded by EOS, rejects
 nonzero padding bits in the final start byte, and recomputes both
 `valid_loss_tokens` and `masked_boundary_labels` from the encoded starts.
+Shard payload names are canonical (`shard-NNNNNN.tokens.bin` and
+`shard-NNNNNN.starts.bin`); traversal paths, symlinked artifacts, duplicate or
+non-finite JSON values, incorrect recorded byte lengths, and unexpected files
+in a fully published shard directory fail closed.
 
 ## Crash-resumable packing construction
 
@@ -223,6 +227,12 @@ provides equivalent identity and trajectory checks around its
 completed-microbatch cursor. Any batches prepared but not consumed before
 interruption are discarded, preventing prefetch from silently skipping data.
 
+For the planned six-rank run, each global microbatch is sliced into six
+disjoint contiguous rank-local portions. A fresh loader process reconstructs
+the same slices from the identity-bound completed-microbatch cursor; tests
+prove that all six rank slices are pairwise disjoint, their union is the exact
+global-order prefix, and restart emits precisely the unconsumed suffix.
+
 The sampler exposes only the complete-update prefix recorded by the production
 manifest. `training_consumption` records available and consumed microbatches,
 optimizer updates, partial-tail rows, and exact consumed/dropped input and
@@ -269,6 +279,12 @@ the immutable packed shards and order to GPU-pod local NVMe, validate packed
 payload checksums and semantics once, then memory-map the local copies. The
 small `order.bin` checksum is independent and enabled by default on every
 loader open; `verify_payload_checksums=False` skips only the expensive shard
+scan. Even in that fast mode, dataset construction and every worker's first
+mmap require exact regular-file byte lengths, so truncation, appended garbage,
+and direct symlink substitution fail before a row is read. Production
+collation also rechecks token range, boundary-bit padding, and the EOS/start
+relationship for every loaded row. These inexpensive online checks complement,
+but do not replace, the launch certificate's complete SHA-256 and semantic
 scan. Do not make each worker issue random reads against network storage during
 the full run.
 

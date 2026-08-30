@@ -23,10 +23,16 @@ jobs:
           cache-dependency-path: |
             requirements-data.txt
             requirements-train.txt
-      - name: Install CPU test dependencies
+      - name: Install training-runtime dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-data.txt -r requirements-train.txt
+          python -m pip install -r requirements-train.txt
+      - name: Verify standalone training runtime
+        run: |
+          python -c "import model, pretrain.data, pretrain.train, pretrain.tokenizer_identity; from tokenizers import Tokenizer"
+          python scripts/launch_pretraining.py --help >/dev/null
+      - name: Install data-pipeline dependencies
+        run: python -m pip install -r requirements-data.txt
       - name: Compile Python sources
         run: python -m compileall -q model.py pretrain posttrain environments scripts tests
       - name: Run full CPU suite

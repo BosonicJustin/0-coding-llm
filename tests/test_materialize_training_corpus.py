@@ -1396,6 +1396,46 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
                     tokenizer_max_document_bytes=4,
                 ).run()
 
+    def test_full_documents_do_not_copy_the_tokenizer_id_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = MaterializationFixture(Path(temporary) / "source")
+            baseline_output = Path(temporary) / "baseline"
+            guarded_output = Path(temporary) / "guarded"
+            fixture.materializer(baseline_output).run()
+
+            materializer = fixture.materializer(guarded_output)
+            tokenizer = materializer.tokenizer
+
+            class SliceGuardIds(list[int]):
+                def __getitem__(self, key: Any) -> Any:
+                    if (
+                        isinstance(key, slice)
+                        and key.start is None
+                        and key.step is None
+                        and key.stop == len(self)
+                    ):
+                        raise AssertionError("full tokenizer ID list was copied")
+                    return super().__getitem__(key)
+
+            class EncodingProxy:
+                def __init__(self, ids: list[int]) -> None:
+                    self.ids = SliceGuardIds(ids)
+
+            original_encode_batch = tokenizer.encode_batch
+
+            def guarded_encode_batch(*args: Any, **kwargs: Any) -> list[EncodingProxy]:
+                return [
+                    EncodingProxy(encoding.ids)
+                    for encoding in original_encode_batch(*args, **kwargs)
+                ]
+
+            tokenizer.encode_batch = guarded_encode_batch
+            completed = materializer.run()
+            self.assertTrue(completed["complete"])
+            self.assertEqual(
+                directory_bytes(guarded_output), directory_bytes(baseline_output)
+            )
+
     def test_controlled_stop_resumes_without_replaying_committed_archives(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = MaterializationFixture(Path(temporary) / "source")

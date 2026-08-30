@@ -152,7 +152,8 @@ separately.
 - [x] Insert an end-of-text token between documents. Do not allow two documents
   to touch without a boundary token.
 - [x] Pack tokens densely into fixed-length causal sequences. Do not pad normal
-  training samples; drop or mask only the incomplete tail of a finalized shard.
+  training samples; retain carry across shard boundaries and omit only the
+  incomplete tail of a finalized split/domain stream.
 - [x] Prevent attention across document boundaries using explicit segment IDs;
   this policy is recorded and tested on the CPU reference backend. The CUDA
   FlexAttention implementation still requires its GPU smoke test.
@@ -244,6 +245,14 @@ been run and validated on the final selected corpus.
   workers, resume the exact format-v4 global-order cursor from a format-v5
   trainer checkpoint, and require
   bit-for-bit equality with the uninterrupted distributed trajectory.
+- [x] Make the production launcher inventory every visible GPU and reject a
+  heterogeneous DDP topology. For the FP32 1.3B path, reject devices below
+  32 GiB: parameters, gradients, and two Adam moments already consume
+  20,536,918,016 bytes per replica before activations/workspaces.
+- [x] Keep the launcher alive as a signal supervisor so preemption does not
+  inherit TorchElastic's roughly 30-second worker-kill deadline. Workers poll a
+  rank-shared request and checkpoint at a clean boundary; the pod termination
+  grace must cover the configured supervisor timeout.
 - [ ] Decode and manually inspect several complete batches.
 - [ ] Overfit one tiny batch; loss should fall sharply.
 - [ ] Run a short single-GPU job; require decreasing training loss, finite

@@ -2,3 +2,7 @@
 # The native model requires a PyTorch release that provides FlexAttention.
 numpy>=2.0,<3
 torch>=2.6
+# Production preflight and every trainer rank authenticate the frozen
+# token-to-ID mapping before model allocation. Keep this in the training
+# environment even when raw-data tooling is installed elsewhere.
+tokenizers>=0.21,<0.24

@@ -366,8 +366,16 @@ in `ENGLISH_NEAR_DEDUP.md`; curation enforces it before reading a mapping row.
 
 For the fast baseline, run directly on the durable network volume. This is
 slower than local NVMe but restart-safe; explicit DELETE journaling avoids WAL
-on NFS. If a later pod exposes at least 350 GB genuinely free local NVMe, use
-that for the work directory and copy only the closed publication afterward.
+on NFS. The live `selection-fast-v1` generation uses this baseline path.
+
+An accelerated, crash-safe local-WAL path is implemented for a **fresh output**
+and documented in `CURATION_ACCELERATION.md`. It requires roughly 322 GB free
+at first startup with the 100,000-row batch contract (500 GB recommended), keeps
+SQLite/WAL/temp state on pod-local storage, and periodically publishes verified
+recovery snapshots to the network volume. The CLI refuses same-filesystem
+"durable" storage and refuses converting or overwriting the baseline canonical
+database. Do not switch the live generation until the target-pod equivalence,
+crash-recovery, and minimum 3x end-to-end performance gates pass.
 
 First certify rollback-journal locking, abrupt-process recovery, and a minimum
 write rate on this exact mounted filesystem:
@@ -854,13 +862,26 @@ Run both single-GPU and `torchrun` smokes through `pretrain.train`. Do not pass
 from that diagnostic order.
 
 Run an uninterrupted control and a forced-stop/resume DDP run with the same
-topology and trajectory. The trainer handles `SIGINT`, `SIGTERM`, and
+topology and trajectory. The trainer handles `SIGHUP`, `SIGINT`, `SIGTERM`, and
 `SIGUSR1`: every rank observes the request at a safe optimizer-step boundary,
 participates in the required collectives, and rank zero atomically publishes a
 graceful-stop checkpoint before exiting with `128 + signal`. Do not use
 `SIGKILL`, and do not interrupt an in-progress checkpoint write. The atomic
 `last`/`previous` generations remain rollback-safe. Resume with the same
 trajectory and world size:
+
+For the production launcher, send the signal to the supervising
+`launch_pretraining.py` process. After preflight it re-execs a clean copy at the
+same PID so preflight CUDA contexts do not consume training VRAM, isolates
+torchrun in a separate session, and uses a shared local request file, giving
+workers 30 minutes by default to finish the update and durable checkpoint. This
+deliberately avoids TorchElastic's
+roughly 30-second signal-shutdown fallback. Configure the pod's termination
+grace to be at least `--graceful-shutdown-timeout-seconds`; otherwise the
+platform can still issue `SIGKILL` before checkpoint completion. After both
+the configured grace period and TorchElastic's cleanup window expire, the
+supervisor kills the complete child process group to avoid orphaned ranks and
+checkpoint leases.
 
 ```bash
 torchrun --standalone --nproc-per-node="$GPU_COUNT" -m pretrain.train \
@@ -886,7 +907,11 @@ states match under the documented deterministic gate; checkpoint rollback from
 a deliberately interrupted write works; and measured data/communication/
 checkpoint performance is acceptable. One mature replicated 1.284B FP32 AdamW
 checkpoint is about 15.4 GB; reserve at least two durable generations (about
-31 GB plus overhead) per active gate/run.
+31 GB plus overhead) per active gate/run. Each DDP replica also holds FP32
+parameters, gradients, and two Adam moments: 20,536,918,016 persistent bytes
+per GPU before activations and workspaces. The launcher rejects the 1.3B path
+below 32 GiB/device and heterogeneous visible GPUs; still require the measured
+full-topology memory smoke because 32 GiB is only an admission floor.
 
 ## 10. Final launch record and launch — GO/NO-GO 10
 

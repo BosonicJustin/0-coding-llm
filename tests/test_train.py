@@ -29,12 +29,17 @@ from pretrain.train import (
     ValidationRunner,
     WandbLogger,
     _atomic_torch_save,
+    _bind_wandb_run_id,
+    _finalize_training_run,
     _raise_if_distributed_stage_failed,
     _resolve_device,
     batch_fingerprint,
+    build_optimizer,
     capture_rng_state,
     evaluate_fixed_batch,
+    initialize_optional_metric_logger,
     learning_rate_for_step,
+    preserve_host_rng_state,
     reconcile_checkpoint_temporaries,
     restore_rng_state,
     seed_everything,
@@ -319,6 +324,24 @@ class TrainingHarnessTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "requirements-wandb"):
                 WandbLogger(mode="offline")
 
+    def test_optional_tracking_initialization_falls_back_without_rng_or_failure(self) -> None:
+        before = capture_rng_state()
+
+        def fail_to_initialize():
+            random.random()
+            np.random.rand()
+            torch.rand(3)
+            raise OSError("tracker service unavailable")
+
+        with preserve_host_rng_state():
+            logger, error = initialize_optional_metric_logger(fail_to_initialize)
+        self.assertEqual(type(logger).__name__, "NullLogger")
+        self.assertEqual(error, "OSError: tracker service unavailable")
+        after = capture_rng_state()
+        self.assertEqual(before["python"], after["python"])
+        np.testing.assert_array_equal(before["numpy"][1], after["numpy"][1])
+        self.assertTrue(torch.equal(before["torch_cpu"], after["torch_cpu"]))
+
     def test_wandb_offline_reuses_explicit_run_id(self) -> None:
         run = mock.Mock(id="stable-run-id")
         wandb = mock.Mock()
@@ -347,10 +370,74 @@ class TrainingHarnessTest(unittest.TestCase):
         logger.finish()
         run.finish.assert_called_once()
 
+    def test_new_wandb_run_id_invalidates_same_step_checkpoint_cache(self) -> None:
+        stream = FixedBatchStream(make_batch())
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "last.pt"
+            trainer = Trainer(
+                CausalLM(self.model_config, dtype=torch.float32),
+                self.train_config(max_steps=1),
+                device="cpu",
+                data_identity=stream.identity,
+                checkpoint_path=checkpoint,
+            )
+            trainer.save_checkpoint()
+            self.assertIsNotNone(trainer._last_checkpoint)
+            _bind_wandb_run_id(trainer, "new-stable-run-id")
+            self.assertIsNone(trainer._last_checkpoint)
+            trainer.save_checkpoint()
+            payload = torch.load(checkpoint, weights_only=False)
+            self.assertEqual(
+                payload["metadata"]["wandb_run_id"],
+                "new-stable-run-id",
+            )
+
     def test_learning_rate_warmup_and_decay_endpoints(self) -> None:
         config = self.train_config(max_steps=5)
         self.assertEqual(learning_rate_for_step(config, 0), config.learning_rate)
         self.assertEqual(learning_rate_for_step(config, 4), config.min_learning_rate)
+
+    def test_train_config_rejects_nonfinite_optimizer_hyperparameters(self) -> None:
+        base = self.train_config(max_steps=5)
+        for field, value in (
+            ("learning_rate", float("nan")),
+            ("min_learning_rate", float("inf")),
+            ("weight_decay", float("nan")),
+            ("beta1", float("inf")),
+            ("adam_eps", float("nan")),
+            ("max_grad_norm", float("inf")),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "must be finite"
+            ):
+                dataclasses.replace(base, **{field: value})
+
+    def test_adamw_decay_groups_are_complete_disjoint_and_shape_based(self) -> None:
+        model = CausalLM(self.model_config, dtype=torch.float32)
+        config = dataclasses.replace(
+            self.train_config(max_steps=1),
+            weight_decay=0.1,
+        )
+        optimizer = build_optimizer(
+            model,
+            config,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(optimizer.param_groups), 2)
+        decay = {id(parameter) for parameter in optimizer.param_groups[0]["params"]}
+        no_decay = {
+            id(parameter) for parameter in optimizer.param_groups[1]["params"]
+        }
+        expected = {id(parameter) for parameter in model.parameters()}
+        self.assertFalse(decay & no_decay)
+        self.assertEqual(decay | no_decay, expected)
+        for parameter in model.parameters():
+            self.assertEqual(id(parameter) in decay, parameter.ndim >= 2)
+        self.assertEqual(
+            optimizer.param_groups[0]["weight_decay"],
+            config.weight_decay,
+        )
+        self.assertEqual(optimizer.param_groups[1]["weight_decay"], 0.0)
 
     def test_fixed_stream_clones_and_fingerprints_full_batch(self) -> None:
         batch = make_batch()
@@ -395,10 +482,33 @@ class TrainingHarnessTest(unittest.TestCase):
             "perf/input_tokens_per_second",
             "perf/loss_tokens_per_second",
             "perf/step_seconds",
+            "perf/data_wait_seconds",
+            "perf/data_wait_fraction",
         }
         self.assertEqual(set(metrics), expected_metrics)
         self.assertEqual(metrics["train/input_tokens"], 12 * 8)
         self.assertEqual(metrics["train/loss_tokens"], 12 * 8)
+        self.assertGreaterEqual(metrics["perf/data_wait_fraction"], 0.0)
+        self.assertLessEqual(metrics["perf/data_wait_fraction"], 1.0)
+
+    def test_distributed_timing_reduces_wait_fraction_independently(self) -> None:
+        trainer = Trainer(
+            CausalLM(self.model_config, dtype=torch.float32),
+            self.train_config(max_steps=1),
+            device="cpu",
+            data_identity="timing-test",
+        )
+        trainer.world_size = 2
+
+        def reduce_max(values, *, op):
+            self.assertIs(op, torch.distributed.ReduceOp.MAX)
+            values.copy_(torch.tensor([10.0, 8.0, 8.0 / 9.0]))
+
+        with mock.patch.object(torch.distributed, "all_reduce", side_effect=reduce_max):
+            elapsed, wait, fraction = trainer._max_step_timings(9.0, 8.0)
+        self.assertEqual(elapsed, 10.0)
+        self.assertEqual(wait, 8.0)
+        self.assertAlmostEqual(fraction, 8.0 / 9.0)
 
     def test_token_normalized_accumulation_matches_concatenated_batch(self) -> None:
         first = make_batch(masked_targets=0)
@@ -1132,6 +1242,45 @@ class TrainingHarnessTest(unittest.TestCase):
                 full.optimizer.state_dict(),
                 resumed.optimizer.state_dict(),
             )
+
+    def test_external_supervisor_stop_request_and_finalization_window(self) -> None:
+        stream = FixedBatchStream(make_batch())
+        controller = GracefulStopController()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            request = root / "stop-request"
+            checkpoint = root / "last.pt"
+            trainer = Trainer(
+                CausalLM(self.model_config, dtype=torch.float32),
+                self.train_config(max_steps=1),
+                device="cpu",
+                data_identity=stream.identity,
+                checkpoint_path=checkpoint,
+                stop_controller=controller,
+            )
+
+            original_save = trainer.save_checkpoint
+
+            def save_then_receive_preemption(path=None):
+                original_save(path)
+                request.write_text(str(int(signal.SIGTERM)), encoding="ascii")
+
+            with (
+                mock.patch.dict(
+                    "os.environ",
+                    {"PRETRAIN_STOP_REQUEST_FILE": str(request)},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    trainer,
+                    "save_checkpoint",
+                    side_effect=save_then_receive_preemption,
+                ),
+            ):
+                exit_code = _finalize_training_run(trainer)
+            self.assertEqual(exit_code, 128 + int(signal.SIGTERM))
+            self.assertEqual(trainer.stop_signal, int(signal.SIGTERM))
+            self.assertTrue(checkpoint.is_file())
 
     def test_compile_setting_must_match_model_wrapper(self) -> None:
         config = dataclasses.replace(self.train_config(max_steps=1), compile_model=True)

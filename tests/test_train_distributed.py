@@ -50,6 +50,15 @@ TEST_TOKENIZER_MANIFEST_SHA256 = "a" * 64
 TEST_TOKENIZER_VOCABULARY_SHA256 = "b" * 64
 
 
+def _production_like_model_config():
+    """Use the 1.3B path's activation-checkpoint/DDP interaction at tiny scale."""
+
+    return dataclasses.replace(
+        tiny_model_config(vocab_size=VOCAB_SIZE, max_seq_len=SEQUENCE_LENGTH),
+        activation_checkpointing=True,
+    )
+
+
 def Trainer(*args, **kwargs):
     kwargs.setdefault(
         "tokenizer_manifest_sha256", TEST_TOKENIZER_MANIFEST_SHA256
@@ -177,7 +186,7 @@ def _ddp_worker(rank: int, rendezvous_uri: str, output_root: str) -> None:
 
         seed_everything(MODEL_SEED, deterministic=True)
         model = CausalLM(
-            tiny_model_config(vocab_size=VOCAB_SIZE, max_seq_len=SEQUENCE_LENGTH),
+            _production_like_model_config(),
             device="cpu",
             dtype=torch.float32,
         )
@@ -292,7 +301,7 @@ def _resume_worker(
 
         seed_everything(MODEL_SEED, deterministic=True)
         model = CausalLM(
-            tiny_model_config(vocab_size=VOCAB_SIZE, max_seq_len=SEQUENCE_LENGTH),
+            _production_like_model_config(),
             device="cpu",
             dtype=torch.float32,
         )
@@ -542,10 +551,7 @@ class DistributedTrainingGateTest(unittest.TestCase):
 
             seed_everything(MODEL_SEED, deterministic=True)
             reference_model = CausalLM(
-                tiny_model_config(
-                    vocab_size=VOCAB_SIZE,
-                    max_seq_len=SEQUENCE_LENGTH,
-                ),
+                _production_like_model_config(),
                 device="cpu",
                 dtype=torch.float32,
             )

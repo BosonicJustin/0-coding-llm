@@ -41,6 +41,16 @@ from typing import Any, Iterable, Iterator, Sequence
 
 import zstandard
 
+import curation_local_store as local_store_module
+from curation_local_store import (
+    DEFAULT_SNAPSHOT_RETENTION,
+    LOCAL_JOURNAL_MODE,
+    LocalSQLiteStore,
+    LocalStoreError,
+    canonical_sha256 as local_store_canonical_sha256,
+    file_sha256 as local_store_file_sha256,
+    storage_admission,
+)
 from benchmark_guard import BenchmarkGuard
 from curation_policy import (
     ALL_BUCKETS,
@@ -112,6 +122,31 @@ QUOTA_CANDIDATE_SQL = f"""
       AND NOT EXISTS (SELECT 1 FROM reasons AS r WHERE r.doc_id=d.doc_id)
     ORDER BY d.selection_rank, d.doc_id
 """
+QUOTA_CANDIDATE_AFTER_SQL = f"""
+    SELECT d.doc_id, d.tokens, d.selection_rank
+    FROM documents AS d INDEXED BY {QUOTA_SELECTION_INDEX}
+    CROSS JOIN groups AS g
+    WHERE d.bucket=?
+      AND g.group_id=d.source_group
+      AND g.split=?
+      AND NOT EXISTS (SELECT 1 FROM reasons AS r WHERE r.doc_id=d.doc_id)
+      AND (d.selection_rank, d.doc_id) > (?, ?)
+    ORDER BY d.selection_rank, d.doc_id
+"""
+BENCHMARK_CONTENT_CLUSTER_SQL = """
+    SELECT d.content_hash
+    FROM reasons AS r INDEXED BY reasons_reason
+    JOIN documents AS d ON d.doc_id=r.doc_id
+    WHERE d.content_hash>? AND r.reason GLOB 'benchmark:*'
+    GROUP BY d.content_hash ORDER BY d.content_hash LIMIT ?
+"""
+BENCHMARK_FINAL_CLUSTER_SQL = """
+    SELECT d.final_cluster
+    FROM reasons AS r INDEXED BY reasons_reason
+    JOIN documents AS d ON d.doc_id=r.doc_id
+    WHERE d.final_cluster>? AND r.reason GLOB 'benchmark:*'
+    GROUP BY d.final_cluster ORDER BY d.final_cluster LIMIT ?
+"""
 SQLITE_JOURNAL_MODES = frozenset(("auto", "delete", "wal"))
 CURATION_LEASE_VERSION = 1
 CURATION_LEASE_FILE = ".curation.cross-client-lease.json"
@@ -128,6 +163,11 @@ CURATION_DISK_SAFETY_DENOMINATOR = 1
 CURATION_MINIMUM_FREE_BYTES = 2 * 1_000_000_000
 CURATION_MINIMUM_SIDECAR_LIMIT_BYTES = 256 * 1024 * 1024
 CURATION_SIDECAR_BYTES_PER_TRANSACTION_ROW = 64 * 1024
+DEFAULT_LOCAL_SQLITE_SNAPSHOT_INTERVAL_SECONDS = 60 * 60
+LOCAL_WAL_AUTOCHECKPOINT_PAGES = 32_768
+MIGRATABLE_IDENTITY_KEYS = frozenset(
+    ("raw_archive_integrity_policy", "sqlite_execution")
+)
 LOCAL_FILESYSTEMS = frozenset(
     (
         "apfs",
@@ -741,9 +781,34 @@ def stable_digest(namespace: str, value: str | bytes) -> bytes:
     return hashlib.sha256(namespace.encode("utf-8") + b"\0" + raw).digest()
 
 
-def iter_jsonl_zst(path: Path) -> Iterator[dict[str, Any]]:
+class _DigestingReader:
+    """Minimal read-through wrapper used to authenticate a consumed stream."""
+
+    def __init__(self, raw: Any) -> None:
+        self.raw = raw
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        payload = self.raw.read(size)
+        self.digest.update(payload)
+        return payload
+
+    def close(self) -> None:
+        self.raw.close()
+
+
+def iter_jsonl_zst(
+    path: Path, *, expected_sha256: str | None = None
+) -> Iterator[dict[str, Any]]:
     with path.open("rb") as raw:
-        reader = zstandard.ZstdDecompressor().stream_reader(raw, read_across_frames=True)
+        source: Any = raw
+        digesting: _DigestingReader | None = None
+        if expected_sha256 is not None:
+            digesting = _DigestingReader(raw)
+            source = digesting
+        reader = zstandard.ZstdDecompressor().stream_reader(
+            source, read_across_frames=True
+        )
         text = __import__("io").TextIOWrapper(reader, encoding="utf-8")
         try:
             for line_number, line in enumerate(text, 1):
@@ -755,6 +820,8 @@ def iter_jsonl_zst(path: Path) -> Iterator[dict[str, Any]]:
                 yield row
         finally:
             text.close()
+        if digesting is not None and digesting.digest.hexdigest() != expected_sha256:
+            raise CurationError(f"Compressed JSONL checksum mismatch: {path}")
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -987,23 +1054,8 @@ def iter_merged_quota_candidate_rows(
             else:
                 after_rank, after_doc_id = after
                 cursor = connection.execute(
-                    f"""
-                    SELECT d.doc_id, d.tokens, d.selection_rank
-                    FROM documents AS d INDEXED BY {QUOTA_SELECTION_INDEX}
-                    CROSS JOIN groups AS g
-                    WHERE d.bucket=?
-                      AND g.group_id=d.source_group
-                      AND g.split=?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM reasons AS r WHERE r.doc_id=d.doc_id
-                      )
-                      AND (
-                          d.selection_rank > ? OR
-                          (d.selection_rank = ? AND d.doc_id > ?)
-                      )
-                    ORDER BY d.selection_rank, d.doc_id
-                    """,
-                    (bucket, split, after_rank, after_rank, after_doc_id),
+                    QUOTA_CANDIDATE_AFTER_SQL,
+                    (bucket, split, after_rank, after_doc_id),
                 )
             cursors.append(cursor)
             row = cursor.fetchone()
@@ -1041,6 +1093,13 @@ class CurationBuilder:
         allow_missing_english_near_dedup: bool,
         batch_size: int = 5_000,
         sqlite_journal_mode: str = "auto",
+        sqlite_local_work_root: Path | None = None,
+        sqlite_snapshot_interval_seconds: int = (
+            DEFAULT_LOCAL_SQLITE_SNAPSHOT_INTERVAL_SECONDS
+        ),
+        sqlite_snapshot_retention: int = DEFAULT_SNAPSHOT_RETENTION,
+        defer_raw_archive_integrity_until_finalize: bool = False,
+        allow_same_device_local_store_for_testing: bool = False,
     ) -> None:
         self.root = root
         self.staging_root = staging_root
@@ -1052,8 +1111,24 @@ class CurationBuilder:
         self.allow_missing_english_near_dedup = allow_missing_english_near_dedup
         self.batch_size = batch_size
         self.sqlite_journal_mode = sqlite_journal_mode
+        self.sqlite_local_work_root = sqlite_local_work_root
+        self.sqlite_snapshot_interval_seconds = sqlite_snapshot_interval_seconds
+        self.sqlite_snapshot_retention = sqlite_snapshot_retention
+        self.defer_raw_archive_integrity_until_finalize = (
+            defer_raw_archive_integrity_until_finalize
+        )
+        self.allow_same_device_local_store_for_testing = (
+            allow_same_device_local_store_for_testing
+        )
         if batch_size < 1 or batch_size > 100_000:
             raise CurationError("batch_size must be between 1 and 100,000")
+        if sqlite_snapshot_interval_seconds < 1:
+            raise CurationError("sqlite_snapshot_interval_seconds must be positive")
+        if (
+            isinstance(sqlite_snapshot_retention, bool)
+            or sqlite_snapshot_retention < 2
+        ):
+            raise CurationError("sqlite_snapshot_retention must be at least two")
         self.sqlite_runtime = {
             "sqlite_version": sqlite3.sqlite_version,
             "journal_policy": select_sqlite_journal_policy(
@@ -1116,6 +1191,11 @@ class CurationBuilder:
                 "--allow-missing-english-near-dedup is only valid when the "
                 "required mapping is absent; remove the diagnostic override"
             )
+        if defer_raw_archive_integrity_until_finalize and not self.fast_canonical_profile:
+            raise CurationError(
+                "Deferred raw-archive integrity is allowed only by the production "
+                "fast canonical profile; English near-dedup requires eager evidence"
+            )
         self.quotas = load_final_quotas(quota_path)
         self.collection_targets = load_collection_targets(quota_path)
         self.quota_sha = file_sha256(quota_path)
@@ -1153,14 +1233,45 @@ class CurationBuilder:
             "english_near_artifact": self.english_near_artifact,
             "sqlite_runtime": self.sqlite_runtime,
             "curation_storage_contract": self.storage_contract,
+            "raw_archive_integrity_policy": (
+                "deferred-full-sha256-mandatory-before-publication"
+                if self.defer_raw_archive_integrity_until_finalize
+                else "eager-full-sha256-at-open-and-before-publication"
+            ),
             **self.artifact_identity,
         }
+        if self.sqlite_local_work_root is not None:
+            self.identity["sqlite_execution"] = {
+                "mode": "local-wal-with-durable-snapshots",
+                "protocol_version": 1,
+                "active_journal_mode": LOCAL_JOURNAL_MODE,
+                "canonical_journal_mode": self.sqlite_runtime["journal_policy"][
+                    "selected_mode"
+                ],
+                "snapshot_retention": self.sqlite_snapshot_retention,
+                "wal_autocheckpoint_pages": LOCAL_WAL_AUTOCHECKPOINT_PAGES,
+                "locking_mode": "exclusive",
+            }
         if self.fast_canonical_profile:
             self.identity["curation_profile"] = self.curation_profile
-        self.work = output / ".work"
+        self.durable_work = output / ".work"
+        self.work = (
+            self.sqlite_local_work_root
+            if self.sqlite_local_work_root is not None
+            else self.durable_work
+        )
+        # In local mode live audit projections may be newer than the most
+        # recent durable recovery snapshot, so they must remain local.  Each
+        # durable snapshot contains its own manifest-bound CHECKPOINT/journal.
+        self.audit_work = self.work
         self.sqlite_temp = self.work / "sqlite-tmp"
         self.db_path = self.work / "curation.sqlite3"
+        self.canonical_db_path = self.durable_work / "curation.sqlite3"
         self.connection: sqlite3.Connection | None = None
+        self.local_store: LocalSQLiteStore | None = None
+        self.active_journal_mode = self.sqlite_runtime["journal_policy"][
+            "selected_mode"
+        ]
 
     def _load_preprocess_manifest(self) -> dict[str, Any]:
         path = self.staging_root / "PREPROCESS_MANIFEST.json"
@@ -1397,7 +1508,11 @@ class CurationBuilder:
     def _load_report_inventory(
         self,
         records: dict[tuple[str, int], dict[str, Any]],
+        *,
+        verify_raw_integrity: bool | None = None,
     ) -> list[tuple[str, Path, str, dict[str, Any]]]:
+        if verify_raw_integrity is None:
+            verify_raw_integrity = not self.defer_raw_archive_integrity_until_finalize
         reports_root = self.staging_root / "reports"
         paths = (
             sorted(
@@ -1414,11 +1529,10 @@ class CurationBuilder:
         seen_archives: set[str] = set()
         seen_shards: set[str] = set()
         seen_keys: set[tuple[str, int]] = set()
-        # The completeness snapshot is authoritative only after every raw
-        # archive has been re-hashed. Keep the verified values so the English
-        # near-artifact contract can reuse this byte evidence without reading
-        # those archives a second time. A later final snapshot rebuilds the
-        # mapping and therefore detects mutation during a long curation run.
+        # Eager mode authenticates raw bytes now. The opt-in fast-profile mode
+        # pins canonical paths, sizes, report identities, and expected digests
+        # here, then performs the same full hash pass unconditionally before
+        # any final manifest can be published.
         verified_raw_archive_sha256: dict[str, str] = {}
         for path in paths:
             if path.name.startswith(".") or path.suffix != ".json":
@@ -1470,10 +1584,15 @@ class CurationBuilder:
             raw_archive = self.root / quota["archive"]
             if raw_archive.stat().st_size != archive_size:
                 raise CurationError(f"Report/raw archive size mismatch in {path}")
-            actual_archive_sha256 = file_sha256(raw_archive)
-            if actual_archive_sha256 != report["archive_sha256"]:
-                raise CurationError(f"Report/raw archive checksum mismatch in {path}")
-            verified_raw_archive_sha256[quota["archive"]] = actual_archive_sha256
+            if verify_raw_integrity:
+                actual_archive_sha256 = file_sha256(raw_archive)
+                if actual_archive_sha256 != report["archive_sha256"]:
+                    raise CurationError(f"Report/raw archive checksum mismatch in {path}")
+                verified_raw_archive_sha256[quota["archive"]] = actual_archive_sha256
+            else:
+                verified_raw_archive_sha256[quota["archive"]] = str(
+                    report["archive_sha256"]
+                )
             expected_fingerprint = (
                 self.staging_root
                 / "fingerprints"
@@ -1529,6 +1648,8 @@ class CurationBuilder:
 
     def _load_complete_report_inventory(
         self,
+        *,
+        force_raw_integrity: bool = False,
     ) -> tuple[list[tuple[str, Path, str, dict[str, Any]]], dict[str, Any]]:
         errors_root = self.staging_root / "errors"
         error_records = (
@@ -1547,7 +1668,14 @@ class CurationBuilder:
             )
         records = self._load_collection_records()
         raw_inventory = self._validate_raw_archive_inventory(records)
-        report_inventory = self._load_report_inventory(records)
+        report_inventory = self._load_report_inventory(
+            records,
+            verify_raw_integrity=(
+                True
+                if force_raw_integrity
+                else not self.defer_raw_archive_integrity_until_finalize
+            ),
+        )
         ledger_totals = {
             bucket: {
                 "archives": sum(1 for record_bucket, _index in records if record_bucket == bucket),
@@ -2924,28 +3052,158 @@ class CurationBuilder:
         self.output.mkdir(parents=True, exist_ok=True)
         if self.output.is_symlink() or not self.output.is_dir():
             raise CurationError("Curation output must be a real directory")
+        self.durable_work.mkdir(parents=True, exist_ok=True)
+        if self.durable_work.is_symlink() or not self.durable_work.is_dir():
+            raise CurationError("Durable curation work path must be a real directory")
+        if self.sqlite_local_work_root is not None:
+            local_mount = detect_output_mount(self.work)
+            if local_mount.get("classification") != "local":
+                raise CurationError(
+                    "Opt-in local SQLite work root must be on a positively "
+                    f"identified local filesystem: {local_mount}"
+                )
+            durable_mount = self.sqlite_runtime["journal_policy"]["mount"]
+            if not self.allow_same_device_local_store_for_testing:
+                if durable_mount.get("classification") != "network":
+                    raise CurationError(
+                        "Local SQLite acceleration requires OUTPUT on a positively "
+                        "identified durable network filesystem"
+                    )
+                if (
+                    durable_mount.get("mount_point")
+                    == local_mount.get("mount_point")
+                    or (
+                        durable_mount.get("device") is not None
+                        and durable_mount.get("device") == local_mount.get("device")
+                    )
+                ):
+                    raise CurationError(
+                        "Local SQLite work and durable recovery output must use "
+                        "independent filesystems"
+                    )
+            self._validate_existing_local_canonical_contract()
+            expected_documents = sum(
+                int(report["documents"])
+                for _relative, _path, _checksum, report in self.report_inventory
+            )
+            # A resume must budget for the projected final database, not an
+            # unnecessary second complete copy. Only regular, non-symlink
+            # SQLite-owned files receive this capacity credit; store identity
+            # validation below still rejects an unowned local root.
+            reclaimable_existing_bytes = 0
+            for candidate in (
+                self.db_path,
+                Path(f"{self.db_path}-journal"),
+                Path(f"{self.db_path}-wal"),
+                Path(f"{self.db_path}-shm"),
+            ):
+                if (
+                    candidate.exists()
+                    and not candidate.is_symlink()
+                    and candidate.is_file()
+                ):
+                    reclaimable_existing_bytes += candidate.stat().st_size
+            admission = storage_admission(
+                local_root=self.work,
+                filesystem_type=str(local_mount.get("filesystem_type", "unknown")),
+                expected_documents=expected_documents,
+                projected_bytes_per_document=int(
+                    self.storage_contract[
+                        "projected_additional_bytes_per_document"
+                    ]
+                ),
+                safety_numerator=int(
+                    self.storage_contract["disk_safety_numerator"]
+                ),
+                safety_denominator=int(
+                    self.storage_contract["disk_safety_denominator"]
+                ),
+                transaction_sidecar_bytes=int(
+                    self.storage_contract["transaction_sidecar_limit_bytes"]
+                ),
+                minimum_free_bytes=int(
+                    self.storage_contract["minimum_free_bytes_after_projection"]
+                ),
+                reclaimable_existing_bytes=reclaimable_existing_bytes,
+            )
+            store_identity = {
+                "output": str(self.output.resolve()),
+                "policy_sha256": self.policy_sha,
+                "quota_config_sha256": self.quota_sha,
+                "report_inventory_sha256": self.inventory_sha,
+                "preprocess_manifest_sha256": self.identity[
+                    "preprocess_manifest_sha256"
+                ],
+                "sqlite_execution": self.identity["sqlite_execution"],
+            }
+            self.local_store = LocalSQLiteStore(
+                local_root=self.work,
+                durable_work=self.durable_work,
+                canonical_db=self.canonical_db_path,
+                identity=store_identity,
+                admission=admission,
+                canonical_journal_mode=self.sqlite_runtime["journal_policy"][
+                    "selected_mode"
+                ],
+                snapshot_interval_seconds=self.sqlite_snapshot_interval_seconds,
+                snapshot_retention=self.sqlite_snapshot_retention,
+                runtime_provenance={
+                    "python": platform.python_version(),
+                    "sqlite": sqlite3.sqlite_version,
+                    "curate_corpus_sha256": local_store_file_sha256(
+                        Path(__file__).resolve()
+                    ),
+                    "curation_local_store_sha256": local_store_file_sha256(
+                        Path(local_store_module.__file__).resolve()
+                    ),
+                    "local_mount": local_mount,
+                    "admission_sha256": local_store_canonical_sha256(admission),
+                },
+            )
+            self.local_store.prepare()
         self.work.mkdir(parents=True, exist_ok=True)
         if self.work.is_symlink() or not self.work.is_dir():
             raise CurationError("Curation work path must be a real directory")
         self.sqlite_temp.mkdir(parents=True, exist_ok=True)
         if self.sqlite_temp.is_symlink() or not self.sqlite_temp.is_dir():
             raise CurationError("SQLite temp path must be a real directory")
-        if len(
-            {
-                self.output.stat().st_dev,
-                self.work.stat().st_dev,
-                self.sqlite_temp.stat().st_dev,
-            }
-        ) != 1:
+        if self.sqlite_local_work_root is None:
+            if len(
+                {
+                    self.output.stat().st_dev,
+                    self.work.stat().st_dev,
+                    self.sqlite_temp.stat().st_dev,
+                }
+            ) != 1:
+                raise CurationError(
+                    "Output, curation database, and SQLite temp paths must share one filesystem"
+                )
+        elif (
+            self.output.stat().st_dev != self.durable_work.stat().st_dev
+            or self.work.stat().st_dev != self.sqlite_temp.stat().st_dev
+        ):
             raise CurationError(
-                "Output, curation database, and SQLite temp paths must share one filesystem"
+                "Local SQLite/temp and durable output/work pairs must each share a filesystem"
+            )
+        if (
+            self.sqlite_local_work_root is not None
+            and not self.allow_same_device_local_store_for_testing
+            and self.work.stat().st_dev == self.durable_work.stat().st_dev
+        ):
+            raise CurationError(
+                "Local SQLite work and durable recovery output resolved to the same device"
             )
         frozen_mount = self.sqlite_runtime["journal_policy"]["mount"]
-        for label, path in (
-            ("output", self.output),
-            ("database work", self.work),
-            ("SQLite temp", self.sqlite_temp),
-        ):
+        frozen_paths = (
+            [
+                ("output", self.output),
+                ("database work", self.work),
+                ("SQLite temp", self.sqlite_temp),
+            ]
+            if self.sqlite_local_work_root is None
+            else [("output", self.output), ("durable work", self.durable_work)]
+        )
+        for label, path in frozen_paths:
             if detect_output_mount(path) != frozen_mount:
                 raise CurationError(
                     f"{label} mount differs from the frozen curation mount identity"
@@ -2962,7 +3220,12 @@ class CurationBuilder:
                 "Output mount or SQLite runtime changed before database open"
             )
         selected_mode = self.sqlite_runtime["journal_policy"]["selected_mode"]
-        if selected_mode == "delete":
+        self.active_journal_mode = (
+            LOCAL_JOURNAL_MODE
+            if self.sqlite_local_work_root is not None
+            else selected_mode
+        )
+        if self.sqlite_local_work_root is None and selected_mode == "delete":
             unsafe_sidecars = [
                 path
                 for path in (
@@ -3004,10 +3267,17 @@ class CurationBuilder:
             )
             if configured_limit != sidecar_limit:
                 raise CurationError("SQLite refused the curation journal-size limit")
-            self.connection.execute("PRAGMA wal_autocheckpoint=1024")
+            wal_autocheckpoint_pages = (
+                LOCAL_WAL_AUTOCHECKPOINT_PAGES
+                if self.sqlite_local_work_root is not None
+                else 1_024
+            )
+            self.connection.execute(
+                f"PRAGMA wal_autocheckpoint={wal_autocheckpoint_pages}"
+            )
             if int(
                 self.connection.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
-            ) != 1024:
+            ) != wal_autocheckpoint_pages:
                 raise CurationError("SQLite refused the WAL autocheckpoint bound")
             self.connection.execute(f"PRAGMA temp_store={SQLITE_TEMP_STORE}")
             if int(self.connection.execute("PRAGMA temp_store").fetchone()[0]) != 1:
@@ -3022,10 +3292,16 @@ class CurationBuilder:
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
             ).fetchone() is not None
             if metadata_exists:
-                if current_mode != selected_mode:
+                allowed_existing_modes = (
+                    {selected_mode, LOCAL_JOURNAL_MODE}
+                    if self.sqlite_local_work_root is not None
+                    else {selected_mode}
+                )
+                if current_mode not in allowed_existing_modes:
                     raise CurationError(
                         "Existing curation database journal mode mismatch: "
-                        f"found {current_mode}, expected {selected_mode}"
+                        f"found {current_mode}, expected one of "
+                        f"{sorted(allowed_existing_modes)}"
                     )
                 # Validate the frozen mount/mode identity before any schema or
                 # metadata write. In particular, never convert a copied WAL
@@ -3040,16 +3316,50 @@ class CurationBuilder:
                     )
                 configured_mode = str(
                     self.connection.execute(
-                        f"PRAGMA journal_mode={selected_mode.upper()}"
+                        f"PRAGMA journal_mode={self.active_journal_mode.upper()}"
                     ).fetchone()[0]
                 ).casefold()
-                if configured_mode != selected_mode:
+                if configured_mode != self.active_journal_mode:
                     raise CurationError(
                         "SQLite refused the selected journal mode: "
-                        f"found {configured_mode}, expected {selected_mode}"
+                        f"found {configured_mode}, expected {self.active_journal_mode}"
                     )
                 self._create_schema()
                 self._initialize_or_validate_identity()
+            if self.sqlite_local_work_root is not None:
+                configured_mode = str(
+                    self.connection.execute(
+                        f"PRAGMA journal_mode={LOCAL_JOURNAL_MODE.upper()}"
+                    ).fetchone()[0]
+                ).casefold()
+                if configured_mode != LOCAL_JOURNAL_MODE:
+                    raise CurationError(
+                        "Local SQLite database refused WAL mode: "
+                        f"found {configured_mode}"
+                    )
+                locking_mode = str(
+                    self.connection.execute(
+                        "PRAGMA locking_mode=EXCLUSIVE"
+                    ).fetchone()[0]
+                ).casefold()
+                if locking_mode != "exclusive":
+                    raise CurationError(
+                        "Local SQLite database refused exclusive single-writer locking"
+                    )
+                recovery = self.local_store.last_prepare_evidence if self.local_store else {}
+                recovered_sidecars = recovery.get("sqlite_sidecars_before_recovery", {})
+                if recovered_sidecars:
+                    quick_check = self.connection.execute("PRAGMA quick_check").fetchone()
+                    if quick_check is None or str(quick_check[0]) != "ok":
+                        raise CurationError(
+                            "Local SQLite WAL crash recovery failed quick_check"
+                        )
+                    if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                        raise CurationError(
+                            "Local SQLite WAL crash recovery failed foreign-key validation"
+                        )
+                    recovery["post_recovery_quick_check"] = "ok"
+                    recovery["post_recovery_foreign_key_check"] = "ok"
             self._assert_no_storage_violation()
             self._sync_audit_files()
             return self
@@ -3060,14 +3370,89 @@ class CurationBuilder:
 
     def __exit__(self, *_args: Any) -> None:
         if self.connection is not None:
-            self.connection.close()
-            self.connection = None
+            original_error = _args[1] if len(_args) >= 2 else None
+            try:
+                if self.local_store is not None:
+                    if self.connection.in_transaction:
+                        self.connection.rollback()
+                    try:
+                        phase = self._phase()
+                        self._snapshot_local_state(
+                            reason=f"builder-exit:{phase}",
+                            force=True,
+                        )
+                        self.local_store.promote_latest()
+                    except BaseException as snapshot_error:
+                        # Best-effort emergency publication must never hide the
+                        # exception that caused context exit. With no original
+                        # error, snapshot/promotion failure remains fatal.
+                        if original_error is None:
+                            raise
+                        add_note = getattr(original_error, "add_note", None)
+                        if add_note is not None:
+                            add_note(
+                                "Local SQLite exit snapshot/promotion also failed: "
+                                f"{type(snapshot_error).__name__}: {snapshot_error}"
+                            )
+            finally:
+                self.connection.close()
+                self.connection = None
 
     @property
     def db(self) -> sqlite3.Connection:
         if self.connection is None:
             raise RuntimeError("CurationBuilder must be used as a context manager")
         return self.connection
+
+    def _validate_existing_local_canonical_contract(self) -> None:
+        """Never convert or overwrite a baseline generation implicitly."""
+
+        canonical = self.canonical_db_path
+        if not canonical.exists() and not canonical.is_symlink():
+            return
+        if canonical.is_symlink() or not canonical.is_file():
+            raise CurationError(
+                "Existing canonical curation database must be a regular file"
+            )
+        sidecars = [
+            Path(f"{canonical}{suffix}")
+            for suffix in ("-journal", "-wal", "-shm")
+            if Path(f"{canonical}{suffix}").exists()
+        ]
+        if sidecars:
+            raise CurationError(
+                "Existing canonical curation database has SQLite sidecars; "
+                "refusing local-mode conversion or overwrite"
+            )
+        uri = f"file:{canonical.resolve(strict=True).as_posix()}?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True, timeout=120)
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='sqlite_execution'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise CurationError(
+                "Existing canonical database is not an accelerated generation; "
+                "use a fresh --output"
+            ) from exc
+        finally:
+            connection.close()
+        if row is None:
+            raise CurationError(
+                "Refusing to convert or overwrite a baseline curation generation; "
+                "local SQLite acceleration requires a fresh --output"
+            )
+        try:
+            execution = json.loads(str(row[0]))
+        except json.JSONDecodeError as exc:
+            raise CurationError(
+                "Existing canonical sqlite_execution identity is invalid"
+            ) from exc
+        if execution != self.identity.get("sqlite_execution"):
+            raise CurationError(
+                "Existing accelerated canonical database has a different "
+                "sqlite_execution identity"
+            )
 
     def _create_schema(self) -> None:
         self.db.executescript(
@@ -3301,8 +3686,18 @@ class CurationBuilder:
             DB_VERSION,
         ):
             raise CurationError("Curation database version mismatch")
+        # A canonical database promoted from local mode retains that execution
+        # provenance even if it is later opened without a local working root.
+        for key in MIGRATABLE_IDENTITY_KEYS:
+            if key in existing and key not in encoded:
+                self.identity[key] = json.loads(existing[key])
+                encoded[key] = existing[key]
         existing_version = json.loads(existing.get("database_version", "null"))
+        identity_extensions: list[tuple[str, str]] = []
         for key, value in encoded.items():
+            if key in MIGRATABLE_IDENTITY_KEYS and key not in existing:
+                identity_extensions.append((key, value))
+                continue
             if (
                 existing_version == 1
                 and key == "curation_storage_contract"
@@ -3325,6 +3720,16 @@ class CurationBuilder:
                 continue
             if existing.get(key) != value:
                 raise CurationError(f"Resume identity mismatch for {key}")
+        if identity_extensions:
+            with self.db:
+                self.db.executemany(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                    identity_extensions,
+                )
+                self._event(
+                    "identity_contract_extended",
+                    {"keys": sorted(key for key, _value in identity_extensions)},
+                )
 
     def _phase(self) -> str:
         row = self.db.execute("SELECT value FROM metadata WHERE key='phase'").fetchone()
@@ -3836,7 +4241,7 @@ class CurationBuilder:
         return completed
 
     def _bound_wal_after_commit(self) -> None:
-        if self.sqlite_runtime["journal_policy"]["selected_mode"] != "wal":
+        if self.active_journal_mode != "wal":
             return
         wal = Path(f"{self.db_path}-wal")
         limit = int(self.storage_contract["transaction_sidecar_limit_bytes"])
@@ -3900,9 +4305,49 @@ class CurationBuilder:
         return self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
 
     def _after_bounded_commit(
-        self, _subphase: str, _progress: dict[str, Any]
+        self, subphase: str, _progress: dict[str, Any]
     ) -> None:
         """Fault-injection seam: committed state is durable before this hook."""
+        if self.local_store is not None:
+            self._snapshot_local_state(
+                reason=f"bounded-commit:{subphase}",
+            )
+
+    def _journal_bytes(self) -> bytes:
+        events = [
+            {
+                "sequence": int(row[0]),
+                "event": row[1],
+                "payload": json.loads(row[2]),
+            }
+            for row in self.db.execute(
+                "SELECT sequence, event, payload FROM events ORDER BY sequence"
+            )
+        ]
+        return b"".join(canonical_json_bytes(row) + b"\n" for row in events)
+
+    def _snapshot_local_state(
+        self, *, reason: str, force: bool = False
+    ) -> dict[str, Any] | None:
+        if self.local_store is None:
+            return None
+        if not self.local_store.snapshot_due(force=force):
+            return None
+        checkpoint = (
+            json.dumps(self._checkpoint_payload(), indent=2, sort_keys=True).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
+        return self.local_store.maybe_snapshot(
+            self.db,
+            reason=reason,
+            force=force,
+            authority_artifacts={
+                "CHECKPOINT.json": checkpoint,
+                "journal.jsonl": self._journal_bytes(),
+            },
+        )
 
     def _checkpoint_payload(self) -> dict[str, Any]:
         count_row = self.db.execute(
@@ -3983,7 +4428,9 @@ class CurationBuilder:
 
     def _sync_checkpoint_file(self) -> None:
         if self.connection is not None:
-            atomic_json(self.work / "CHECKPOINT.json", self._checkpoint_payload())
+            atomic_json(
+                self.audit_work / "CHECKPOINT.json", self._checkpoint_payload()
+            )
 
     def _validate_durable_counts_full(self) -> dict[str, int]:
         actual_row = self.db.execute(
@@ -4016,12 +4463,7 @@ class CurationBuilder:
     def _sync_audit_files(self) -> None:
         if self.connection is None:
             return
-        events = [
-            {"sequence": int(row[0]), "event": row[1], "payload": json.loads(row[2])}
-            for row in self.db.execute("SELECT sequence, event, payload FROM events ORDER BY sequence")
-        ]
-        journal = b"".join(canonical_json_bytes(row) + b"\n" for row in events)
-        atomic_bytes(self.work / "journal.jsonl", journal)
+        atomic_bytes(self.audit_work / "journal.jsonl", self._journal_bytes())
         self._sync_checkpoint_file()
 
     def ingest_inventory(self, max_new_archives: int | None = None) -> bool:
@@ -4965,22 +5407,12 @@ class CurationBuilder:
         phases = (
             (
                 "canonicalize.benchmark_content_clusters",
-                """
-                SELECT d.content_hash
-                FROM reasons AS r JOIN documents AS d ON d.doc_id=r.doc_id
-                WHERE d.content_hash>? AND r.reason LIKE 'benchmark:%'
-                GROUP BY d.content_hash ORDER BY d.content_hash LIMIT ?
-                """,
+                BENCHMARK_CONTENT_CLUSTER_SQL,
                 "INSERT INTO benchmark_content_clusters(content_hash) VALUES (?)",
             ),
             (
                 "canonicalize.benchmark_final_clusters",
-                """
-                SELECT d.final_cluster
-                FROM reasons AS r JOIN documents AS d ON d.doc_id=r.doc_id
-                WHERE d.final_cluster>? AND r.reason LIKE 'benchmark:%'
-                GROUP BY d.final_cluster ORDER BY d.final_cluster LIMIT ?
-                """,
+                BENCHMARK_FINAL_CLUSTER_SQL,
                 "INSERT INTO benchmark_final_clusters(final_cluster) VALUES (?)",
             ),
             (
@@ -5550,10 +5982,10 @@ class CurationBuilder:
         if not ids:
             return {}
         result = {doc_id: {"reasons": []} for doc_id in ids}
-        # SQLite defaults to 999 bind parameters.  Input batches are split
-        # into conservative lookup chunks while output compression stays large.
-        for start in range(0, len(ids), 500):
-            chunk = ids[start : start + 500]
+        # SQLite defaults to 999 bind parameters. Keep enough headroom for
+        # compatibility with that minimum while amortizing network round trips.
+        for start in range(0, len(ids), 900):
+            chunk = ids[start : start + 900]
             marks = ",".join("?" for _ in chunk)
             for row in self.db.execute(
                 f"SELECT doc_id, reason FROM reasons WHERE doc_id IN ({marks}) ORDER BY doc_id, reason",
@@ -5561,32 +5993,26 @@ class CurationBuilder:
             ):
                 result[bytes(row[0])]["reasons"].append(str(row[1]))
             for row in self.db.execute(
-                f"SELECT doc_id, canonical_doc_id FROM canonical_map WHERE doc_id IN ({marks})",
-                chunk,
-            ):
-                result[bytes(row[0])]["canonical_doc_id"] = bytes(row[1]).hex()
-            for row in self.db.execute(
                 f"""
-                SELECT d.doc_id, g.split, hex(d.source_group)
-                FROM documents AS d JOIN groups AS g ON g.group_id=d.source_group
+                SELECT d.doc_id, c.canonical_doc_id, g.split,
+                       hex(d.source_group), s.split, s.selected_tokens
+                FROM documents AS d
+                LEFT JOIN canonical_map AS c ON c.doc_id=d.doc_id
+                LEFT JOIN groups AS g ON g.group_id=d.source_group
+                LEFT JOIN selected AS s ON s.doc_id=d.doc_id
                 WHERE d.doc_id IN ({marks})
                 """,
                 chunk,
             ):
-                result[bytes(row[0])].update(
-                    assigned_split=str(row[1]), group_id=str(row[2]).lower()
-                )
-            for row in self.db.execute(
-                f"""
-                SELECT s.doc_id, s.split, s.selected_tokens
-                FROM selected AS s
-                WHERE s.doc_id IN ({marks})
-                """,
-                chunk,
-            ):
-                result[bytes(row[0])].update(
-                    split=str(row[1]), selected_tokens=int(row[2])
-                )
+                decision = result[bytes(row[0])]
+                if row[1] is not None:
+                    decision["canonical_doc_id"] = bytes(row[1]).hex()
+                if row[2] is not None:
+                    decision.update(
+                        assigned_split=str(row[2]), group_id=str(row[3]).lower()
+                    )
+                if row[4] is not None:
+                    decision.update(split=str(row[4]), selected_tokens=int(row[5]))
         return result
 
     def emit_decisions(self) -> None:
@@ -5625,8 +6051,6 @@ class CurationBuilder:
 
     def _emit_archive(self, report: dict[str, Any]) -> None:
         fingerprint = self.staging_root / report["fingerprint_file"]
-        if file_sha256(fingerprint) != report["fingerprint_sha256"]:
-            raise CurationError(f"Fingerprint changed before decision emission: {fingerprint}")
         relative = Path("decisions") / report["bucket"] / f"part-{int(report['index']):06d}.jsonl.zst"
         output_path = self.output / relative
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5681,7 +6105,14 @@ class CurationBuilder:
                             records += 1
                         pending.clear()
 
-                    for row in iter_jsonl_zst(fingerprint):
+                    # Authenticate the exact compressed bytes being decoded.
+                    # Emission has no database writes before this stream is
+                    # exhausted, so a mismatch discards only the temporary
+                    # output and avoids a redundant full network-volume read.
+                    for row in iter_jsonl_zst(
+                        fingerprint,
+                        expected_sha256=report["fingerprint_sha256"],
+                    ):
                         pending.append(row)
                         if len(pending) >= self.batch_size:
                             flush()
@@ -5712,7 +6143,12 @@ class CurationBuilder:
                 pass
 
     def _verify_all_inputs_and_outputs(self) -> None:
-        current_reports, current_completeness = self._load_complete_report_inventory()
+        # Publication is never allowed on deferred startup evidence alone.
+        # This full pass authenticates every opaque raw archive immediately
+        # before the final manifest/materializer handoff is made authoritative.
+        current_reports, current_completeness = self._load_complete_report_inventory(
+            force_raw_integrity=True
+        )
         if current_completeness != self.collection_completeness:
             raise CurationError(
                 "Collection completeness identity changed during curation"
@@ -6075,6 +6511,45 @@ def build_parser() -> argparse.ArgumentParser:
             "an explicit WAL override is rejected on network or unknown mounts."
         ),
     )
+    parser.add_argument(
+        "--sqlite-local-work-root",
+        type=Path,
+        help=(
+            "opt in to a dedicated pod-local SQLite working directory; the "
+            "database runs in WAL mode there and publishes immutable, verified "
+            "snapshots plus an atomic canonical database under OUTPUT/.work"
+        ),
+    )
+    parser.add_argument(
+        "--sqlite-snapshot-interval-seconds",
+        type=int,
+        default=DEFAULT_LOCAL_SQLITE_SNAPSHOT_INTERVAL_SECONDS,
+        help=(
+            "minimum interval between durable local-SQLite snapshots "
+            f"(default: {DEFAULT_LOCAL_SQLITE_SNAPSHOT_INTERVAL_SECONDS}); "
+            "builder exit always forces one"
+        ),
+    )
+    parser.add_argument(
+        "--sqlite-snapshot-retention",
+        type=int,
+        default=DEFAULT_SNAPSHOT_RETENTION,
+        help=(
+            "complete durable recovery databases to retain; older database "
+            "payloads are removed only after an authenticated retirement "
+            "receipt while immutable chain manifests remain (default: 2)"
+        ),
+    )
+    parser.add_argument(
+        "--defer-raw-archive-integrity-until-finalize",
+        action="store_true",
+        help=(
+            "fast-canonical profile only: at startup validate canonical raw "
+            "paths, sizes, reports, and expected hashes without rereading every "
+            "raw byte; a complete raw SHA-256 pass remains mandatory and "
+            "fail-closed immediately before publication"
+        ),
+    )
     parser.add_argument("--max-new-archives", type=int)
     parser.add_argument(
         "--recover-stale-cross-client-lease",
@@ -6116,12 +6591,27 @@ def main() -> int:
             allow_missing_english_near_dedup=args.allow_missing_english_near_dedup,
             batch_size=args.batch_size,
             sqlite_journal_mode=args.sqlite_journal_mode,
+            sqlite_local_work_root=args.sqlite_local_work_root,
+            sqlite_snapshot_interval_seconds=(
+                args.sqlite_snapshot_interval_seconds
+            ),
+            sqlite_snapshot_retention=args.sqlite_snapshot_retention,
+            defer_raw_archive_integrity_until_finalize=(
+                args.defer_raw_archive_integrity_until_finalize
+            ),
         ) as builder:
             result = builder.run(
                 max_new_archives=args.max_new_archives, stop_after_phase=args.stop_after_phase
             )
         print(json.dumps(result, indent=2, sort_keys=True))
-    except (CurationError, OSError, ValueError, sqlite3.Error, json.JSONDecodeError) as exc:
+    except (
+        CurationError,
+        LocalStoreError,
+        OSError,
+        ValueError,
+        sqlite3.Error,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"Curation failed: {exc}", file=sys.stderr)
         exit_code = 1
     finally:

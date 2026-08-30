@@ -24,8 +24,11 @@ from benchmark_guard import BenchmarkGuard
 from build_english_near_clusters import EnglishNearDedupBuilder
 import curate_corpus as curate_corpus_module
 from curate_corpus import (
+    BENCHMARK_CONTENT_CLUSTER_SQL,
+    BENCHMARK_FINAL_CLUSTER_SQL,
     CurationBuilder,
     CurationError,
+    QUOTA_CANDIDATE_AFTER_SQL,
     QUOTA_CANDIDATE_SQL,
     QUOTA_SELECTION_INDEX,
     assign_group_split,
@@ -976,6 +979,20 @@ class CorpusFixture:
 
 
 class CurateCorpusTest(unittest.TestCase):
+    def test_verified_compressed_jsonl_authenticates_consumed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "rows.jsonl.zst"
+            payload = b'{"row":1}\n{"row":2}\n'
+            path.write_bytes(zstandard.ZstdCompressor().compress(payload))
+            checksum = file_sha256(path)
+
+            self.assertEqual(
+                list(iter_jsonl_zst(path, expected_sha256=checksum)),
+                [{"row": 1}, {"row": 2}],
+            )
+            with self.assertRaisesRegex(CurationError, "checksum mismatch"):
+                list(iter_jsonl_zst(path, expected_sha256="0" * 64))
+
     def test_cross_client_lease_is_atomic_exclusive_and_releasable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "curated"
@@ -1835,6 +1852,27 @@ class CurateCorpusTest(unittest.TestCase):
                     any("TEMP B-TREE" in detail.upper() for detail in plan), plan
                 )
 
+                after_plan = [
+                    str(row[3])
+                    for row in connection.execute(
+                        "EXPLAIN QUERY PLAN " + QUOTA_CANDIDATE_AFTER_SQL,
+                        (bucket, "train", b"\x40" * 32, b"\x40" * 32),
+                    )
+                ]
+                self.assertTrue(
+                    any(
+                        QUOTA_SELECTION_INDEX in detail
+                        and "selection_rank" in detail
+                        and ">" in detail
+                        for detail in after_plan
+                    ),
+                    after_plan,
+                )
+                self.assertFalse(
+                    any("TEMP B-TREE" in detail.upper() for detail in after_plan),
+                    after_plan,
+                )
+
             expected.sort(key=lambda row: (row[0], row[1]))
             expected_rows = [(doc_id, tokens) for _rank, doc_id, tokens in expected]
             first = list(
@@ -1853,6 +1891,159 @@ class CurateCorpusTest(unittest.TestCase):
             )
             self.assertEqual(first, expected_rows)
             self.assertEqual(second, expected_rows)
+
+            midpoint = expected[len(expected) // 2]
+            suffix = list(
+                curate_corpus_module.iter_merged_quota_candidate_rows(
+                    connection,
+                    split="train",
+                    buckets=("wikipedia", "fineweb_edu"),
+                    after=(midpoint[0], midpoint[1]),
+                )
+            )
+            self.assertEqual(suffix, expected[len(expected) // 2 + 1 :])
+        finally:
+            connection.close()
+
+    def test_decision_lookup_combines_status_joins_and_preserves_optional_fields(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE documents (
+                    doc_id BLOB PRIMARY KEY,
+                    source_group BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE reasons (
+                    doc_id BLOB NOT NULL,
+                    reason TEXT NOT NULL,
+                    PRIMARY KEY(doc_id, reason)
+                ) WITHOUT ROWID;
+                CREATE TABLE canonical_map (
+                    doc_id BLOB PRIMARY KEY,
+                    canonical_doc_id BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE groups (
+                    group_id BLOB PRIMARY KEY,
+                    split TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE selected (
+                    doc_id BLOB PRIMARY KEY,
+                    split TEXT NOT NULL,
+                    selected_tokens INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                """
+            )
+            kept = hashlib.sha256(b"kept").digest()
+            rejected = hashlib.sha256(b"rejected").digest()
+            canonical = hashlib.sha256(b"canonical").digest()
+            group = hashlib.sha256(b"group").digest()
+            missing_group = hashlib.sha256(b"missing-group").digest()
+            connection.executemany(
+                "INSERT INTO documents(doc_id, source_group) VALUES (?, ?)",
+                ((kept, group), (rejected, missing_group)),
+            )
+            connection.execute(
+                "INSERT INTO reasons(doc_id, reason) VALUES (?, ?)",
+                (rejected, "quality:synthetic"),
+            )
+            connection.execute(
+                "INSERT INTO canonical_map(doc_id, canonical_doc_id) VALUES (?, ?)",
+                (kept, canonical),
+            )
+            connection.execute(
+                "INSERT INTO groups(group_id, split) VALUES (?, ?)",
+                (group, "train"),
+            )
+            connection.execute(
+                "INSERT INTO selected(doc_id, split, selected_tokens) VALUES (?, ?, ?)",
+                (kept, "train", 17),
+            )
+            builder = object.__new__(CurationBuilder)
+            builder.connection = connection
+            statements: list[str] = []
+            connection.set_trace_callback(statements.append)
+            status = builder._decision_rows(
+                [{"doc_id": kept.hex()}, {"doc_id": rejected.hex()}]
+            )
+            connection.set_trace_callback(None)
+
+            self.assertEqual(
+                status[kept],
+                {
+                    "reasons": [],
+                    "canonical_doc_id": canonical.hex(),
+                    "assigned_split": "train",
+                    "group_id": group.hex(),
+                    "split": "train",
+                    "selected_tokens": 17,
+                },
+            )
+            self.assertEqual(status[rejected], {"reasons": ["quality:synthetic"]})
+            self.assertEqual(
+                sum(statement.lstrip().upper().startswith("SELECT") for statement in statements),
+                2,
+            )
+        finally:
+            connection.close()
+
+    def test_sparse_benchmark_cluster_scans_start_from_reason_index(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE documents (
+                    doc_id BLOB PRIMARY KEY,
+                    content_hash BLOB NOT NULL,
+                    final_cluster BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE reasons (
+                    doc_id BLOB NOT NULL,
+                    reason TEXT NOT NULL,
+                    PRIMARY KEY(doc_id, reason)
+                ) WITHOUT ROWID;
+                CREATE INDEX reasons_reason ON reasons(reason);
+                """
+            )
+            documents = []
+            reasons = []
+            wanted_content = []
+            wanted_final = []
+            for index in range(1_000):
+                doc_id = hashlib.sha256(f"doc-{index}".encode()).digest()
+                content = hashlib.sha256(f"content-{index // 2}".encode()).digest()
+                final = hashlib.sha256(f"final-{index // 3}".encode()).digest()
+                documents.append((doc_id, content, final))
+                if index % 10 == 0:
+                    reasons.append((doc_id, "quality:synthetic"))
+                if index in (111, 333, 777):
+                    reasons.append((doc_id, "benchmark:mbpp"))
+                    wanted_content.append(content)
+                    wanted_final.append(final)
+            connection.executemany("INSERT INTO documents VALUES (?, ?, ?)", documents)
+            connection.executemany("INSERT INTO reasons VALUES (?, ?)", reasons)
+
+            for sql, expected in (
+                (BENCHMARK_CONTENT_CLUSTER_SQL, sorted(set(wanted_content))),
+                (BENCHMARK_FINAL_CLUSTER_SQL, sorted(set(wanted_final))),
+            ):
+                plan = [
+                    str(row[3])
+                    for row in connection.execute(
+                        "EXPLAIN QUERY PLAN " + sql, (b"", 10_000)
+                    )
+                ]
+                self.assertTrue(
+                    any("reasons_reason" in detail for detail in plan), plan
+                )
+                self.assertFalse(
+                    any("SCAN d" in detail for detail in plan), plan
+                )
+                self.assertEqual(
+                    [bytes(row[0]) for row in connection.execute(sql, (b"", 10_000))],
+                    expected,
+                )
         finally:
             connection.close()
 

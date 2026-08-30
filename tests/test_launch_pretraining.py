@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import signal
 import tempfile
 import unittest
 from dataclasses import replace
@@ -423,12 +424,31 @@ class RuntimeAndCommandTest(unittest.TestCase):
                 return contextlib.nullcontext(index)
 
             @staticmethod
-            def is_bf16_supported() -> bool:
+            def is_bf16_supported(*, including_emulation: bool = True) -> bool:
+                if including_emulation:
+                    raise AssertionError("preflight must require native BF16")
                 return True
 
             @staticmethod
             def get_device_name(index: int) -> str:
-                return f"GPU-{index}"
+                return "Homogeneous-GPU"
+
+            @staticmethod
+            def get_device_capability(index: int) -> tuple[int, int]:
+                del index
+                return (9, 0)
+
+            @staticmethod
+            def get_device_properties(index: int):
+                del index
+                return SimpleNamespace(
+                    total_memory=80 * 1024**3,
+                    multi_processor_count=132,
+                )
+
+            @staticmethod
+            def mem_get_info() -> tuple[int, int]:
+                return (79 * 1024**3, 80 * 1024**3)
 
         fake_torch = SimpleNamespace(
             __version__="9.9",
@@ -446,6 +466,34 @@ class RuntimeAndCommandTest(unittest.TestCase):
         self.assertEqual(runtime.world_size, 6)
         self.assertEqual(runtime.cuda_devices, 6)
         self.assertEqual(runtime.bf16_supported_devices, list(range(6)))
+        self.assertEqual(
+            [profile["total_memory_bytes"] for profile in runtime.cuda_device_profiles],
+            [80 * 1024**3] * 6,
+        )
+        self.assertEqual(
+            [
+                profile["available_memory_bytes"]
+                for profile in runtime.cuda_device_profiles
+            ],
+            [79 * 1024**3] * 6,
+        )
+        memory = launch.inspect_model_memory(
+            runtime,
+            model_size="1.3b",
+            vocab_size=49152,
+            max_seq_len=4096,
+        )
+        self.assertEqual(memory.parameter_count, 1_283_557_376)
+        self.assertEqual(
+            memory.persistent_training_state_bytes,
+            memory.parameter_count * 16,
+        )
+        self.assertEqual(memory.minimum_device_memory_bytes, 32 * 1024**3)
+        self.assertEqual(
+            memory.smallest_available_device_memory_bytes,
+            79 * 1024**3,
+        )
+        self.assertTrue(memory.measured_full_topology_smoke_required)
 
         common = dict(
             format_version=4,
@@ -519,6 +567,8 @@ class RuntimeAndCommandTest(unittest.TestCase):
         self.assertIn("--standalone", command)
         self.assertIn("--nnodes=1", command)
         self.assertIn("--nproc-per-node=6", command)
+        self.assertIn("--max-restarts=0", command)
+        self.assertIn("--activation-checkpointing", command)
         self.assertEqual(
             command[command.index("--tokenizer") + 1],
             "/local/tokenizer/starcoder2",
@@ -559,12 +609,31 @@ class RuntimeAndCommandTest(unittest.TestCase):
                 return contextlib.nullcontext(index)
 
             @staticmethod
-            def is_bf16_supported() -> bool:
+            def is_bf16_supported(*, including_emulation: bool = True) -> bool:
+                if including_emulation:
+                    raise AssertionError("preflight must require native BF16")
                 return True
 
             @staticmethod
             def get_device_name(index: int) -> str:
-                return f"GPU-{index}"
+                return "Homogeneous-GPU"
+
+            @staticmethod
+            def get_device_capability(index: int) -> tuple[int, int]:
+                del index
+                return (9, 0)
+
+            @staticmethod
+            def get_device_properties(index: int):
+                del index
+                return SimpleNamespace(
+                    total_memory=80 * 1024**3,
+                    multi_processor_count=132,
+                )
+
+            @staticmethod
+            def mem_get_info() -> tuple[int, int]:
+                return (79 * 1024**3, 80 * 1024**3)
 
         fake_torch = SimpleNamespace(
             __version__="9.9",
@@ -583,6 +652,7 @@ class RuntimeAndCommandTest(unittest.TestCase):
         self.assertEqual(result.bf16_supported_devices, [0, 1])
         self.assertTrue(result.deterministic_algorithms)
         self.assertEqual(result.cublas_workspace_config, ":4096:8")
+        self.assertEqual(result.python_hash_seed, "0")
         with self.assertRaisesRegex(launch.PreflightError, "exact match"):
             launch.inspect_runtime(
                 nproc_per_node=1,
@@ -595,14 +665,104 @@ class RuntimeAndCommandTest(unittest.TestCase):
                 torch_module=fake_torch,
                 environment={"CUBLAS_WORKSPACE_CONFIG": ":16:8"},
             )
+        with self.assertRaisesRegex(launch.PreflightError, "PYTHONHASHSEED"):
+            launch.inspect_runtime(
+                nproc_per_node=2,
+                torch_module=fake_torch,
+                environment={"PYTHONHASHSEED": "random"},
+            )
+
+    def test_runtime_rejects_heterogeneous_or_24gb_1p3b_ddp(self) -> None:
+        class HeterogeneousCuda:
+            is_available = staticmethod(lambda: True)
+            device_count = staticmethod(lambda: 2)
+            device = staticmethod(contextlib.nullcontext)
+            is_bf16_supported = staticmethod(
+                lambda *, including_emulation=True: not including_emulation
+            )
+            get_device_name = staticmethod(lambda index: f"GPU-{index}")
+            get_device_capability = staticmethod(lambda index: (9, 0))
+            get_device_properties = staticmethod(
+                lambda index: SimpleNamespace(
+                    total_memory=80 * 1024**3,
+                    multi_processor_count=132,
+                )
+            )
+            mem_get_info = staticmethod(
+                lambda: (79 * 1024**3, 80 * 1024**3)
+            )
+
+        fake_torch = SimpleNamespace(
+            __version__="9.9",
+            version=SimpleNamespace(cuda="99.0"),
+            cuda=HeterogeneousCuda(),
+            distributed=SimpleNamespace(
+                is_available=lambda: True, is_nccl_available=lambda: True
+            ),
+        )
+        with self.assertRaisesRegex(launch.PreflightError, "heterogeneous"):
+            launch.inspect_runtime(
+                nproc_per_node=2,
+                torch_module=fake_torch,
+                environment={},
+            )
+
+        low_memory_runtime = launch.RuntimeInspection(
+            python_executable="/opt/venv/bin/python",
+            python_executable_sha256="b" * 64,
+            python_version="3.12.0",
+            python_implementation="cpython",
+            torch_version="9.9",
+            cuda_runtime="99.0",
+            cuda_devices=6,
+            world_size=6,
+            bf16_supported_devices=list(range(6)),
+            cuda_device_profiles=[
+                {
+                    "index": index,
+                    "name": "24GB-GPU",
+                    "compute_capability": [9, 0],
+                    "total_memory_bytes": 24 * 1024**3,
+                    "available_memory_bytes": 24 * 1024**3,
+                    "allocator_total_memory_bytes": 24 * 1024**3,
+                    "multiprocessor_count": 128,
+                }
+                for index in range(6)
+            ],
+            launcher_module="torch.distributed.run",
+            deterministic_algorithms=True,
+            cublas_workspace_config=":4096:8",
+            python_hash_seed="0",
+        )
+        with self.assertRaisesRegex(
+            launch.PreflightError, "production admission floor"
+        ):
+            launch.inspect_model_memory(
+                low_memory_runtime,
+                model_size="1.3b",
+                vocab_size=49152,
+                max_seq_len=4096,
+            )
 
     def test_runtime_and_command_ignore_poisoned_path_torchrun(self) -> None:
         class FakeCuda:
             is_available = staticmethod(lambda: True)
             device_count = staticmethod(lambda: 1)
             device = staticmethod(contextlib.nullcontext)
-            is_bf16_supported = staticmethod(lambda: True)
-            get_device_name = staticmethod(lambda index: f"GPU-{index}")
+            is_bf16_supported = staticmethod(
+                lambda *, including_emulation=True: not including_emulation
+            )
+            get_device_name = staticmethod(lambda index: "Homogeneous-GPU")
+            get_device_capability = staticmethod(lambda index: (9, 0))
+            get_device_properties = staticmethod(
+                lambda index: SimpleNamespace(
+                    total_memory=80 * 1024**3,
+                    multi_processor_count=132,
+                )
+            )
+            mem_get_info = staticmethod(
+                lambda: (79 * 1024**3, 80 * 1024**3)
+            )
 
         fake_torch = SimpleNamespace(
             __version__="9.9",
@@ -621,9 +781,27 @@ class RuntimeAndCommandTest(unittest.TestCase):
                 torch_module=fake_torch,
                 environment={"PATH": temporary},
             )
-        self.assertEqual(runtime.python_executable, str(Path(sys.executable).resolve()))
+        self.assertEqual(runtime.python_executable, str(Path(sys.executable).absolute()))
         self.assertEqual(runtime.launcher_module, "torch.distributed.run")
         self.assertNotEqual(runtime.python_executable, str(poisoned))
+
+    def test_interpreter_identity_preserves_virtual_environment_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "base-python"
+            target.write_bytes(b"authenticated interpreter\n")
+            target.chmod(0o755)
+            environment_python = root / "venv" / "bin" / "python"
+            environment_python.parent.mkdir(parents=True)
+            environment_python.symlink_to(target)
+            with mock.patch.object(launch.sys, "executable", str(environment_python)):
+                identity = launch._interpreter_identity()
+        self.assertEqual(identity["python_executable"], str(environment_python))
+        self.assertNotEqual(identity["python_executable"], str(target))
+        self.assertEqual(
+            identity["python_executable_sha256"],
+            hashlib.sha256(b"authenticated interpreter\n").hexdigest(),
+        )
 
     def test_rendered_torchrun_command_owns_production_contract(self) -> None:
         runtime = launch.RuntimeInspection(
@@ -636,9 +814,22 @@ class RuntimeAndCommandTest(unittest.TestCase):
             cuda_devices=2,
             world_size=2,
             bf16_supported_devices=[0, 1],
+            cuda_device_profiles=[
+                {
+                    "index": index,
+                    "name": "Homogeneous-GPU",
+                    "compute_capability": [9, 0],
+                    "total_memory_bytes": 80 * 1024**3,
+                    "available_memory_bytes": 79 * 1024**3,
+                    "allocator_total_memory_bytes": 80 * 1024**3,
+                    "multiprocessor_count": 132,
+                }
+                for index in range(2)
+            ],
             launcher_module="torch.distributed.run",
             deterministic_algorithms=True,
             cublas_workspace_config=":4096:8",
+            python_hash_seed="0",
         )
         train = launch.OrderInspection(
             path="/local/train/manifest.json",
@@ -705,7 +896,7 @@ class RuntimeAndCommandTest(unittest.TestCase):
         self.assertIn("--compile", command)
         self.assertNotIn("--steps", command)
 
-    def test_exec_replaces_process_with_exact_argv_and_environment(self) -> None:
+    def test_supervisor_starts_exact_argv_and_injects_stop_channel(self) -> None:
         command = [
             str(Path(sys.executable).resolve()),
             "-m",
@@ -717,16 +908,133 @@ class RuntimeAndCommandTest(unittest.TestCase):
             "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
             "WANDB_MODE": "disabled",
         }
+        process = mock.Mock()
+        process.wait.return_value = 0
+        with mock.patch.object(launch.subprocess, "Popen", return_value=process) as popen:
+            exit_code = launch.supervise_torchrun(
+                command,
+                environment,
+                graceful_shutdown_timeout_seconds=60,
+            )
+        self.assertEqual(exit_code, 0)
+        launched_environment = popen.call_args.kwargs["env"]
+        self.assertEqual(popen.call_args.args[0], command)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(launched_environment["PATH"], "/poisoned")
+        self.assertIn("PRETRAIN_STOP_REQUEST_FILE", launched_environment)
+        process.wait.assert_called_once_with(timeout=0.25)
+
+    def test_execute_handoff_reexecs_clean_context_supervisor(self) -> None:
+        python_executable = str(Path(sys.executable).resolve())
+        command = [python_executable, "-m", "torch.distributed.run"]
+        environment = {"CUBLAS_WORKSPACE_CONFIG": ":4096:8"}
         with mock.patch.object(launch.os, "execvpe") as execvpe:
             with self.assertRaisesRegex(AssertionError, "unexpectedly returned"):
-                launch.exec_torchrun(command, environment)
-        execvpe.assert_called_once_with(command[0], command, environment)
+                launch.exec_clean_supervisor(
+                    python_executable=python_executable,
+                    command=command,
+                    environment=environment,
+                    graceful_shutdown_timeout_seconds=1800,
+                )
+        argv = execvpe.call_args.args[1]
+        self.assertEqual(execvpe.call_args.args[0], python_executable)
+        self.assertEqual(execvpe.call_args.args[2], environment)
+        self.assertEqual(argv[0], python_executable)
+        self.assertEqual(argv[2], "--internal-supervise-torchrun")
+        self.assertEqual(argv[3:5], ["1800", "--"])
+        self.assertEqual(argv[5:], command)
+
+    def test_supervisor_holds_torchrun_open_for_worker_checkpoint(self) -> None:
+        observed: dict[str, object] = {}
+
+        class SignalProcess:
+            def __init__(self, environment):
+                self.environment = environment
+                self.wait_calls = 0
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    __import__("os").kill(__import__("os").getpid(), signal.SIGTERM)
+                    raise launch.subprocess.TimeoutExpired("torchrun", timeout)
+                request = Path(
+                    self.environment["PRETRAIN_STOP_REQUEST_FILE"]
+                )
+                observed["request"] = request.read_text(encoding="ascii")
+                return 1
+
+            def terminate(self):
+                self.fail("supervisor terminated torchrun before its deadline")
+
+            def kill(self):
+                self.fail("supervisor killed torchrun before its deadline")
+
+            @staticmethod
+            def fail(message):
+                raise AssertionError(message)
+
+        def start_process(command, *, env, start_new_session):
+            del command
+            self.assertTrue(start_new_session)
+            return SignalProcess(env)
+
+        with mock.patch.object(launch.subprocess, "Popen", side_effect=start_process):
+            exit_code = launch.supervise_torchrun(
+                [str(Path(sys.executable).resolve()), "-m", "torch.distributed.run"],
+                {},
+                graceful_shutdown_timeout_seconds=60,
+            )
+        self.assertEqual(exit_code, 128 + int(signal.SIGTERM))
+        self.assertEqual(observed["request"], f"{int(signal.SIGTERM)}\n")
+
+    def test_supervisor_kills_entire_child_session_after_grace_expires(self) -> None:
+        class StuckProcess:
+            pid = 43210
+
+            def __init__(self):
+                self.initial_wait = True
+                self.terminated = False
+
+            def wait(self, timeout=None):
+                if timeout == 0.25 and self.initial_wait:
+                    self.initial_wait = False
+                    __import__("os").kill(__import__("os").getpid(), signal.SIGTERM)
+                    raise launch.subprocess.TimeoutExpired("torchrun", timeout)
+                if timeout == 35:
+                    raise launch.subprocess.TimeoutExpired("torchrun", timeout)
+                self.assertEqual(timeout, None)
+                return -int(signal.SIGKILL)
+
+            def terminate(self):
+                self.terminated = True
+
+            @staticmethod
+            def assertEqual(found, expected):
+                if found != expected:
+                    raise AssertionError(f"found {found!r}, expected {expected!r}")
+
+        process = StuckProcess()
+        with (
+            mock.patch.object(launch.subprocess, "Popen", return_value=process),
+            mock.patch.object(launch.time, "monotonic", side_effect=(100.0, 102.0)),
+            mock.patch.object(launch.os, "killpg") as killpg,
+        ):
+            exit_code = launch.supervise_torchrun(
+                [str(Path(sys.executable).resolve()), "-m", "torch.distributed.run"],
+                {},
+                graceful_shutdown_timeout_seconds=1,
+            )
+        self.assertTrue(process.terminated)
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+        self.assertEqual(exit_code, 128 + int(signal.SIGTERM))
 
     def test_protected_passthrough_flags_are_rejected(self) -> None:
         for values in (
             ["--", "--steps", "10"],
             ["--step", "10"],
             ["--checkpoint=/tmp/wrong.pt"],
+            ["--graceful-shutdown-timeout-seconds=1"],
+            ["--no-activation-checkpointing"],
             ["--verify-packed-payloads"],
         ):
             with self.subTest(values=values), self.assertRaisesRegex(

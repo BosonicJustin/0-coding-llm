@@ -34,7 +34,7 @@ group splitting, tokenization, and packing.
 - The native PyTorch model, packed loader, deterministic distributed sampler,
   materializer, checkpoint/resume harness, validation, W&B integration, and
   production launcher are implemented.
-- The complete local suite passes 284 tests (one platform skip), including a
+- The complete local suite passes 355 tests (two platform skips), including a
   real two-process Gloo DDP accumulation/token-normalization gate.
 - CUDA FlexAttention, BF16, memory, throughput, and multi-GPU resume gates are
   still required before a long training run.
@@ -56,6 +56,7 @@ group splitting, tokenization, and packing.
 - [Wikipedia acquisition](WIKIPEDIA_PIPELINE.md)
 - [Streaming raw audit](STREAMING_PREPROCESS.md)
 - [Curation contract](CURATION.md)
+- [Curation acceleration and recovery design](CURATION_ACCELERATION.md)
 - [Optional English near-deduplication](ENGLISH_NEAR_DEDUP.md)
 - [English near-deduplication calibration](ENGLISH_NEAR_DEDUP_CALIBRATION.md)
 - [Materialization](MATERIALIZATION.md)
