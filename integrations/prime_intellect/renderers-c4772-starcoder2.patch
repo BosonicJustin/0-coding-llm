@@ -1,0 +1,95 @@
+diff --git a/renderers/__init__.py b/renderers/__init__.py
+--- a/renderers/__init__.py
++++ b/renderers/__init__.py
+@@ -67,6 +67,7 @@ from renderers.configs import (
+     Nemotron3RendererConfig,
+     Nemotron3UltraRendererConfig,
+     PrimeQwen3RendererConfig,
++    StarCoder2CodingRendererConfig,
+     Qwen35RendererConfig,
+     Qwen36RendererConfig,
+     Qwen38RendererConfig,
+@@ -109,6 +110,7 @@ _LAZY_RENDERERS: dict[str, str] = {
+     "Nemotron3Renderer": "renderers.nemotron3",
+     "Nemotron3UltraRenderer": "renderers.nemotron3",
+     "PrimeQwen3Renderer": "renderers.prime_qwen3",
++    "StarCoder2CodingRenderer": "renderers.starcoder2_coding",
+     "Qwen35Renderer": "renderers.qwen35",
+     "Qwen36Renderer": "renderers.qwen36",
+     "Qwen38Renderer": "renderers.qwen38",
+@@ -189,6 +191,8 @@ __all__ = [
+     "PlaceholderRange",
+     "PrimeQwen3Renderer",
+     "PrimeQwen3RendererConfig",
++    "StarCoder2CodingRenderer",
++    "StarCoder2CodingRendererConfig",
+     "Qwen35Renderer",
+     "Qwen35RendererConfig",
+     "Qwen36Renderer",
+diff --git a/renderers/base.py b/renderers/base.py
+--- a/renderers/base.py
++++ b/renderers/base.py
+@@ -917,4 +917,6 @@ MODEL_RENDERER_MAP: dict[str, str] = {
+     # Qwen3 — base and Instruct variants share the same chat template.
++    # Frozen tokenizer used by the 0-coding-llm experiment.
++    "bigcode/starcoder2-tokenizer": "starcoder2-coding-chat-v1",
+     "Qwen/Qwen3-0.6B": "qwen3",
+     "Qwen/Qwen3-1.7B": "qwen3",
+     "Qwen/Qwen3-4B": "qwen3",
+@@ -1319,6 +1321,7 @@ def _populate_registry():
+         Nemotron35Renderer,
+     )
+     from renderers.prime_qwen3 import PrimeQwen3Renderer
++    from renderers.starcoder2_coding import StarCoder2CodingRenderer
+     from renderers.qwen3 import Qwen3Renderer
+     from renderers.qwen3_vl import Qwen3VLRenderer
+     from renderers.qwen35 import Qwen35Renderer
+@@ -1330,6 +1333,7 @@ def _populate_registry():
+             "default": DefaultRenderer,
+             "qwen3": Qwen3Renderer,
+             "prime-qwen3": PrimeQwen3Renderer,
++            "starcoder2-coding-chat-v1": StarCoder2CodingRenderer,
+             "qwen3-vl": Qwen3VLRenderer,
+             "gemma4": Gemma4Renderer,
+             "qwen3.5": Qwen35Renderer,
+diff --git a/renderers/configs.py b/renderers/configs.py
+--- a/renderers/configs.py
++++ b/renderers/configs.py
+@@ -203,6 +203,13 @@ class PrimeQwen3RendererConfig(BaseRendererConfig):
+     _template_fields = frozenset()
+ 
+ 
++class StarCoder2CodingRendererConfig(BaseRendererConfig):
++    """Frozen ASCII coding-chat format for the 0-coding-llm experiment."""
++
++    name: Literal["starcoder2-coding-chat-v1"] = "starcoder2-coding-chat-v1"
++    _template_fields = frozenset()
++
++
+ class Qwen35RendererConfig(BaseRendererConfig):
+     """Qwen3.5 renderer config."""
+ 
+@@ -936,6 +943,7 @@ RendererConfig = Annotated[
+         DefaultRendererConfig,
+         Qwen3RendererConfig,
+         PrimeQwen3RendererConfig,
++        StarCoder2CodingRendererConfig,
+         Qwen35RendererConfig,
+         Qwen36RendererConfig,
+         Qwen38RendererConfig,
+@@ -982,6 +990,7 @@ _CONFIG_BY_NAME: dict[str, type[BaseRendererConfig]] = {
+     "default": DefaultRendererConfig,
+     "qwen3": Qwen3RendererConfig,
+     "prime-qwen3": PrimeQwen3RendererConfig,
++    "starcoder2-coding-chat-v1": StarCoder2CodingRendererConfig,
+     "qwen3.5": Qwen35RendererConfig,
+     "qwen3.6": Qwen36RendererConfig,
+     "qwen3.8": Qwen38RendererConfig,
+@@ -1059,6 +1068,7 @@ __all__ = [
+     "Nemotron3RendererConfig",
+     "Nemotron3UltraRendererConfig",
+     "PrimeQwen3RendererConfig",
++    "StarCoder2CodingRendererConfig",
+     "Qwen35RendererConfig",
+     "Qwen36RendererConfig",
+     "Qwen38RendererConfig",

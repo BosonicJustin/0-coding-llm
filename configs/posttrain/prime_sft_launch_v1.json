@@ -1,0 +1,14 @@
+{
+  "cache": {
+    "dataset_size_multiplier": 2,
+    "default_root": "/workspace/posttraining-cache/prime-sft-v1",
+    "minimum_free_bytes": 17179869184,
+    "reserve_bytes": 4294967296
+  },
+  "config_path": "configs/posttrain/prime_sft_6gpu.toml",
+  "config_sha256": "e4252da5fac9a35d056187c9aea49fae3eaa5f5d37f126131f32efd145ed6bdc",
+  "format_version": 1,
+  "kind": "prime_sft_launch_contract",
+  "prime_rl_commit": "3fc28ddfb354f336d1cc28e8e032f262f5aa68b2",
+  "renderers_commit": "c4772ac1321c69e83d2b4460600072911cc41a0b"
+}

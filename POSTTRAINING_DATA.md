@@ -80,9 +80,11 @@ post-training curation job has completed all of the following:
    targets, secrets/credentials, unsafe binary payloads, and unusable examples.
    Write transformations and rejection decisions to a new derived directory;
    never edit `raw/`.
-3. Decontaminate against every frozen evaluation set—including MBPP,
-   HumanEval/EvalPlus, and any later SFT/RL evaluation—using exact,
-   normalized, and conservative semantic checks. Propagate contamination across
+3. Register every frozen evaluation set before publishing a derived corpus,
+   then decontaminate against that exact registry using exact, normalized, and
+   calibrated semantic checks. The current experiment registers MBPP only;
+   HumanEval/EvalPlus are examples of *future* benchmarks that would require a
+   new policy and output version before use. Propagate contamination across
    duplicate groups before constructing train/validation splits.
 4. Measure prompt, response, and combined lengths with the exact tokenizer used
    for SFT. Freeze a context-length policy before training: prefer dropping or
@@ -92,3 +94,8 @@ post-training curation job has completed all of the following:
 5. Deduplicate and quality-score only under an explicit, versioned policy, then
    publish checksummed train/validation manifests. Do not point an SFT loader at
    this acquisition directory directly.
+
+The implemented, versioned projection and its PrimeRL integration are described
+in [PRIME_SFT.md](PRIME_SFT.md). The checked-in Prime config remains a dry-run
+scaffold until that document's data, model-export, boundary-isolation, GPU, and
+hyperparameter gates have passed.

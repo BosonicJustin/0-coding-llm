@@ -236,11 +236,13 @@ been run and validated on the final selected corpus.
   to a single-process global batch. It also guards the required
   `static_graph=False` reducer policy.
 - [x] Verify that checkpoint RNG capture, restore, and seeding touch only each
-  DDP rank's assigned CUDA device; checkpoint format v4 records the local device
-  index and state rather than initializing every visible GPU in every worker.
+  DDP rank's assigned CUDA device; checkpoint format v5 records the local device
+  index/state plus mandatory manifest and canonical vocabulary SHA-256
+  identities rather than initializing every visible GPU in every worker.
 - [x] Run a real two-rank CPU process-restart gate: atomically save at a clean
   accumulation boundary, terminate both workers, restore with two fresh
-  workers, resume the exact format-v4 global-order cursor, and require
+  workers, resume the exact format-v4 global-order cursor from a format-v5
+  trainer checkpoint, and require
   bit-for-bit equality with the uninterrupted distributed trajectory.
 - [ ] Decode and manually inspect several complete batches.
 - [ ] Overfit one tiny batch; loss should fall sharply.

@@ -119,3 +119,36 @@ with prompt/user positions set to `-100`, while assistant targets remain
 supervised. RL can load the same checkpoint into a separate generation and
 rollout stack. Pretraining, SFT, and RL data formats should remain separate and
 independently versioned.
+
+### Hugging Face export
+
+Post-training frameworks that load `AutoModelForCausalLM` can consume an
+atomically published Llama-compatible export of a trusted native checkpoint:
+
+```bash
+python scripts/export_hf_checkpoint.py \
+  --checkpoint /durable/checkpoints/pretrain.pt \
+  --tokenizer /workspace/dataset/tokenizer/starcoder2 \
+  --output /durable/models/pretrain-hf \
+  --max-shard-size 5GB
+```
+
+`pretrain/hf_export.py` maps every native parameter to its exact HF Llama name,
+validates the complete key/shape/dtype/config contract, rejects non-finite
+weights, verifies that saving the tokenizer did not change a token ID, and
+writes safetensors plus checksummed `NATIVE_EXPORT_MANIFEST.json`. The output
+path must not exist and is renamed into place only after every validation and
+write succeeds. Format-v5 checkpoints carry mandatory source-manifest and
+canonical token-to-ID vocabulary SHA-256 identities; the exporter requires a
+verified source `TOKENIZER_MANIFEST.json` and exact agreement with both. A
+directly saved state dictionary or legacy checkpoint is supported only when
+`--model-config` is supplied where needed and both authenticated identities are
+provided explicitly with `--expected-tokenizer-manifest-sha256` and
+`--expected-tokenizer-vocabulary-sha256`. Equal vocabulary size alone is never
+accepted.
+
+The parameter conversion is exact for ordinary causal sequences. The HF Llama
+API does not itself preserve this repository's `document_ids` argument, so a
+post-training loader that packs independent conversations must supply its own
+block-diagonal/variable-length attention isolation rather than treating the
+export as permission for cross-example attention.

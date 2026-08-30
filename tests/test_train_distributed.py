@@ -29,7 +29,7 @@ from pretrain.data import (
 )
 from pretrain.train import (
     TrainConfig,
-    Trainer,
+    Trainer as ProductionTrainer,
     capture_rng_state,
     seed_everything,
     tiny_model_config,
@@ -46,6 +46,18 @@ MASKED_TARGETS = ((0, 5), (2, 7))
 RESUME_STEPS = 2
 RESUME_GLOBAL_MICROBATCH_ROWS = WORLD_SIZE
 RESUME_ACCUMULATION_STEPS = 2
+TEST_TOKENIZER_MANIFEST_SHA256 = "a" * 64
+TEST_TOKENIZER_VOCABULARY_SHA256 = "b" * 64
+
+
+def Trainer(*args, **kwargs):
+    kwargs.setdefault(
+        "tokenizer_manifest_sha256", TEST_TOKENIZER_MANIFEST_SHA256
+    )
+    kwargs.setdefault(
+        "tokenizer_vocabulary_sha256", TEST_TOKENIZER_VOCABULARY_SHA256
+    )
+    return ProductionTrainer(*args, **kwargs)
 
 
 def _batch_for(rank: int, microbatch: int) -> dict[str, torch.Tensor]:
@@ -608,7 +620,15 @@ class DistributedTrainingGateTest(unittest.TestCase):
             )
             self.assertTrue(checkpoint.is_file())
             checkpoint_payload = torch.load(checkpoint, weights_only=False)
-            self.assertEqual(checkpoint_payload["format_version"], 4)
+            self.assertEqual(checkpoint_payload["format_version"], 5)
+            self.assertEqual(
+                checkpoint_payload["tokenizer_manifest_sha256"],
+                TEST_TOKENIZER_MANIFEST_SHA256,
+            )
+            self.assertEqual(
+                checkpoint_payload["tokenizer_vocabulary_sha256"],
+                TEST_TOKENIZER_VOCABULARY_SHA256,
+            )
             self.assertEqual(checkpoint_payload["world_size"], WORLD_SIZE)
             self.assertEqual(
                 checkpoint_payload["train_state"]["completed_steps"], 1

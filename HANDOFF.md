@@ -18,7 +18,7 @@ Downloaded SFT data is quarantined until benchmark decontamination, schema
 normalization, length analysis, split construction, and a separate SFT
 publication manifest are complete.
 
-## Live state at 2026-08-30 15:58 UTC
+## Last verified live state at 2026-08-30 15:58 UTC
 
 - `curation-fast-v1` is alive in detached `tmux` on the CPU pod.
 - The curator is in `inventory`: 3,183,945 / 51,328,930 documents (6.2030%),
@@ -38,6 +38,12 @@ publication manifest are complete.
 - The public repository is deployed separately at `/workspace/0-coding-llm`
   on commit `44a365b`; the active curator continues from its original checkout
   so deployment cannot mutate its running code.
+
+This is the last authenticated server snapshot, not a claim about current
+progress. A later connection reached the RunPod SSH gateway and the server
+accepted the correct public key, but the local 1Password agent did not complete
+the signing operation. Re-read `CHECKPOINT.json`, `tmux ls`, and `df` before
+reporting a newer percentage or deploying another commit.
 
 ## Monitoring without mutating state
 
@@ -84,22 +90,33 @@ be implemented before order v4 is frozen.
 
 For OpenCodeInstruct, independently:
 
-1. Preserve the raw snapshot and pinned source manifest.
-2. Audit prompt/answer length with the pinned StarCoder2 tokenizer.
-3. Remove MBPP and every other final evaluation suite using exact, normalized,
-   substring, and conservative fuzzy checks.
-4. Define SFT train/validation splits without reusing final benchmarks.
-5. Render `input` and `output` into a versioned textual chat format; mask prompt
-   labels and supervise assistant tokens plus EOS.
-6. Pack short conversations with block-diagonal isolation. Filter or
-   deliberately truncate examples whose complete prompt and response exceed
-   4,096 tokens.
+1. The raw pinned snapshot and source manifest are complete and immutable.
+2. Run `scripts/prepare_prime_sft.py` to create a new derived publication; do
+   not train from `raw/`.
+3. The implemented policy scans prompt, answer, and unit-test text against the
+   frozen MBPP denylist and propagates hits across normalized prompt groups.
+   It does not claim fuzzy/semantic-paraphrase coverage, and adding any future
+   final benchmark requires a new policy and output version.
+4. The curator creates deterministic leakage-safe train/validation groups and
+   uses the exact pinned tokenizer plus `starcoder2-coding-chat-v1`. Complete
+   conversations over 4,096 causal inputs are dropped, never truncated.
+5. Audit the real score/retention distribution and publish a new positive
+   `min_average_test_score` policy. The current `0.0` output is inspection-only
+   and is blocked by the Prime launcher for real training.
+6. Export the selected format-v5 pretraining checkpoint through
+   `scripts/export_hf_checkpoint.py`, prewarm the offline HF cache once, and use
+   `scripts/launch_prime_sft.py`. Never invoke Prime's `sft` command directly.
+7. Prime must retain custom Llama plus `seq_lens` boundary isolation. Before a
+   real six-GPU run, complete the one-GPU overfit/BF16/memory and six-rank NCCL
+   boundary-perturbation gates in `PRIME_SFT.md`.
 
 ## Verified code state
 
 The model/trainer stack includes real two-process CPU/Gloo gates for DDP token
 normalization and atomic checkpoint → process restart → exact immutable-order
-resume. Checkpoint format v4 stores only each rank's assigned CUDA RNG state.
+resume. Checkpoint format v5 stores only each rank's assigned CUDA RNG state
+and binds every saved generation to the authenticated tokenizer-manifest and
+canonical token-to-ID vocabulary SHA-256 identities.
 Remaining gates are intentionally left unchecked in
 `PRETRAINING_CHECKLIST.md`: some depend on the final curated/materialized data
 and manual sample inspection; others require the eventual GPU image and

@@ -28,6 +28,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-data.txt -r requirements-train.txt
       - name: Compile Python sources
-        run: python -m compileall -q model.py pretrain scripts tests
+        run: python -m compileall -q model.py pretrain posttrain environments scripts tests
       - name: Run full CPU suite
         run: python -m unittest discover -s tests

@@ -1,0 +1,119 @@
+# PrimeRL standalone fixed-dataset SFT on one six-GPU RunPod node.
+#
+# This config targets the exact PrimeRL/renderers commits pinned by
+# integrations/prime_intellect.  It intentionally uses PrimeRL's custom Llama
+# implementation: only that path receives seq_lens and therefore enforces
+# block-diagonal attention between conversations packed into one physical row.
+# Invoke this file only through scripts/launch_prime_sft.py. The wrapper
+# authenticates every input and requires a one-process HF cache prewarm before
+# six ranks start. It also refuses this provisional quality policy for a real
+# run, so dry_run must remain true until a new approved contract is published.
+
+max_steps = 1000
+dry_run = true
+output_dir = "/workspace/posttraining-runs/prime-sft"
+
+[run]
+name = "coding-llm-1p3b-opencodeinstruct-sft-v1"
+
+[deployment]
+type = "single_node"
+gpus_per_node = 6
+num_train_gpus = 6
+num_infer_gpus = 0
+
+[model]
+name = "/workspace/posttraining-models/coding-llm-base-hf"
+impl = "custom"
+attn = "auto"
+seq_len = 4096
+ac_offloading = "None"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+cp = 1
+ep = 1
+optim_cpu_offload = false
+
+[model.ac]
+mode = "full"
+freq = 1
+
+[tokenizer]
+name = "/workspace/posttraining-models/coding-llm-base-hf"
+trust_remote_code = false
+
+[renderer]
+name = "starcoder2-coding-chat-v1"
+
+[data]
+type = "sft"
+name = "/workspace/posttraining-data/sft/opencodeinstruct/derived/prime-sft-v1"
+splits = ["train"]
+seq_len = 4096
+batch_size = 48
+micro_batch_size = 1
+num_workers = 1
+shuffle = true
+seed = 20260830
+
+[data.loss_mask]
+system = false
+user = false
+assistant = true
+tool = false
+
+[val]
+interval = 50
+eval_on_start = true
+
+[val.data]
+type = "sft"
+name = "/workspace/posttraining-data/sft/opencodeinstruct/derived/prime-sft-v1"
+splits = ["validation"]
+seq_len = 4096
+batch_size = 6
+micro_batch_size = 1
+num_workers = 1
+shuffle = false
+seed = 20260830
+
+[val.data.loss_mask]
+system = false
+user = false
+assistant = true
+tool = false
+
+[optim]
+type = "adamw"
+lr = 2e-5
+weight_decay = 0.1
+betas1 = 0.9
+betas2 = 0.95
+max_norm = 1.0
+
+[scheduler]
+type = "cosine"
+warmup_steps = 50
+min_lr = 2e-6
+
+[ckpt]
+# PrimeRL appends its own checkpoints/ directory to this base path.
+output_dir = "/workspace/posttraining-runs/prime-sft/coding-llm-1p3b-opencodeinstruct-sft-v1"
+interval = 250
+keep_last = 3
+keep_interval = 1000
+
+[monitors.wandb]
+project = "0-coding-llm"
+group = "opencodeinstruct-sft-v1"
+tags = ["sft", "prime-rl", "starcoder2-tokenizer", "six-gpu"]
+
+[monitors.file]
+path = "metrics.jsonl"
+
+[log]
+level = "info"
+json_logging = true
+log_data = false
+interval = 10.0
+ranks_filter = [0]

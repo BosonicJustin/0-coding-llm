@@ -43,7 +43,8 @@ Every atomic checkpoint contains:
   rank. A worker never seeds, captures, or restores peer GPUs;
 - model configuration, parameter dtypes, optimizer-trajectory configuration,
   world size, Python/NumPy/torch/CUDA runtime identity, model/trainer source
-  hashes, and immutable data identity.
+  hashes, immutable data identity, the exact tokenizer-manifest SHA-256, and a
+  canonical SHA-256 of the complete token-to-ID vocabulary.
 
 Resume rejects a different dataset/order, model, dtype, world size, torch
 version, LR schedule, accumulation factor, or optimizer hyperparameters. Log
@@ -60,10 +61,12 @@ compares every model and optimizer tensor after uninterrupted versus
 interrupted/resumed training with exact equality. The chosen CUDA container
 still needs the equivalent bitwise gate before a long run.
 
-Checkpoint format v4 stores one rank-local CUDA RNG device index and state per
-worker. This avoids the multi-GPU-unsafe `get_rng_state_all()` behavior, which
-would eagerly initialize every visible GPU from every DDP process. Earlier
-checkpoint formats are intentionally rejected rather than ambiguously migrated.
+Checkpoint format v5 stores one rank-local CUDA RNG device index and state per
+worker and binds the model to both tokenizer identities. This avoids the
+multi-GPU-unsafe `get_rng_state_all()` behavior and prevents a same-size but
+semantically different vocabulary from being substituted on resume or export.
+Earlier checkpoint formats are intentionally rejected for exact resume rather
+than ambiguously migrated.
 
 `tests/test_train_distributed.py` contains real, two-process Gloo correctness
 gates. The first runs the production DDP wrapper with two accumulated
@@ -107,6 +110,7 @@ debug architecture first:
 ```bash
 python scripts/overfit_single_chunk.py \
   --order-manifest /local-nvme/train/order-seed-1234/manifest.json \
+  --tokenizer /workspace/dataset/tokenizer/starcoder2 \
   --model-size tiny \
   --device cuda \
   --precision bfloat16 \
@@ -118,6 +122,7 @@ Then run the same gate with the exact architecture:
 ```bash
 python scripts/overfit_single_chunk.py \
   --order-manifest /local-nvme/train/order-seed-1234/manifest.json \
+  --tokenizer /workspace/dataset/tokenizer/starcoder2 \
   --model-size 1.3b \
   --device cuda \
   --parameter-dtype float32 \
@@ -143,6 +148,7 @@ Single process:
 ```bash
 python -m pretrain.train \
   --order-manifest /local-nvme/train/order-seed-1234/manifest.json \
+  --tokenizer /workspace/dataset/tokenizer/starcoder2 \
   --model-size 1.3b \
   --device cuda \
   --precision bfloat16 \
@@ -155,6 +161,7 @@ one process per local GPU:
 ```bash
 torchrun --standalone --nproc-per-node=6 -m pretrain.train \
   --order-manifest /local-nvme/train/order-seed-1234/manifest.json \
+  --tokenizer /workspace/dataset/tokenizer/starcoder2 \
   --model-size 1.3b \
   --device cuda \
   --precision bfloat16 \
@@ -209,6 +216,10 @@ argument vector. It fails before model allocation unless all of the following
 are proven:
 
 - the train order is format v4 with frozen optimizer geometry;
+- the explicit `--tokenizer` directory has a valid source manifest, every
+  declared file matches its recorded size and SHA-256, its manifest SHA-256
+  matches both orders, and its canonical token-to-ID mapping has the declared
+  vocabulary size;
 - the distinct validation order is format v4, has split `validation`, is
   intentionally unfrozen, and can supply the requested number of complete
   global microbatches at the training microbatch size;
@@ -297,6 +308,7 @@ python scripts/certify_pretraining_data.py "$VALIDATION_ORDER" \
 python scripts/launch_pretraining.py \
   --train-order-manifest "$TRAIN_ORDER" \
   --validation-order-manifest "$VALIDATION_ORDER" \
+  --tokenizer /workspace/dataset/tokenizer/starcoder2 \
   --local-data-root "$GPU_PACKED" \
   --durable-checkpoint-root "$DATA_ROOT" \
   --checkpoint "$CHECKPOINT_DIR/last.pt" \

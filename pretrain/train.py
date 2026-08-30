@@ -46,10 +46,15 @@ from pretrain.data import (
     evaluation_order_geometry,
     frozen_training_geometry,
 )
+from pretrain.tokenizer_identity import (
+    TokenizerIdentityError,
+    require_sha256,
+    verify_tokenizer_identity,
+)
 
 
 CHECKPOINT_FORMAT = "native-pytorch-pretrain"
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 5
 Precision = Literal["float32", "bfloat16"]
 WandbMode = Literal["disabled", "offline", "online"]
 _REQUIRED_BATCH_KEYS = ("input_ids", "position_ids", "document_ids", "labels")
@@ -1231,6 +1236,8 @@ class Trainer:
         *,
         device: torch.device | str,
         data_identity: str,
+        tokenizer_manifest_sha256: str | None = None,
+        tokenizer_vocabulary_sha256: str | None = None,
         optimizer: torch.optim.Optimizer | None = None,
         logger: MetricLogger | None = None,
         checkpoint_path: str | Path | None = None,
@@ -1255,6 +1262,37 @@ class Trainer:
         if not data_identity:
             raise ValueError("data_identity must not be empty")
         self.data_identity = data_identity
+        if (tokenizer_manifest_sha256 is None) != (
+            tokenizer_vocabulary_sha256 is None
+        ):
+            raise ValueError(
+                "tokenizer manifest and vocabulary SHA-256 values must be supplied together"
+            )
+        try:
+            self.tokenizer_manifest_sha256 = (
+                None
+                if tokenizer_manifest_sha256 is None
+                else require_sha256(
+                    tokenizer_manifest_sha256,
+                    field="tokenizer_manifest_sha256",
+                )
+            )
+            self.tokenizer_vocabulary_sha256 = (
+                None
+                if tokenizer_vocabulary_sha256 is None
+                else require_sha256(
+                    tokenizer_vocabulary_sha256,
+                    field="tokenizer_vocabulary_sha256",
+                )
+            )
+        except TokenizerIdentityError as exc:
+            raise ValueError(str(exc)) from exc
+        if self.tokenizer_manifest_sha256 is None and (
+            checkpoint_path is not None or config.checkpoint_every > 0
+        ):
+            raise ValueError(
+                "Checkpointing requires tokenizer manifest and vocabulary SHA-256 identities"
+            )
         self.training_geometry = _canonical_training_geometry(training_geometry)
         self.rank, self.world_size = _distributed_rank_world()
         if _is_compiled_model(model) != config.compile_model:
@@ -1432,6 +1470,14 @@ class Trainer:
         destination = Path(path) if path is not None else self.checkpoint_path
         if destination is None:
             raise ValueError("No checkpoint path was configured")
+        if (
+            self.tokenizer_manifest_sha256 is None
+            or self.tokenizer_vocabulary_sha256 is None
+        ):
+            raise RuntimeError(
+                "Refusing to create an unbound checkpoint: tokenizer manifest and "
+                "vocabulary SHA-256 identities are required"
+            )
         checkpoint_key = (destination.resolve(), self.state.completed_steps)
         skip_checkpoint = self._last_checkpoint == checkpoint_key
         dirty_boundary = any(
@@ -1477,6 +1523,8 @@ class Trainer:
                     # the code objects this process loaded rather than the new bytes.
                     "implementation_signature": self.implementation_signature,
                     "data_identity": self.data_identity,
+                    "tokenizer_manifest_sha256": self.tokenizer_manifest_sha256,
+                    "tokenizer_vocabulary_sha256": self.tokenizer_vocabulary_sha256,
                     "training_geometry": self.training_geometry,
                     "validation_configuration": self.validation_configuration,
                     "model_config": self._model_config(),
@@ -1550,6 +1598,16 @@ class Trainer:
                 self.implementation_signature,
             ),
             ("data_identity", payload.get("data_identity"), self.data_identity),
+            (
+                "tokenizer_manifest_sha256",
+                payload.get("tokenizer_manifest_sha256"),
+                self.tokenizer_manifest_sha256,
+            ),
+            (
+                "tokenizer_vocabulary_sha256",
+                payload.get("tokenizer_vocabulary_sha256"),
+                self.tokenizer_vocabulary_sha256,
+            ),
             (
                 "training_geometry",
                 payload.get("training_geometry"),
@@ -2372,6 +2430,40 @@ def _distributed_verify_order(
     return payload, manifest_digest, order_digest
 
 
+def _distributed_verify_tokenizer(
+    path: Path,
+    *,
+    expected_manifest_sha256: str,
+    expected_vocab_size: int,
+    rank: int,
+    world_size: int,
+) -> dict[str, Any]:
+    """Authenticate the tokenizer once on rank zero and broadcast its identity."""
+
+    result: list[dict[str, Any] | None] = [None]
+    if rank == 0:
+        try:
+            identity = verify_tokenizer_identity(
+                path,
+                expected_manifest_sha256=expected_manifest_sha256,
+                expected_vocab_size=expected_vocab_size,
+            )
+            result[0] = {
+                "path": str(path.resolve()),
+                "manifest_sha256": identity.manifest_sha256,
+                "vocabulary_sha256": identity.vocabulary_sha256,
+                "vocab_size": identity.vocab_size,
+            }
+        except BaseException as exc:
+            result[0] = {"error": f"{type(exc).__name__}: {exc}"}
+    if world_size > 1:
+        dist.broadcast_object_list(result, src=0)
+    assert result[0] is not None
+    if "error" in result[0]:
+        raise RuntimeError(f"Tokenizer identity verification failed: {result[0]['error']}")
+    return result[0]
+
+
 def _raise_if_distributed_stage_failed(
     local_error: BaseException | None,
     *,
@@ -2470,6 +2562,15 @@ def _run_initialized_training(
         )
         if order_payload.get("split") != "train":
             parser.error("--order-manifest must identify the train split")
+        tokenizer_identity = _distributed_verify_tokenizer(
+            args.tokenizer,
+            expected_manifest_sha256=str(
+                order_payload.get("tokenizer_manifest_sha256", "")
+            ),
+            expected_vocab_size=int(order_payload["vocab_size"]),
+            rank=rank,
+            world_size=world_size,
+        )
         validation_payload: dict[str, Any] | None = None
         validation_manifest_digest: str | None = None
         validation_payload_digest: str | None = None
@@ -2607,6 +2708,7 @@ def _run_initialized_training(
             "order_manifest": str(args.order_manifest.resolve()),
             "order_manifest_sha256": order_manifest_digest,
             "order_payload_sha256": order_payload_digest,
+            "tokenizer": tokenizer_identity,
             "training_geometry": dict(training_geometry),
             "validation": (
                 None
@@ -2635,7 +2737,17 @@ def _run_initialized_training(
                 device=device,
                 data_identity=(
                     f"order-manifest-sha256:{order_manifest_digest};"
-                    f"order-payload-sha256:{order_payload_digest}"
+                    f"order-payload-sha256:{order_payload_digest};"
+                    "tokenizer-manifest-sha256:"
+                    f"{order_payload['tokenizer_manifest_sha256']};"
+                    "tokenizer-vocabulary-sha256:"
+                    f"{tokenizer_identity['vocabulary_sha256']}"
+                ),
+                tokenizer_manifest_sha256=str(
+                    order_payload["tokenizer_manifest_sha256"]
+                ),
+                tokenizer_vocabulary_sha256=str(
+                    tokenizer_identity["vocabulary_sha256"]
                 ),
                 logger=NullLogger(),
                 checkpoint_path=args.checkpoint,
@@ -2786,6 +2898,15 @@ def _run_initialized_training(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--order-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        required=True,
+        help=(
+            "immutable tokenizer directory; TOKENIZER_MANIFEST.json and the "
+            "canonical token-to-ID mapping are authenticated before training"
+        ),
+    )
     parser.add_argument("--model-size", choices=("tiny", "1.3b"), default="1.3b")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", choices=("float32", "bfloat16"))

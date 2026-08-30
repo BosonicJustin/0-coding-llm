@@ -34,7 +34,7 @@ group splitting, tokenization, and packing.
 - The native PyTorch model, packed loader, deterministic distributed sampler,
   materializer, checkpoint/resume harness, validation, W&B integration, and
   production launcher are implemented.
-- The complete local suite passes 236 tests (one platform skip), including a
+- The complete local suite passes 284 tests (one platform skip), including a
   real two-process Gloo DDP accumulation/token-normalization gate.
 - CUDA FlexAttention, BF16, memory, throughput, and multi-GPU resume gates are
   still required before a long training run.
@@ -67,6 +67,8 @@ group splitting, tokenization, and packing.
 ### Post-training
 
 - [SFT dataset acquisition and quarantine](POSTTRAINING_DATA.md)
+- [Prime Intellect SFT data/model/runtime integration](PRIME_SFT.md)
+- [Prime Verifiers coding smoke environment](environments/coding_smoke/README.md)
 
 ## Local verification
 

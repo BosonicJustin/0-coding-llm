@@ -625,6 +625,7 @@ test "$(jq -er '.training_consumption.optimizer_updates' \
 cd "$PROJECT_ROOT"
 torchrun --standalone --nproc-per-node="$GPU_COUNT" -m pretrain.train \
   --order-manifest "$SMOKE_ORDER/manifest.json" \
+  --tokenizer "$DATA_ROOT/tokenizer/starcoder2" \
   --model-size 1.3b \
   --device cuda \
   --precision bfloat16 \
@@ -780,6 +781,7 @@ OVERFIT_BATCH_ROWS="$(jq -er '.accepted.overfit_batch_rows' "$GEOMETRY_RECORD")"
 cd "$PROJECT_ROOT"
 "$PYTHON_BIN" scripts/overfit_single_chunk.py \
   --order-manifest "$TRAIN_ORDER" \
+  --tokenizer "$DATA_ROOT/tokenizer/starcoder2" \
   --model-size tiny \
   --device cuda \
   --precision bfloat16 \
@@ -789,6 +791,7 @@ cd "$PROJECT_ROOT"
 
 "$PYTHON_BIN" scripts/overfit_single_chunk.py \
   --order-manifest "$TRAIN_ORDER" \
+  --tokenizer "$DATA_ROOT/tokenizer/starcoder2" \
   --model-size 1.3b \
   --device cuda \
   --parameter-dtype float32 \
@@ -862,6 +865,7 @@ trajectory and world size:
 ```bash
 torchrun --standalone --nproc-per-node="$GPU_COUNT" -m pretrain.train \
   --order-manifest "$LOCAL_DIAGNOSTIC_ORDER/manifest.json" \
+  --tokenizer "$DATA_ROOT/tokenizer/starcoder2" \
   --model-size 1.3b \
   --device cuda \
   --precision bfloat16 \
@@ -945,6 +949,7 @@ findmnt -no TARGET,FSTYPE,OPTIONS --target "$GPU_PACKED_RO"
 
 TRAIN_ORDER="$GPU_PACKED_RO/orders/train/manifest.json"
 VALIDATION_ORDER="$GPU_PACKED_RO/orders/validation/manifest.json"
+TOKENIZER_ROOT="$DATA_ROOT/tokenizer/starcoder2"
 GLOBAL_MICROBATCH_ROWS="$(jq -er \
   '.training_consumption.frozen_global_microbatch_rows' "$TRAIN_ORDER")"
 TRAIN_DATA_EVIDENCE="$DATA_ROOT/audits/$RUN_ID/train-data-certification.json"
@@ -966,6 +971,7 @@ cd "$PROJECT_ROOT"
 LAUNCH_COMMON=(
   --train-order-manifest "$TRAIN_ORDER"
   --validation-order-manifest "$VALIDATION_ORDER"
+  --tokenizer "$TOKENIZER_ROOT"
   --local-data-root "$GPU_PACKED_RO"
   --durable-checkpoint-root "$DATA_ROOT"
   --checkpoint "$CHECKPOINT_DIR/last.pt"

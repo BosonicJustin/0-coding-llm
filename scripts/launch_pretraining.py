@@ -38,6 +38,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pretrain import data as training_data  # noqa: E402
+from pretrain.tokenizer_identity import (  # noqa: E402
+    TokenizerIdentityError,
+    verify_tokenizer_identity,
+)
 
 
 ResumeGeneration = Literal["none", "latest", "previous"]
@@ -83,6 +87,7 @@ _PROTECTED_TRAINER_OPTIONS = frozenset(
         "--precision",
         "--resume",
         "--steps",
+        "--tokenizer",
         "--validation-order-manifest",
         "--verify-packed-payloads",
         "--wandb-entity",
@@ -1167,6 +1172,7 @@ def render_torchrun_command(
     train_order: OrderInspection,
     validation_order: OrderInspection,
     checkpoint: CheckpointInspection,
+    tokenizer_path: str,
     model_size: str,
     workers: int,
     checkpoint_every: int,
@@ -1192,6 +1198,8 @@ def render_torchrun_command(
         "pretrain.train",
         "--order-manifest",
         train_order.path,
+        "--tokenizer",
+        tokenizer_path,
         "--validation-order-manifest",
         validation_order.path,
         "--model-size",
@@ -1276,6 +1284,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-order-manifest", type=Path, required=True)
     parser.add_argument("--validation-order-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        required=True,
+        help="immutable tokenizer directory bound to both training orders",
+    )
     parser.add_argument("--local-data-root", type=Path, required=True)
     parser.add_argument("--durable-checkpoint-root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -1364,6 +1378,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             world_size=runtime.world_size,
             eval_batches=args.eval_batches,
         )
+        try:
+            tokenizer_identity = verify_tokenizer_identity(
+                args.tokenizer,
+                expected_manifest_sha256=train_order.tokenizer_manifest_sha256,
+                expected_vocab_size=train_order.vocab_size,
+            )
+        except (OSError, RuntimeError, TokenizerIdentityError) as exc:
+            raise PreflightError(f"Tokenizer identity verification failed: {exc}") from exc
         train_evidence = (
             {"status": "missing", "required_for_execute": True}
             if args.train_data_evidence is None
@@ -1405,6 +1427,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             train_order=train_order,
             validation_order=validation_order,
             checkpoint=checkpoint,
+            tokenizer_path=str(args.tokenizer.resolve()),
             model_size=args.model_size,
             workers=args.workers,
             checkpoint_every=args.checkpoint_every,
@@ -1421,7 +1444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         report: dict[str, Any] = {
             "format": "production-pretraining-preflight",
-            "format_version": 1,
+            "format_version": 2,
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "status": "pass",
             "mode": "execute" if args.execute else "dry-run",
@@ -1451,6 +1474,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
             },
             "checkpoint": asdict(checkpoint),
+            "tokenizer": {
+                "path": str(args.tokenizer.resolve()),
+                "manifest_sha256": tokenizer_identity.manifest_sha256,
+                "vocabulary_sha256": tokenizer_identity.vocabulary_sha256,
+                "vocab_size": tokenizer_identity.vocab_size,
+            },
             "wandb": wandb,
             "train_order": asdict(train_order),
             "validation_order": asdict(validation_order),

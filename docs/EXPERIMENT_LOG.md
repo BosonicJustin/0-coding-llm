@@ -815,3 +815,69 @@ the live curator. In the server's data environment, all 10 SFT downloader tests
 passed. In its PyTorch 2.13 CPU environment, 95 focused loader, trainer,
 launcher, and SFT tests passed with one optional skip. No package was added to
 the active curation environment.
+
+### Prime Intellect SFT integration
+
+On 2026-08-30 the post-training design was separated into two explicit paths.
+Fixed-target supervised fine-tuning uses PrimeRL directly over an immutable
+Hugging Face `messages` dataset; it does not instantiate a Verifiers
+environment. A separate six-task, repository-authored Verifiers package exists
+only to smoke-test later containerized evaluation/RL plumbing and is prohibited
+from supplying SFT rows.
+
+The reviewed runtime pins are PrimeRL
+`3fc28ddfb354f336d1cc28e8e032f262f5aa68b2` and renderers
+`c4772ac1321c69e83d2b4460600072911cc41a0b`. A typed renderer named
+`starcoder2-coding-chat-v1` was added as a reproducible patch to the pinned
+renderer checkout. It adds no vocabulary entries, independently encodes ASCII
+role scaffolding and message bodies, masks all prompt/scaffold tokens, and
+supervises assistant content plus terminal EOS ID 0. The same renderer is used
+for exact 4,096-token curation checks and Prime training, preventing a hidden
+template/token-count mismatch.
+
+The OpenCodeInstruct projection is a restartable two-pass publication job. It
+first authenticates the certified 50-shard/5,000,000-row raw snapshot and
+builds a global authority for prompt groups matching the frozen MBPP denylist
+across prompt, answer, and unit-test text. It then validates rows, propagates
+group rejections, rejects high-confidence credentials, renders exact lengths,
+drops rather than truncates over-context conversations, assigns normalized
+prompt groups to deterministic train/validation splits, and atomically
+publishes Parquet plus complete manifests and ID/reason-only rejection ledgers.
+This is exact/normalized decontamination and grouping, not proof against
+semantic paraphrases. The current `min_average_test_score=0.0` policy is
+deliberately provisional; a real run is blocked until the observed score
+distribution is audited and a new immutable positive-threshold dataset and
+training approval are published.
+
+Native format-v5 pretraining checkpoints now bind both the source tokenizer
+manifest SHA-256 and a canonical token-to-ID vocabulary SHA-256. The HF exporter
+requires those identities, validates the complete native state/config, maps it
+to Llama names, writes only safetensors, preserves the source tokenizer
+manifest, generates new integrity metadata for the derived tokenizer files,
+and publishes atomically. Prime preflight additionally proves the curated data
+and exported checkpoint share the exact source tokenizer manifest and
+`tokenizer.json` bytes.
+
+The checked-in Prime TOML is a six-rank dry-run scaffold: one node, six training
+GPUs, custom Llama, 4,096 context, BF16, global packed-row batch 48,
+microbatch one, eight accumulation rounds, assistant-only labels, and one data
+worker per rank. The custom model path is mandatory because the reviewed
+PrimeRL SFT packer supplies `seq_lens` for variable-length/block-diagonal
+attention; the generic HF path does not preserve those boundaries. A
+fail-closed launcher authenticates the complete dataset, HF export, tokenizer,
+Prime/renderers checkouts, installed patch, and TOML; performs a one-process
+offline HF cache prewarm; then requires the matching cache inventory before it
+can exec six ranks. The checked-in contract cannot launch a real non-dry run.
+
+No SFT curation or Prime training was launched during this implementation.
+Remaining hardware gates are a one-GPU forward/backward and overfit, BF16 and
+memory calibration, a six-rank NCCL step, and an explicit perturbation test
+proving packed conversation boundaries remain isolated on the selected Prime
+GPU image. MBPP remains final-evaluation-only and must not be used for
+checkpoint or hyperparameter selection.
+
+The final local CPU suite passed 284 tests with one platform skip, including
+the real two-process Gloo checkpoint/resume gates and 39 focused Prime/SFT
+integration tests. The Prime TOML also parsed successfully through the exact
+pinned upstream `SFTConfig`, and the renderer patch applied and validated
+against clean temporary copies of both pinned upstream checkouts.

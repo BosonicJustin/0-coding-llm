@@ -501,6 +501,7 @@ class RuntimeAndCommandTest(unittest.TestCase):
             train_order=train,
             validation_order=validation,
             checkpoint=checkpoint,
+            tokenizer_path="/local/tokenizer/starcoder2",
             model_size="1.3b",
             workers=4,
             checkpoint_every=100,
@@ -518,6 +519,10 @@ class RuntimeAndCommandTest(unittest.TestCase):
         self.assertIn("--standalone", command)
         self.assertIn("--nnodes=1", command)
         self.assertIn("--nproc-per-node=6", command)
+        self.assertEqual(
+            command[command.index("--tokenizer") + 1],
+            "/local/tokenizer/starcoder2",
+        )
         self.assertEqual(command[command.index("--device") + 1], "cuda")
 
         incompatible_train = replace(
@@ -675,6 +680,7 @@ class RuntimeAndCommandTest(unittest.TestCase):
             train_order=train,
             validation_order=validation,
             checkpoint=checkpoint,
+            tokenizer_path="/local/tokenizer/starcoder2",
             model_size="1.3b",
             workers=4,
             checkpoint_every=100,

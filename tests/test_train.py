@@ -25,7 +25,7 @@ from pretrain.train import (
     FixedBatchStream,
     GracefulStopController,
     TrainConfig,
-    Trainer,
+    Trainer as ProductionTrainer,
     ValidationRunner,
     WandbLogger,
     _atomic_torch_save,
@@ -43,6 +43,22 @@ from pretrain.train import (
     validate_deterministic_cuda_environment,
     verify_order_payload_checksum,
 )
+
+
+TEST_TOKENIZER_MANIFEST_SHA256 = "a" * 64
+TEST_TOKENIZER_VOCABULARY_SHA256 = "b" * 64
+
+
+def Trainer(*args, **kwargs):
+    """Construct a trainer bound to the deterministic synthetic test tokenizer."""
+
+    kwargs.setdefault(
+        "tokenizer_manifest_sha256", TEST_TOKENIZER_MANIFEST_SHA256
+    )
+    kwargs.setdefault(
+        "tokenizer_vocabulary_sha256", TEST_TOKENIZER_VOCABULARY_SHA256
+    )
+    return ProductionTrainer(*args, **kwargs)
 
 
 OVERFIT_SCRIPT = PROJECT_ROOT / "scripts" / "overfit_single_chunk.py"
@@ -520,6 +536,42 @@ class TrainingHarnessTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "data_identity mismatch"):
                 other.load_checkpoint(checkpoint)
+
+    def test_checkpointing_requires_both_tokenizer_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "Checkpointing requires tokenizer"):
+                ProductionTrainer(
+                    CausalLM(self.model_config, dtype=torch.float32),
+                    self.train_config(max_steps=1),
+                    device="cpu",
+                    data_identity="unbound-checkpoint-must-fail",
+                    checkpoint_path=Path(temporary) / "last.pt",
+                )
+
+    def test_checkpoint_rejects_changed_same_size_tokenizer_vocabulary(self) -> None:
+        stream = FixedBatchStream(make_batch())
+        config = self.train_config(max_steps=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "last.pt"
+            source = Trainer(
+                CausalLM(self.model_config, dtype=torch.float32),
+                config,
+                device="cpu",
+                data_identity=stream.identity,
+                checkpoint_path=checkpoint,
+            )
+            source.save_checkpoint()
+            changed = Trainer(
+                CausalLM(self.model_config, dtype=torch.float32),
+                config,
+                device="cpu",
+                data_identity=stream.identity,
+                tokenizer_vocabulary_sha256="c" * 64,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "tokenizer_vocabulary_sha256 mismatch"
+            ):
+                changed.load_checkpoint(checkpoint)
 
     def test_checkpoint_rejects_changed_global_microbatch_rows(self) -> None:
         stream = FixedBatchStream(make_batch())

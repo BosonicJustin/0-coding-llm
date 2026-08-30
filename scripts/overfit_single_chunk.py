@@ -44,11 +44,21 @@ from pretrain.train import (
     seed_everything,
     tiny_model_config,
 )
+from pretrain.tokenizer_identity import verify_tokenizer_identity, vocabulary_sha256
 
 
-TOKENIZER_MANIFEST_SHA256 = hashlib.sha256(
-    b"single-chunk-overfit-synthetic-tokenizer"
-).hexdigest()
+def synthetic_tokenizer_identities(vocab_size: int) -> tuple[str, str]:
+    """Return reproducible identities for the diagnostic numeric vocabulary."""
+
+    if vocab_size < 1:
+        raise ValueError("Synthetic vocabulary size must be positive")
+    manifest_sha256 = hashlib.sha256(
+        f"single-chunk-overfit-synthetic-tokenizer-v1:{vocab_size}".encode("ascii")
+    ).hexdigest()
+    vocabulary = {
+        f"<synthetic-token-{token_id}>": token_id for token_id in range(vocab_size)
+    }
+    return manifest_sha256, vocabulary_sha256(vocabulary)
 
 
 def build_synthetic_order(
@@ -64,6 +74,7 @@ def build_synthetic_order(
 
     if sequence_length < 4:
         raise ValueError("Synthetic packed fixture requires sequence_length >= 4")
+    tokenizer_manifest_sha256, _ = synthetic_tokenizer_identities(vocab_size)
     manifests: dict[str, Path] = {}
     for domain_id, (domain, rows) in enumerate(
         zip(DOMAIN_ORDER, (4, 4, 2), strict=True)
@@ -76,7 +87,7 @@ def build_synthetic_order(
             sequence_length=sequence_length,
             vocab_size=vocab_size,
             eos_token_id=0,
-            tokenizer_manifest_sha256=TOKENIZER_MANIFEST_SHA256,
+            tokenizer_manifest_sha256=tokenizer_manifest_sha256,
             rows_per_shard=2,
             construction_seed=17,
         )
@@ -157,6 +168,8 @@ def run_overfit(
     resume_path: Path | None,
     logger: Any,
     compile_model: bool,
+    tokenizer_manifest_sha256: str,
+    tokenizer_vocabulary_sha256: str,
 ) -> dict[str, Any]:
     """Run the fixed-batch experiment and assert meaningful memorization."""
 
@@ -201,6 +214,8 @@ def run_overfit(
         config,
         device=device,
         data_identity=fixed_stream.identity,
+        tokenizer_manifest_sha256=tokenizer_manifest_sha256,
+        tokenizer_vocabulary_sha256=tokenizer_vocabulary_sha256,
         logger=logger,
         checkpoint_path=checkpoint_path,
     )
@@ -235,6 +250,8 @@ def run_overfit(
         "loss_ratio": ratio,
         "required_loss_ratio": required_loss_ratio,
         "checkpoint": str(checkpoint_path.resolve()),
+        "tokenizer_manifest_sha256": tokenizer_manifest_sha256,
+        "tokenizer_vocabulary_sha256": tokenizer_vocabulary_sha256,
     }
     if not all(math.isfinite(value) for value in (baseline_loss, resume_start_loss, final_loss)):
         raise AssertionError(f"Non-finite overfit losses: {result}")
@@ -259,6 +276,11 @@ def _resolve_device(requested: str) -> torch.device:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--order-manifest", type=Path)
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="required with --order-manifest; authenticates the real token-to-ID mapping",
+    )
     parser.add_argument("--model-size", choices=("tiny", "1.3b"), default="tiny")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--parameter-dtype", choices=("float32", "bfloat16"), default="float32")
@@ -291,6 +313,8 @@ def main() -> int:
 
     synthetic_context: tempfile.TemporaryDirectory[str] | None = None
     if args.order_manifest is None:
+        if args.tokenizer is not None:
+            parser.error("--tokenizer is only valid with --order-manifest")
         synthetic_context = tempfile.TemporaryDirectory()
         synthetic_root = Path(synthetic_context.name)
         synthetic_vocab = 64 if args.model_size == "tiny" else 49_152
@@ -299,11 +323,28 @@ def main() -> int:
             sequence_length=16,
             vocab_size=synthetic_vocab,
         )
+        (
+            tokenizer_manifest_sha256,
+            tokenizer_vocabulary_sha256,
+        ) = synthetic_tokenizer_identities(synthetic_vocab)
     else:
+        if args.tokenizer is None:
+            parser.error("--tokenizer is required with --order-manifest")
         order_manifest = args.order_manifest
     order_payload = json.loads(order_manifest.read_text(encoding="utf-8"))
     vocab_size = int(order_payload["vocab_size"])
     sequence_length = int(order_payload["sequence_length"])
+    if args.order_manifest is not None:
+        assert args.tokenizer is not None
+        tokenizer_identity = verify_tokenizer_identity(
+            args.tokenizer,
+            expected_manifest_sha256=str(
+                order_payload["tokenizer_manifest_sha256"]
+            ),
+            expected_vocab_size=vocab_size,
+        )
+        tokenizer_manifest_sha256 = tokenizer_identity.manifest_sha256
+        tokenizer_vocabulary_sha256 = tokenizer_identity.vocabulary_sha256
     model_config = (
         tiny_model_config(vocab_size=vocab_size, max_seq_len=sequence_length)
         if args.model_size == "tiny"
@@ -341,6 +382,8 @@ def main() -> int:
             resume_path=args.resume,
             logger=logger,
             compile_model=args.compile,
+            tokenizer_manifest_sha256=tokenizer_manifest_sha256,
+            tokenizer_vocabulary_sha256=tokenizer_vocabulary_sha256,
         )
         _atomic_write_json(args.output_dir / "result.json", result)
         print(json.dumps(result, indent=2, sort_keys=True), flush=True)

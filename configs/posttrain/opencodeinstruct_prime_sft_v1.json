@@ -1,0 +1,27 @@
+{
+  "benchmark_denylists": [
+    "configs/mbpp_denylist.json"
+  ],
+  "chat_format_id": "starcoder2-coding-chat-v1",
+  "filter": {
+    "max_completion_bytes": 1000000,
+    "max_prompt_bytes": 1000000,
+    "min_average_test_score": 0.0,
+    "reject_high_confidence_secrets": true,
+    "require_metadata_json": false
+  },
+  "max_sequence_length": 4096,
+  "overlength_policy": "drop-complete-conversation",
+  "policy_version": 1,
+  "source_license": "CC-BY-4.0",
+  "source_repo_id": "nvidia/OpenCodeInstruct",
+  "source_revision": "8f3ba5bafe4d6e8db46082cf7ae6741bc370604d",
+  "split": {
+    "seed": "opencodeinstruct-prime-sft-v1",
+    "validation_per_million": 2000
+  },
+  "tokenizer_eos_id": 0,
+  "tokenizer_repo_id": "bigcode/starcoder2-tokenizer",
+  "tokenizer_revision": "9cfe60e28fd01cc1391ecd2146a34cda7534efeb",
+  "tokenizer_vocab_size": 49152
+}
