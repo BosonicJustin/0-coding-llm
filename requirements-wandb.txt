@@ -1,0 +1,3 @@
+# Optional experiment tracking. The trainer never imports this package when
+# --wandb-mode is disabled (the default).
+wandb>=0.18,<1

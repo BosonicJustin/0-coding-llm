@@ -1,0 +1,63 @@
+{
+  "config_version": 1,
+  "calibration_algorithm": "deterministic-real-text-perturbation-v1",
+  "seed": "coding-model-english-near-calibration-v1",
+  "sampling": {
+    "maximum_archives_per_bucket": 4,
+    "maximum_documents_per_bucket": 32,
+    "maximum_fixture_documents": 64,
+    "minimum_source_words": 96,
+    "maximum_source_words": 4096
+  },
+  "perturbations": {
+    "variants_per_document_per_bin": 1,
+    "operations": [
+      "append_donor_fragment",
+      "truncate_tail",
+      "replace_contiguous_with_donor"
+    ],
+    "maximum_search_evaluations_per_operation": 24,
+    "bins": [
+      {
+        "name": "below_wide",
+        "minimum_numerator": 700,
+        "maximum_numerator": 760,
+        "denominator": 1000
+      },
+      {
+        "name": "below_boundary",
+        "minimum_numerator": 770,
+        "maximum_numerator": 795,
+        "denominator": 1000
+      },
+      {
+        "name": "above_boundary",
+        "minimum_numerator": 800,
+        "maximum_numerator": 830,
+        "denominator": 1000
+      },
+      {
+        "name": "above_target",
+        "minimum_numerator": 840,
+        "maximum_numerator": 880,
+        "denominator": 1000
+      },
+      {
+        "name": "high_similarity",
+        "minimum_numerator": 900,
+        "maximum_numerator": 950,
+        "denominator": 1000
+      }
+    ]
+  },
+  "acceptance": {
+    "minimum_eligible_documents": 48,
+    "minimum_pairs_at_or_above_production_threshold": 144,
+    "minimum_candidate_recall": 0.98,
+    "recall_acceptance_statistic": "one-sided-wilson-lower-bound",
+    "recall_confidence_level": 0.95,
+    "maximum_generation_failures": 0,
+    "maximum_exact_refinement_decision_errors": 0,
+    "require_every_bin": true
+  }
+}

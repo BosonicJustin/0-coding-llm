@@ -1,0 +1,53 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.netrc
+*.pem
+*.key
+*.p12
+
+# Local Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime logs and experiment tracking
+*.log
+runs/
+wandb/
+
+# Model checkpoints and exported weights
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# Corpora, generated pipeline state, and large binary payloads
+data/
+dataset/
+dataset-*/
+artifacts/
+.work/
+*.sqlite
+*.sqlite3
+*.db
+*-journal
+*-wal
+*-shm
+*.jsonl
+*.jsonl.zst
+*.tar.zst
+*.parquet
+*.arrow
+*.bin
+*.npy
+*.npz

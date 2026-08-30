@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "estimation": {
+    "bytes_per_token": {
+      "python": 3.87,
+      "other_code": 4.0
+    }
+  },
+  "quotas": [
+    {
+      "name": "collection/python",
+      "phase": "collection",
+      "category": "python",
+      "token_field": "exact_tokens",
+      "target": 1
+    },
+    {
+      "name": "collection/other_code",
+      "phase": "collection",
+      "category": "other_code",
+      "token_field": "exact_tokens",
+      "target": 1
+    }
+  ]
+}

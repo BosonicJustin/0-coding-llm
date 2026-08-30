@@ -1,0 +1,8 @@
+# The quota ledger itself uses only the Python standard library.
+# These packages are used by the streaming collector and exact tokenizer audit.
+datasets>=3.2,<5
+tokenizers>=0.21,<0.24
+transformers>=4.48,<6
+huggingface_hub[hf_xet]>=0.30,<2
+zstandard>=0.23,<1
+xxhash>=3.5,<4

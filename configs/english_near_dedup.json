@@ -1,0 +1,87 @@
+{
+  "config_version": 1,
+  "algorithm": "raw-text-doph-lsh-plus-full-shingle-jaccard-v1",
+  "description": "Cross-source English near-deduplication. The 16-value preprocessing sketch is integrity-only; production candidates come from a second immutable-raw-text pass.",
+  "normalization": "NFKC+casefold+collapse-whitespace",
+  "shingle_words": 5,
+  "candidate_signature": {
+    "algorithm": "densified-one-permutation-minhash",
+    "hash": "xxh3-64",
+    "tables": [
+      {
+        "hash_seed": 1691086982835599081,
+        "bins": 72,
+        "bands": 12,
+        "rows_per_band": 6,
+        "densify_seed": 7841199801642290067
+      },
+      {
+        "hash_seed": 11694633085474628617,
+        "bins": 72,
+        "bands": 12,
+        "rows_per_band": 6,
+        "densify_seed": 13787848793156543929
+      }
+    ],
+    "band_key_seed": 507867018506514414,
+    "maximum_posting_documents": 5000,
+    "maximum_unique_candidate_pairs": 250000000,
+    "posting_overflow_action": "fail_closed",
+    "length_ratio_filter": "exact_jaccard_upper_bound"
+  },
+  "refinement": {
+    "algorithm": "full-unique-five-word-shingle-jaccard",
+    "shingle_hash": "xxh3-64",
+    "shingle_hash_seed": 104729,
+    "minimum_jaccard_numerator": 4,
+    "minimum_jaccard_denominator": 5,
+    "hash_collision_model": "64-bit-collisions-are-possible-and-audited-not-impossible"
+  },
+  "operational_preflight": {
+    "contract_version": 1,
+    "sampling_algorithm": "deterministic-keyspace-stratified-successor-v1",
+    "sampling_seed": 9290996214508845239,
+    "requested_pairs": 10000,
+    "strata": 256,
+    "successors_per_probe": 64,
+    "maximum_probe_passes": 4,
+    "minimum_production_pairs_per_second": 1000.0,
+    "maximum_projected_refinement_seconds": 259200,
+    "maximum_peak_process_rss_bytes": 12884901888,
+    "union_parent_memory_safety_numerator": 3,
+    "union_parent_memory_safety_denominator": 2,
+    "disk_projection_safety_numerator": 3,
+    "disk_projection_safety_denominator": 2,
+    "minimum_post_refinement_free_bytes": 21474836480
+  },
+  "clustering": {
+    "normalized_hash_equality_always_unions": true,
+    "near_edges": "refined-jaccard-at-or-above-threshold",
+    "component_root": "lowest-frozen-inventory-ordinal",
+    "singleton_clusters_required": true
+  },
+  "storage": {
+    "sqlite_journal_mode": "auto",
+    "wal_local_filesystem_allowlist": [
+      "apfs",
+      "btrfs",
+      "ext2",
+      "ext3",
+      "ext4",
+      "hfs",
+      "hfsplus",
+      "overlay",
+      "tmpfs",
+      "xfs",
+      "zfs"
+    ],
+    "network_or_unknown_action": "delete",
+    "wal_on_non_allowlisted_action": "fail_closed"
+  },
+  "output": {
+    "mapping_filename": "clusters.jsonl.zst",
+    "mapping_record": "doc_id-cluster_id",
+    "compression": "zstd-level-3-checksummed",
+    "atomic_manifest": true
+  }
+}

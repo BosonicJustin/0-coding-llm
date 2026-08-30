@@ -1,0 +1,86 @@
+{
+  "policy_version": 2,
+  "description": "Fast production baseline with global exact and normalized canonicalization but no fuzzy near-deduplication.",
+  "curation_profile": {
+    "contract_version": 1,
+    "name": "fast-exact-normalized-canonical-v1",
+    "production_tier": "baseline",
+    "fuzzy_near_dedup": false,
+    "canonicalization": "global_exact_then_global_normalized_hash",
+    "benchmark_propagation": "global_exact_and_global_normalized_hash",
+    "split_grouping": "stable_repository_or_english_source",
+    "known_limitations": [
+      "Semantic near-duplicate documents may remain and may cross source groups or data splits."
+    ]
+  },
+  "trusted_code_source": {
+    "repo_id": "HuggingFaceCode/stack-v3-train",
+    "resolved_revision": "df4b205fbba4cc1c2fd1f205b10d66f730798bb9",
+    "source_shard_count": 8192,
+    "source_shards_sha256": "d080732e8c9f2dbd3877c498e6e7a5dc96076c69e5e9ab95f7b9c51474d21408",
+    "upstream_release": "v3.1",
+    "upstream_deduplication": "file_level_cross_repository_minhash_lsh"
+  },
+  "common": {
+    "raw_archives_immutable": true,
+    "exact_hash_audit": true,
+    "normalized_hash_audit": true,
+    "residual_exact_normalized_action": "remove_deterministically_before_split",
+    "benchmark_contamination_action": "reject_before_split"
+  },
+  "selection": {
+    "selection_version": 1,
+    "seed": "coding-model-from-scratch-curation-v1",
+    "terminal_document_action": "keep_token_prefix_to_exact_quota",
+    "split_order": ["test", "validation", "train"],
+    "quality": {
+      "hard_reject_flags": [
+        "empty",
+        "high_line_repetition",
+        "null_character",
+        "possible_secret",
+        "replacement_character",
+        "too_short"
+      ],
+      "hard_reject_flags_by_bucket": {
+        "python": ["likely_minified"],
+        "other_code": ["likely_minified"],
+        "fineweb_edu": ["high_url_density"],
+        "wikipedia": ["high_url_density"]
+      },
+      "soft_penalty_weights": {
+        "possible_generated": 8,
+        "very_long_line": 4
+      },
+      "missing_code_repo_id_action": "reject",
+      "missing_english_source_identity_action": "reject"
+    },
+    "english_near_dedup": {
+      "required_for_production": false,
+      "mapping_format": null,
+      "missing_mapping_action": "disabled_by_fast_profile"
+    }
+  },
+  "buckets": {
+    "python": {
+      "local_near_dedup": false,
+      "near_duplicate_authority": "trusted_upstream_stack_v3_train",
+      "split_grouping": "repository_and_residual_duplicate_union"
+    },
+    "other_code": {
+      "local_near_dedup": false,
+      "near_duplicate_authority": "trusted_upstream_stack_v3_train",
+      "split_grouping": "repository_and_residual_duplicate_union"
+    },
+    "fineweb_edu": {
+      "local_near_dedup": false,
+      "near_duplicate_authority": "disabled_by_fast_profile",
+      "split_grouping": "stable_english_source_after_canonicalization"
+    },
+    "wikipedia": {
+      "local_near_dedup": false,
+      "near_duplicate_authority": "disabled_by_fast_profile",
+      "split_grouping": "stable_english_source_after_canonicalization"
+    }
+  }
+}
