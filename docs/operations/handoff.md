@@ -18,7 +18,7 @@ Downloaded SFT data is quarantined until benchmark decontamination, schema
 normalization, length analysis, split construction, and a separate SFT
 publication manifest are complete.
 
-## Last verified server state at 2026-08-31 14:04 UTC
+## Last verified server state at 2026-08-31 16:53 UTC
 
 - The resized CPU pod exposes a 320 GiB local overlay
   (343,597,383,680 bytes total) and the durable NFS network volume at
@@ -75,10 +75,41 @@ publication manifest are complete.
   immediately published a healthy record. The monitor now distinguishes the
   exact bulk-index subphase, requires terminal inventory accounting for it, and
   still rejects every unknown inventory subphase.
+- Exact-choice canonicalization completed for all 49,463,280 groups. At 14:35
+  UTC, final-choice canonicalization had committed 26,400,000 rows in 264
+  atomic batches with cursor
+  `88a0a01f84ece7b0edb1d53a21ce6e4c5d74945ae68fe659f066336ebbed9215`.
+  The live checkpoint and journal hashes were respectively
+  `1c5fb4464d2bdb567b5ed057b868c560ea462e30d13895ba7b81943faa90afbc`
+  and `20d76f3801d81337ac84fe5347a74f70dd41c7ca4b568a87be6ca5328703ceb3`.
+- Hourly snapshot generation four copied the then-60,043,280,384-byte database
+  to NFS but remained inside its integrity pass with no published manifest.
+  At 16:25 UTC the monitor was stopped, exact curator PID 368 was verified
+  against its command and durable lease, and that PID received `SIGTERM` to use
+  the tested WAL crash-recovery path. The local database, WAL, SHM, checkpoint,
+  and journal were not moved, truncated, or deleted; their checkpoint/journal
+  hashes remained unchanged after process death. Snapshot three remained the
+  newest complete recovery authority.
+- The same generation restarted at 16:28 UTC as PID 882. The frozen identity,
+  retention two, policy, batch size, journaling mode, and deferred raw-integrity
+  policy are unchanged; only the full-snapshot interval changed from 3,600 to
+  21,600 seconds. The restart explicitly claimed the recorded stale lease,
+  automatically removed manifestless snapshot four, authenticated snapshot
+  three, hashed the existing local database and sidecars, and passed WAL,
+  SQLite quick-check, and foreign-key recovery gates.
+- Resume is proven rather than inferred: final-choice first reappeared at or
+  beyond the exact 26,400,000-row / 264-batch floor, then advanced to
+  30,200,000 rows / 302 batches by 16:53 UTC with a strictly later cursor. The
+  16:52 monitor record was healthy with no warnings, the new curator and monitor
+  tmux sessions were alive, no active health alert existed, local storage had
+  264 GiB free, and NFS had 814 GiB free. The previous false-positive alert is
+  retained under `.work/archived-health-alerts/`, not silently discarded.
 - The accelerated output is durable at
   `/workspace/dataset/curated/selection-fast-local-v2`; its live SQLite/WAL
   authority is `/local/curation/selection-fast-local-v2`. Full authenticated
-  snapshots are written hourly to NFS with retention two.
+  snapshots are now scheduled every six hours with retention two. Snapshot
+  three remains the latest complete NFS recovery point until generation four is
+  republished; do not delete the pod or its local volume in that interval.
 
 - The network-volume baseline curator was stopped deliberately with `Ctrl-C`
   through its `curation-fast-v1` tmux foreground job before the storage resize.
@@ -137,13 +168,15 @@ progress commits are recorded in `CHECKPOINT.json` and SQLite.
 
 ## What follows automatically
 
-The accelerated curator is advancing inventory and will continue into quality
-filtering, exact/normalized canonicalization, leakage-safe grouping, split
-assignment, quota selection, final deferred raw-integrity verification, and
-atomic publication. It must not be replaced with an ad hoc filtering process.
-A storage violation, lease conflict, identity mismatch, accounting mismatch, or
-failed health record after startup is a hard stop. Token materialization remains
-a separate launch after final curation certification.
+The accelerated curator has completed inventory, bulk indexes, and exact-choice
+canonicalization and is advancing the restartable final-choice subphase. It
+will continue automatically through the remaining exact/normalized
+canonicalization accounting, leakage-safe grouping, split assignment, quota
+selection, final deferred raw-integrity verification, and atomic publication.
+It must not be replaced with an ad hoc filtering process. A storage violation,
+lease conflict, identity mismatch, accounting mismatch, or failed health record
+after startup is a hard stop. Token materialization remains a separate launch
+after final curation certification.
 
 ## What requires a separate launch
 

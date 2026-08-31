@@ -529,6 +529,172 @@ the canonical owner, and atomically archives the old record under
 recovery when the recorded same-host PID is alive. An existing claim for that
 token is a manual-review stop, never something to delete automatically.
 
+### Controlled restart of the local-WAL curator
+
+Use this procedure when the accelerated curator is blocked inside a long
+SQLite snapshot integrity scan and a same-pod restart is preferable to waiting
+for the incomplete snapshot. This is a deliberately abrupt, WAL-recovery stop:
+`SIGINT` is not appropriate here because context-manager exit forces another
+full snapshot. `SIGTERM` has been exercised by the process-death recovery gate;
+it leaves the durable lease behind so that the restart must explicitly prove
+and claim the stale owner. Do not use this procedure for a healthy curator just
+to change ordinary configuration.
+
+First stop the health monitor so that the intentional process death does not
+publish an avoidable alert. Resolve exactly one curator PID, compare its full
+command line to the frozen launch record, validate that the durable lease names
+that PID and output, and record the live projection hashes before signaling it:
+
+```bash
+CURATION_FAST_WORK="$DATA_ROOT/curated/selection-fast-local-v2"
+CURATION_FAST_LOCAL=/local/curation/selection-fast-local-v2
+CURATION_FAST_LEASE="$CURATION_FAST_WORK/.curation.cross-client-lease.json"
+CURATION_FAST_CHECKPOINT="$CURATION_FAST_LOCAL/CHECKPOINT.json"
+CURATION_FAST_JOURNAL="$CURATION_FAST_LOCAL/journal.jsonl"
+CURATION_FAST_DB="$CURATION_FAST_LOCAL/curation.sqlite3"
+
+tmux kill-session -t curation-fast-local-v2-monitor 2>/dev/null || true
+test -f "$CURATION_FAST_LEASE"
+CURATOR_PID="$(jq -er '.pid' "$CURATION_FAST_LEASE")"
+kill -0 "$CURATOR_PID"
+
+ps -ww -p "$CURATOR_PID" -o pid=,ppid=,lstart=,stat=,args=
+tr '\0' ' ' < "/proc/$CURATOR_PID/cmdline"
+printf '\n'
+jq -e --arg output "$(realpath "$CURATION_FAST_WORK")" \
+  --argjson pid "$CURATOR_PID" \
+  '.pid == $pid and .output == $output and
+   (.owner_token | test("^[0-9a-f]{64}$"))' \
+  "$CURATION_FAST_LEASE" >/dev/null
+
+STALE_OWNER_TOKEN="$(jq -er '.owner_token' "$CURATION_FAST_LEASE")"
+CHECKPOINT_SHA_BEFORE="$(sha256sum "$CURATION_FAST_CHECKPOINT" | cut -d' ' -f1)"
+JOURNAL_SHA_BEFORE="$(sha256sum "$CURATION_FAST_JOURNAL" | cut -d' ' -f1)"
+jq '{phase, counts, last_event_sequence,
+     running: [.subphases[] | select(.status == "running")]}' \
+  "$CURATION_FAST_CHECKPOINT"
+printf 'checkpoint_sha256=%s\njournal_sha256=%s\nowner_token=%s\n' \
+  "$CHECKPOINT_SHA_BEFORE" "$JOURNAL_SHA_BEFORE" "$STALE_OWNER_TOKEN"
+stat "$CURATION_FAST_DB" \
+  "$CURATION_FAST_DB-wal" "$CURATION_FAST_DB-shm" 2>/dev/null || true
+ls -l "/proc/$CURATOR_PID/fd"
+```
+
+Do not continue unless the displayed PID, executable arguments, policy, output,
+local work root, batch size, journaling mode, snapshot retention, and deferred
+raw-integrity flag exactly match the frozen run. Retain the printed hashes and
+the exact lowercase `owner_token` in the incident record. The checkpoint and
+journal are projections of the committed SQLite state; the restart validates
+their coherence again before the monitor is relaunched.
+
+Send one `SIGTERM` to that exact PID and wait for it to disappear. Do not copy,
+move, truncate, checkpoint, or delete `curation.sqlite3`, `-wal`, or `-shm`, and
+do not manually remove the manifestless snapshot directory. If the PID remains
+in uninterruptible I/O after the bounded wait, stop and investigate the mount;
+do not escalate automatically to `SIGKILL`.
+
+```bash
+kill -TERM "$CURATOR_PID"
+for _attempt in $(seq 1 120); do
+  kill -0 "$CURATOR_PID" 2>/dev/null || break
+  sleep 1
+done
+if kill -0 "$CURATOR_PID" 2>/dev/null; then
+  echo "curator is still alive; inspect process state and mount before escalation" >&2
+  exit 1
+fi
+
+test -f "$CURATION_FAST_LEASE"
+test "$(jq -er '.owner_token' "$CURATION_FAST_LEASE")" = "$STALE_OWNER_TOKEN"
+test "$(jq -er '.pid' "$CURATION_FAST_LEASE")" = "$CURATOR_PID"
+! pgrep -af '[/]opt/coding-model-venv/bin/python scripts/curate_corpus.py'
+! tmux has-session -t curation-fast-local-v2 2>/dev/null
+stat "$CURATION_FAST_DB" \
+  "$CURATION_FAST_DB-wal" "$CURATION_FAST_DB-shm" 2>/dev/null || true
+sha256sum "$CURATION_FAST_CHECKPOINT" "$CURATION_FAST_JOURNAL"
+```
+
+The last two hashes may equal the pre-signal hashes when the process was blocked,
+or may identify a later coherent commit completed before signal delivery. Keep
+both observations. Confirm independently that no curator on another pod mounts
+this output before recovering the NFS-visible lease; a local `pgrep` cannot
+prove that cross-pod condition.
+
+Restart from the same checkout, Python environment, source/policy paths, output,
+local work root, batch size, journal mode, snapshot retention, and integrity
+policy. For the qualified live generation, the only operational change is the
+snapshot interval from one hour to six hours (`21600` seconds). The interval is
+not part of the frozen database/store identity; retention is and remains two.
+Pass the captured stale token exactly once:
+
+```bash
+tmux new-session -d -s curation-fast-local-v2 -c "$PROJECT_ROOT" \
+  "env PYTHONUNBUFFERED=1 nice -n 5 $PYTHON_BIN scripts/curate_corpus.py \
+    --root $DATA_ROOT \
+    --staging-root $DATA_ROOT/staging/preprocess \
+    --policy $PROJECT_ROOT/configs/curation_policy_fast_exact_normalized.json \
+    --output $CURATION_FAST_WORK \
+    --sqlite-local-work-root $CURATION_FAST_LOCAL \
+    --sqlite-snapshot-interval-seconds 21600 \
+    --sqlite-snapshot-retention 2 \
+    --defer-raw-archive-integrity-until-finalize \
+    --batch-size 100000 \
+    --sqlite-journal-mode delete \
+    --recover-stale-cross-client-lease $STALE_OWNER_TOKEN \
+    >> $DATA_ROOT/logs/curation-fast-local-v2.log 2>&1"
+```
+
+Startup is intentionally quiet and I/O-heavy. It atomically archives the stale
+lease after publishing its permanent recovery claim, removes any snapshot
+generation that never published `manifest.json`, and validates the complete
+snapshot chain. It then authenticates the existing local database and WAL/SHM,
+opens SQLite so WAL recovery runs, and, when crash sidecars were present,
+requires `quick_check` plus a foreign-key check before phase work resumes. A
+sidecar-free database receives the full database check instead. If local state
+has actually been lost, only the last complete manifest-bound network snapshot
+is eligible for restore; a manifestless partial copy is never recovery
+authority.
+
+On the current NFS, validating a tens-of-gigabytes complete snapshot and hashing
+the larger local database can take tens of minutes to roughly an hour, and may
+take longer under contention. No checkpoint advance during that preparation is
+expected. Observe the exact process, its file descriptors, CPU/I/O state, the
+unchanged local files, and the new lease instead of treating the old checkpoint
+mtime alone as a hang.
+
+Wait until preparation has completed and the checkpoint/journal projection has
+advanced coherently, then run one health inspection before starting the
+persistent five-minute monitor:
+
+```bash
+NEW_CURATOR_PID="$(jq -er '.pid' "$CURATION_FAST_LEASE")"
+kill -0 "$NEW_CURATOR_PID"
+ps -ww -p "$NEW_CURATOR_PID" -o pid=,lstart=,stat=,etime=,time=,args=
+
+"$PYTHON_BIN" "$PROJECT_ROOT/scripts/monitor_curation.py" \
+  --output "$CURATION_FAST_WORK" \
+  --live-work-root "$CURATION_FAST_LOCAL" \
+  --stall-seconds 3600 \
+  --once
+
+tmux new-session -d -s curation-fast-local-v2-monitor -c "$PROJECT_ROOT" \
+  "env PYTHONUNBUFFERED=1 $PYTHON_BIN scripts/monitor_curation.py \
+    --output $CURATION_FAST_WORK \
+    --live-work-root $CURATION_FAST_LOCAL \
+    --interval-seconds 300 \
+    --stall-seconds 3600 \
+    >> $DATA_ROOT/logs/curation-fast-local-v2-monitor.log 2>&1"
+```
+
+The six-hour interval avoids repeatedly spending hours in full NFS snapshot
+copy, integrity, and hashing passes. A process crash on the same pod still
+recovers every committed local WAL transaction. The tradeoff is pod/local-disk
+loss: recovery then falls back to the newest fully published network snapshot,
+so all work since that publication is expendable. The exposure is the elapsed
+time since the last successful snapshot, potentially more than six hours if a
+new snapshot is still incomplete. Do not delete the pod or its local volume
+until the next complete snapshot—or the final certified publication—is durable.
+
 The command above writes directly to the durable network publication
 `$DATA_ROOT/curated/selection-fast-v1`; no second copy or rename is needed.
 Only `manifest.json`, `manifest.sha256`, and `decisions/` are closed inputs to

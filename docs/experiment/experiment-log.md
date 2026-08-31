@@ -1030,3 +1030,52 @@ contributes no synthetic document rows. Every other running inventory subphase
 still fails closed. Three regression tests cover the valid terminal transition,
 premature index construction, and an unknown subphase. The complete CPU suite
 passed all 367 tests with two platform skips.
+
+## 2026-08-31 controlled snapshot abort and WAL recovery
+
+Final-choice canonicalization had committed 26,400,000 rows in 264 batches when
+the hourly snapshot timer started generation four at 14:35 UTC. The live SQLite
+database was 60,043,280,384 bytes. Generation four completed its NFS copy but
+was still inside the first integrity pass almost two hours later and had never
+published `manifest.json`; it was therefore an incomplete transfer, not a
+recovery authority. Generation three remained complete and authenticated.
+
+Before intervention, the exact curator PID and full command line were matched
+to the durable cross-client lease. The live `CHECKPOINT.json` and
+`journal.jsonl` hashes were recorded as
+`1c5fb4464d2bdb567b5ed057b868c560ea462e30d13895ba7b81943faa90afbc`
+and `20d76f3801d81337ac84fe5347a74f70dd41c7ca4b568a87be6ca5328703ceb3`.
+The checkpoint recorded `canonicalize.final_choice` at 26,400,000 rows, 264
+batches, and cursor
+`88a0a01f84ece7b0edb1d53a21ce6e4c5d74945ae68fe659f066336ebbed9215`.
+The monitor was stopped first. Because `SIGINT` invokes the curator context
+manager's forced-exit snapshot and the process was blocked inside SQLite,
+verified PID 368 received one `SIGTERM`, exercising the already tested WAL
+crash-recovery path. The PID and tmux session exited, the advisory file lock was
+released, and the stale durable lease remained as required. No local database,
+WAL, SHM, checkpoint, journal, or snapshot payload was manually altered.
+
+At 16:28 UTC the identical generation was relaunched with the captured
+`--recover-stale-cross-client-lease` token. Frozen identity, policy, batch size,
+journal mode, snapshot retention two, and deferred raw-integrity policy were
+unchanged. The only operating change was
+`--sqlite-snapshot-interval-seconds 21600`, replacing the one-hour interval with
+six hours. Startup removed manifestless generation four, authenticated complete
+generation three, authenticated the 60 GB local database and WAL/SHM, performed
+SQLite recovery plus quick and foreign-key checks, and republished the live
+checkpoint before phase work continued.
+
+The resume floor was exact and monotonic. Final-choice advanced first to
+28,000,000 rows / 280 batches and then to 30,200,000 rows / 302 batches by
+16:53 UTC with a cursor strictly greater than the recorded pre-stop cursor.
+The 16:52 health record was `healthy`: PID 882 alive, no warnings, no active
+health alert, bounded 142,420,192-byte WAL, 264 GiB local space free, and 814
+GiB NFS space free. The false 13:54 bulk-index alert was preserved under the
+output's `.work/archived-health-alerts/` directory. Both curator and five-minute
+monitor tmux sessions remained active.
+
+This restart preserves every committed local WAL transaction against a process
+crash on the same pod. Until the next complete six-hour snapshot publishes,
+loss of the pod's local disk would still fall back to generation three and lose
+newer canonicalization, so the pod/local volume must remain intact. The exact
+repeatable procedure is now in the production runbook.

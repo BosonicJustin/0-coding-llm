@@ -181,8 +181,12 @@ outputs.
 Moving indexed random writes and WAL checkpoints off NFS should plausibly improve
 the database-heavy inventory phase by 5–20x and end-to-end curation by 3–10x,
 depending on decoder and snapshot time. These are planning ranges, not measured
-claims. Hourly full snapshots write one database sequentially to NFS, so benchmark
-the interval and do not reduce it merely to make progress telemetry look fresher.
+claims. Full snapshots write one database sequentially to NFS, so benchmark the
+interval and do not reduce it merely to make progress telemetry look fresher.
+The qualified live rollout measured roughly three hours to publish a 31.4 GB
+snapshot through copy, integrity, and SHA-256 gates. Its operational interval is
+therefore six hours: fewer full-copy stalls in exchange for a larger rollback
+window if both the pod and its local disk are lost.
 
 ## Benchmark matrix
 
@@ -221,7 +225,7 @@ python scripts/curate_corpus.py \
   --policy configs/curation_policy_fast_exact_normalized.json \
   --output /workspace/dataset/curated/selection-fast-local-v2 \
   --sqlite-local-work-root /local/curation/selection-fast-local-v2 \
-  --sqlite-snapshot-interval-seconds 3600 \
+  --sqlite-snapshot-interval-seconds 21600 \
   --sqlite-snapshot-retention 2 \
   --defer-raw-archive-integrity-until-finalize \
   --batch-size 100000
@@ -250,3 +254,7 @@ python scripts/monitor_curation.py \
 
 These commands are operating examples, not permission to switch the production
 generation. The benchmark and recovery gates remain mandatory.
+
+For an exact-PID, lease-fenced restart of an already qualified generation,
+including the tested `SIGTERM`/WAL recovery path and the required monitor delay,
+follow [Controlled restart of the local-WAL curator](../operations/production-runbook.md#controlled-restart-of-the-local-wal-curator).
