@@ -18,7 +18,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from model import CausalLM
+from pretrain.model import CausalLM
 from pretrain.data import create_training_dataloader, frozen_training_geometry
 from pretrain.train import (
     CheckpointLease,

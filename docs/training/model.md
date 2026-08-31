@@ -1,6 +1,6 @@
 # Native PyTorch model
 
-`model.py` is now a native PyTorch implementation rather than a Hugging Face
+`pretrain/model.py` is a native PyTorch implementation rather than a Hugging Face
 `LlamaForCausalLM` wrapper. The default configuration preserves the original
 architecture exactly:
 
@@ -104,7 +104,8 @@ architecture has no dropout, the block checkpoint does not preserve RNG state.
 The native optimizer loop, token-correct gradient accumulation, replicated DDP,
 atomic full-state checkpoint/resume, fixed-chunk overfit gate, and optional W&B
 logging are implemented in `pretrain/train.py`; operational details and GPU
-gates are documented in `TRAINING.md`. Native FSDP/sharded checkpoints, a fused
+gates are documented in [training.md](training.md). Native FSDP/sharded
+checkpoints, a fused
 vocabulary loss, and final CUDA
 performance tuning are not yet implemented. The bounded pure-PyTorch loss path
 is correct but trades memory for output-head recomputation, so it should still

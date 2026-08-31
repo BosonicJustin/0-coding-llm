@@ -121,7 +121,8 @@ new algorithm/config version with a wider refinement representation; do not
 reinterpret an existing v1 result.
 
 Before the expensive full run, execute the bounded candidate-recall gate in
-`ENGLISH_NEAR_DEDUP_CALIBRATION.md`. A production calibration must use the
+[english-near-dedup-calibration.md](english-near-dedup-calibration.md). A
+production calibration must use the
 immutable real English sample, the pinned acceptance profile, and report
 `production_gate_eligible == true`. A poor calibration means creating a new
 pinned config (more bands/tables), not editing a run in place.

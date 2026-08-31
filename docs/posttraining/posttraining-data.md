@@ -96,6 +96,6 @@ post-training curation job has completed all of the following:
    this acquisition directory directly.
 
 The implemented, versioned projection and its PrimeRL integration are described
-in [PRIME_SFT.md](PRIME_SFT.md). The checked-in Prime config remains a dry-run
+in [prime-sft.md](prime-sft.md). The checked-in Prime config remains a dry-run
 scaffold until that document's data, model-export, boundary-isolation, GPU, and
 hyperparameter gates have passed.

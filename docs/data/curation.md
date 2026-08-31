@@ -69,7 +69,8 @@ artifact with one global exact-normalized namespace.
    validates but does not trust the compact 16-value audit sketches: it rereads
    immutable raw text for a larger LSH candidate pass and refines candidates
    with complete hashed five-word-shingle Jaccard. See
-   `ENGLISH_NEAR_DEDUP.md` for the pinned algorithm and its statistical limits.
+   [english-near-dedup.md](english-near-dedup.md) for the pinned algorithm and
+   its statistical limits.
 6. Propagate every benchmark hit through its exact and final duplicate
    cluster. Select one deterministic residual exact canonical globally. Then
    select one code canonical per normalized hash across Python and other code,

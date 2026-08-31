@@ -11,7 +11,9 @@ FAST_POLICY = "configs/curation_policy_fast_exact_normalized.json"
 
 class RunbookContractTest(unittest.TestCase):
     def test_network_curation_probe_is_bound_to_the_exact_work_mount(self) -> None:
-        text = (PROJECT_ROOT / "PRODUCTION_RUNBOOK.md").read_text(encoding="utf-8")
+        text = (
+            PROJECT_ROOT / "docs" / "operations" / "production-runbook.md"
+        ).read_text(encoding="utf-8")
         blocks = [
             block
             for block in re.findall(r"```bash\n(.*?)\n```", text, flags=re.DOTALL)
@@ -30,7 +32,10 @@ class RunbookContractTest(unittest.TestCase):
 
     def test_fast_materialization_commands_pin_the_matching_policy(self) -> None:
         checked = 0
-        for relative in ("MATERIALIZATION.md", "PRODUCTION_RUNBOOK.md"):
+        for relative in (
+            "docs/data/materialization.md",
+            "docs/operations/production-runbook.md",
+        ):
             text = (PROJECT_ROOT / relative).read_text(encoding="utf-8")
             for block in re.findall(r"```bash\n(.*?)\n```", text, flags=re.DOTALL):
                 if (

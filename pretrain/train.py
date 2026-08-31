@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from model import CausalLM, ModelConfig
+from .model import CausalLM, ModelConfig
 from pretrain.data import (
     DOMAIN_ORDER,
     DistributedBatchSampler,

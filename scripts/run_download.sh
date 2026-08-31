@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PROJECT_ROOT="/workspace/coding_model_from_scratch"
-DATA_ROOT="/workspace/dataset"
-PYTHON_BIN="/opt/coding-model-venv/bin/python"
+PROJECT_ROOT="${PROJECT_ROOT:-/workspace/coding_model_from_scratch}"
+DATA_ROOT="${DATA_ROOT:-/workspace/dataset}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/coding-model-venv/bin/python}"
 LOG_DIR="$DATA_ROOT/logs"
 LOG_FILE="$LOG_DIR/collector.log"
 

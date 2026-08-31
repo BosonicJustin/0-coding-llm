@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -27,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from model import CausalLM, ModelConfig  # noqa: E402
+from pretrain.model import CausalLM, ModelConfig  # noqa: E402
 
 
 class QualificationError(RuntimeError):
@@ -44,6 +45,16 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _model_source_path() -> Path:
+    source = inspect.getsourcefile(CausalLM)
+    if source is None:
+        raise QualificationError("Cannot resolve the imported CausalLM source file")
+    path = Path(source).resolve(strict=True)
+    if not path.is_file():
+        raise QualificationError(f"CausalLM source is not a regular file: {path}")
+    return path
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -370,7 +381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if output.exists() and not args.overwrite:
         _parser().error(f"refusing to overwrite existing evidence: {output}")
     source_identity = {
-        "model_py_sha256": _sha256(PROJECT_ROOT / "model.py"),
+        "model_py_sha256": _sha256(_model_source_path()),
         "qualification_script_sha256": _sha256(Path(__file__).resolve()),
     }
     running = {

@@ -22,6 +22,21 @@ def requirement_lines(path: Path) -> dict[str, str]:
 
 
 class DependencyContractTest(unittest.TestCase):
+    def test_data_runtime_declares_every_direct_external_import(self) -> None:
+        requirements = requirement_lines(PROJECT_ROOT / "requirements-data.txt")
+        self.assertTrue(
+            {
+                "datasets",
+                "huggingface-hub",
+                "pyarrow",
+                "tokenizers",
+                "transformers",
+                "xxhash",
+                "zstandard",
+            }
+            <= requirements.keys()
+        )
+
     def test_training_runtime_declares_every_direct_external_import(self) -> None:
         requirements = requirement_lines(PROJECT_ROOT / "requirements-train.txt")
         self.assertTrue({"numpy", "torch", "tokenizers"} <= requirements.keys())

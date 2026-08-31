@@ -29,7 +29,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import Any
 
-from model import ModelConfig
+from .model import ModelConfig
 from pretrain import data as training_data
 from pretrain.tokenizer_identity import verify_tokenizer_identity
 

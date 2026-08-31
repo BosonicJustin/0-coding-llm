@@ -23,7 +23,8 @@ corpus is smaller: 52.58B train tokens plus 0.50B validation and 0.50B test.
 ## 2. Audit raw-corpus integrity
 
 The streaming preprocessor begins these audit/fingerprint steps as finalized
-archives arrive; see `STREAMING_PREPROCESS.md`. After acquisition, verify that
+archives arrive; see
+[streaming-preprocess.md](../data/streaming-preprocess.md). After acquisition, verify that
 it has caught up completely and that its error count is zero.
 
 - [x] Enumerate every archive and record its size and SHA-256 checksum.
@@ -166,7 +167,8 @@ separately.
 
 The native PyTorch packed-row format, deterministic global order, distributed
 sampler, and synthetic correctness tests are implemented in `pretrain/data.py`;
-see `TRAINING_DATA.md`. The boxes below remain unchecked until those tools have
+see [training-data.md](../training/training-data.md). The boxes below remain
+unchecked until those tools have
 been run and validated on the final selected corpus.
 
 - [ ] Convert selected documents into large sequential binary shards, roughly

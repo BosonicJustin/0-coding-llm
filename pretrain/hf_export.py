@@ -1,6 +1,6 @@
 """Export native pretraining checkpoints as Hugging Face Llama models.
 
-The native architecture in :mod:`model` is parameter-compatible with
+The native architecture in :mod:`pretrain.model` is parameter-compatible with
 ``transformers.LlamaForCausalLM``.  This module deliberately performs a
 closed-world conversion: every expected native key and tensor shape must be
 present, no extra key is accepted, and the tokenizer vocabulary must match the
@@ -27,7 +27,7 @@ from typing import Any
 
 import torch
 
-from model import ModelConfig
+from .model import ModelConfig
 from pretrain.tokenizer_identity import (
     TOKENIZER_MANIFEST_NAME,
     TokenizerIdentityError,

@@ -21,7 +21,7 @@ import torch.distributed as dist
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from model import CausalLM
+from pretrain.model import CausalLM
 from pretrain.data import (
     DistributedBatchSampler,
     create_training_dataloader,

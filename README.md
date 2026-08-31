@@ -22,53 +22,66 @@ The raw acquisition deliberately includes headroom. Final token budgets are
 enforced only after quality filtering, contamination propagation, leakage-safe
 group splitting, tokenization, and packing.
 
-## Current status — 2026-08-30
+## Current status — 2026-08-31
 
 - Raw acquisition is complete: 64.582B audited content tokens in 4,345
   finalized archives, with zero archive errors.
-- Restart-safe fast-v1 curation is running on the network volume. It performs
-  quality/benchmark filtering, exact and normalized-hash canonicalization,
-  leakage-safe grouping, split assignment, and exact mixture selection.
+- Restart-safe accelerated curation is running with live SQLite/WAL state on
+  pod-local storage and authenticated snapshots on the network volume. It
+  performs quality/benchmark filtering, exact and normalized-hash
+  canonicalization, leakage-safe grouping, split assignment, and exact mixture
+  selection. The original network-volume generation remains an untouched
+  rollback authority.
 - Fuzzy English near-deduplication is intentionally deferred for the first
   baseline and remains available as a later controlled ablation.
 - The native PyTorch model, packed loader, deterministic distributed sampler,
   materializer, checkpoint/resume harness, validation, W&B integration, and
   production launcher are implemented.
-- The complete local suite passes 355 tests (two platform skips), including a
-  real two-process Gloo DDP accumulation/token-normalization gate.
+- The complete CPU suite passes 364 tests with two platform skips, including
+  real two-process Gloo DDP accumulation, token-normalization, and
+  process-restart gates. CUDA/NCCL qualification remains intentionally
+  separate.
 - CUDA FlexAttention, BF16, memory, throughput, and multi-GPU resume gates are
   still required before a long training run.
 - The planned hardware topology is one six-GPU RunPod pod with one NCCL process
   per GPU; exact GPU type/VRAM and DDP versus FSDP remain smoke-test decisions.
 
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `pretrain/` | Model, packed-data runtime, trainer, materializer, export, and run authority |
+| `posttrain/` | SFT data contracts and Prime integration |
+| `scripts/` | Auditable command-line entry points; see [scripts/README.md](scripts/README.md) |
+| `configs/` | Versioned data, curation, and post-training policies |
+| `docs/` | Categorized design, operations, and experiment records |
+| `tests/` | CPU correctness, recovery, contract, and integration gates |
+
 ## Documentation
+
+The complete categorized index is [docs/README.md](docs/README.md).
 
 ### Operations
 
-- [Current operational handoff](HANDOFF.md)
-- [Pre-training readiness checklist](PRETRAINING_CHECKLIST.md)
-- [Production runbook](PRODUCTION_RUNBOOK.md)
+- [Current operational handoff](docs/operations/handoff.md)
+- [Pre-training readiness checklist](docs/operations/pretraining-checklist.md)
+- [Production runbook](docs/operations/production-runbook.md)
 
 ### Pre-training
 
-- [Data pipeline](DATA_PIPELINE.md)
-- [FineWeb-Edu acquisition](ENGLISH_PIPELINE.md)
-- [Wikipedia acquisition](WIKIPEDIA_PIPELINE.md)
-- [Streaming raw audit](STREAMING_PREPROCESS.md)
-- [Curation contract](CURATION.md)
-- [Curation acceleration and recovery design](CURATION_ACCELERATION.md)
-- [Optional English near-deduplication](ENGLISH_NEAR_DEDUP.md)
-- [English near-deduplication calibration](ENGLISH_NEAR_DEDUP_CALIBRATION.md)
-- [Materialization](MATERIALIZATION.md)
-- [Training data and loader](TRAINING_DATA.md)
-- [Training harness](TRAINING.md)
-- [Model architecture](MODEL.md)
-- [Experiment log](docs/EXPERIMENT_LOG.md)
+- [Data pipeline](docs/data/data-pipeline.md)
+- [Curation contract](docs/data/curation.md)
+- [Materialization](docs/data/materialization.md)
+- [Training data and loader](docs/training/training-data.md)
+- [Training harness](docs/training/training.md)
+- [Model architecture](docs/training/model.md)
+- [Pre-training run authority](docs/training/pretraining-run-authority.md)
+- [Experiment log](docs/experiment/experiment-log.md)
 
 ### Post-training
 
-- [SFT dataset acquisition and quarantine](POSTTRAINING_DATA.md)
-- [Prime Intellect SFT data/model/runtime integration](PRIME_SFT.md)
+- [SFT dataset acquisition and quarantine](docs/posttraining/posttraining-data.md)
+- [Prime Intellect SFT data/model/runtime integration](docs/posttraining/prime-sft.md)
 - [Prime Verifiers coding smoke environment](environments/coding_smoke/README.md)
 
 ## Local verification
@@ -105,4 +118,5 @@ No license is currently granted for this repository's project source. Dataset
 terms are separate from source-code terms and must be reviewed per pinned
 source manifest. In particular, the downloaded OpenCodeInstruct snapshot is
 CC BY 4.0 and remains quarantined until its attribution, contamination, and SFT
-publication requirements in `POSTTRAINING_DATA.md` are satisfied.
+publication requirements in
+[posttraining-data.md](docs/posttraining/posttraining-data.md) are satisfied.

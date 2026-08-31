@@ -11,14 +11,17 @@ resume/DDP gates, and a contamination-clean validation loop are mandatory below.
 MBPP and the final test order are never used to choose hyperparameters or
 checkpoints.
 
-Canonical contracts live in [PRETRAINING_CHECKLIST.md](PRETRAINING_CHECKLIST.md),
-[STREAMING_PREPROCESS.md](STREAMING_PREPROCESS.md),
-[ENGLISH_NEAR_DEDUP_CALIBRATION.md](ENGLISH_NEAR_DEDUP_CALIBRATION.md),
-[ENGLISH_NEAR_DEDUP.md](ENGLISH_NEAR_DEDUP.md),
-[CURATION.md](CURATION.md), [MATERIALIZATION.md](MATERIALIZATION.md),
-[TRAINING_DATA.md](TRAINING_DATA.md), [MODEL.md](MODEL.md), and
-[TRAINING.md](TRAINING.md). This runbook orders those contracts; it does not
-replace them.
+Canonical contracts live in
+[pretraining-checklist.md](pretraining-checklist.md),
+[streaming-preprocess.md](../data/streaming-preprocess.md),
+[english-near-dedup-calibration.md](../data/english-near-dedup-calibration.md),
+[english-near-dedup.md](../data/english-near-dedup.md),
+[curation.md](../data/curation.md),
+[materialization.md](../data/materialization.md),
+[training-data.md](../training/training-data.md),
+[model.md](../training/model.md), and
+[training.md](../training/training.md). This runbook orders those contracts; it
+does not replace them.
 
 ## 0. Conventions and storage boundary
 
@@ -360,22 +363,27 @@ mv .english-near-v1.incoming english-near
 ```
 
 The complete sibling-manifest consumer contract—not merely these two hashes—is
-in `ENGLISH_NEAR_DEDUP.md`; curation enforces it before reading a mapping row.
+in [english-near-dedup.md](../data/english-near-dedup.md); curation enforces it
+before reading a mapping row.
 
 ## 4. Curate and select — GO/NO-GO 4
 
-For the fast baseline, run directly on the durable network volume. This is
-slower than local NVMe but restart-safe; explicit DELETE journaling avoids WAL
-on NFS. The live `selection-fast-v1` generation uses this baseline path.
+The preserved `selection-fast-v1` rollback generation ran directly on the
+durable network volume. That path is restart-safe but slow; explicit DELETE
+journaling avoids WAL on NFS. Do not modify or delete it until the accelerated
+generation has completed final certification.
 
 An accelerated, crash-safe local-WAL path is implemented for a **fresh output**
-and documented in `CURATION_ACCELERATION.md`. It requires roughly 322 GB free
-at first startup with the 100,000-row batch contract (500 GB recommended), keeps
-SQLite/WAL/temp state on pod-local storage, and periodically publishes verified
-recovery snapshots to the network volume. The CLI refuses same-filesystem
-"durable" storage and refuses converting or overwriting the baseline canonical
-database. Do not switch the live generation until the target-pod equivalence,
-crash-recovery, and minimum 3x end-to-end performance gates pass.
+and documented in
+[curation-acceleration.md](../data/curation-acceleration.md). It requires the
+exact local-capacity admission gate at first startup with the 100,000-row batch
+contract, keeps SQLite/WAL/temp state on pod-local storage, and periodically
+publishes verified recovery snapshots to the network volume. The CLI refuses
+same-filesystem "durable" storage and refuses converting or overwriting the
+baseline canonical database. The active `selection-fast-local-v2` generation
+passed the controlled snapshot/integrity qualification and minimum 3x
+performance gate before its full rollout; its live status is recorded in
+[handoff.md](handoff.md).
 
 First certify rollback-journal locking, abrupt-process recovery, and a minimum
 write rate on this exact mounted filesystem:
@@ -541,7 +549,8 @@ and rerun curation under a new output identity before Stage 5.
 
 ## 5. Pack first, without guessing GPU geometry — GO/NO-GO 5
 
-Optionally run the one-archive measurement from `MATERIALIZATION.md` in a
+Optionally run the one-archive measurement from
+[materialization.md](../data/materialization.md) in a
 distinct disposable output. Then run production Stage 1 directly to the
 network volume so an overnight pod loss does not lose the only checkpoint:
 

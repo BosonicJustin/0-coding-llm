@@ -1,8 +1,8 @@
 # Experiment handoff
 
 This file is the short operational handoff. The detailed, authoritative
-procedures remain in `PRODUCTION_RUNBOOK.md` and
-`PRETRAINING_CHECKLIST.md`.
+procedures remain in [production-runbook.md](production-runbook.md) and
+[pretraining-checklist.md](pretraining-checklist.md).
 
 ## Storage boundaries
 
@@ -158,7 +158,8 @@ For OpenCodeInstruct, independently:
    `scripts/launch_prime_sft.py`. Never invoke Prime's `sft` command directly.
 7. Prime must retain custom Llama plus `seq_lens` boundary isolation. Before a
    real six-GPU run, complete the one-GPU overfit/BF16/memory and six-rank NCCL
-   boundary-perturbation gates in `PRIME_SFT.md`.
+   boundary-perturbation gates in
+   [prime-sft.md](../posttraining/prime-sft.md).
 
 ## Verified code state
 
@@ -168,6 +169,6 @@ resume. Checkpoint format v5 stores only each rank's assigned CUDA RNG state
 and binds every saved generation to the authenticated tokenizer-manifest and
 canonical token-to-ID vocabulary SHA-256 identities.
 Remaining gates are intentionally left unchecked in
-`PRETRAINING_CHECKLIST.md`: some depend on the final curated/materialized data
-and manual sample inspection; others require the eventual GPU image and
-topology.
+[pretraining-checklist.md](pretraining-checklist.md): some depend on the final
+curated/materialized data and manual sample inspection; others require the
+eventual GPU image and topology.

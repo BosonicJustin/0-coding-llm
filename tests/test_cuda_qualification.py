@@ -35,6 +35,10 @@ class CudaQualificationTest(unittest.TestCase):
             self.assertEqual(evidence["status"], "failed")
             self.assertEqual(evidence["failure"]["type"], "QualificationError")
             self.assertIn("CUDA is unavailable", evidence["failure"]["message"])
+            self.assertEqual(
+                evidence["source_identity"]["model_py_sha256"],
+                MODULE._sha256(PROJECT_ROOT / "pretrain" / "model.py"),
+            )
 
     def test_existing_evidence_is_not_overwritten_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

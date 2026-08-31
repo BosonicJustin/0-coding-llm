@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from model import ModelConfig  # noqa: E402
+from pretrain.model import ModelConfig  # noqa: E402
 from pretrain import data as training_data  # noqa: E402
 from pretrain.tokenizer_identity import (  # noqa: E402
     TokenizerIdentityError,

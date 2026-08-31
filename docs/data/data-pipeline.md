@@ -208,6 +208,8 @@ manifests, tokenizer, checkpoints, and quota records under `/workspace/dataset`
 must remain on the network volume.
 
 The required processing, audit, split, packing, smoke-test, and training
-readiness steps after collection are specified in `PRETRAINING_CHECKLIST.md`.
+readiness steps after collection are specified in
+[pretraining-checklist.md](../operations/pretraining-checklist.md).
 Finalized archives are already being validated and fingerprinted concurrently
-with acquisition as described in `STREAMING_PREPROCESS.md`.
+with acquisition as described in
+[streaming-preprocess.md](streaming-preprocess.md).

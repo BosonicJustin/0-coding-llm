@@ -32,10 +32,10 @@ checkpoints/
 *.onnx
 
 # Corpora, generated pipeline state, and large binary payloads
-data/
-dataset/
-dataset-*/
-artifacts/
+/data/
+/dataset/
+/dataset-*/
+/artifacts/
 .work/
 *.sqlite
 *.sqlite3

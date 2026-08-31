@@ -440,7 +440,8 @@ consumed/dropped input and supervised tokens globally and per 40/40/20 domain.
 Sampler state v2 and trainer checkpoint v2 bind that geometry and require every
 resume cursor to land on an optimizer-update boundary.
 
-`model.py` was replaced with a native PyTorch Llama implementation preserving
+The original root `model.py` was replaced with a native PyTorch Llama
+implementation, now maintained at `pretrain/model.py`, preserving
 the exact 1,283,557,376-parameter architecture: 24 layers, 2,048 model width,
 5,632 SwiGLU width, 16 query heads, four KV heads, 4,096 context, RMSNorm, RoPE,
 and untied 49,152-token embeddings. CPU debugging uses an equivalent dense SDPA
@@ -970,3 +971,33 @@ semantic equivalence of the eventual final corpus. The untouched
 `selection-fast-v1` baseline remains the rollback authority until the
 accelerated corpus completes, publishes, and passes final accounting, integrity,
 and training-data certification.
+
+## 2026-08-31 repository structure migration
+
+Before pre-training produced any production checkpoint or immutable run
+authority, the repository was reorganized without changing model tensor names,
+architecture, data formats, or the running curator. The native model moved from
+the root into `pretrain/model.py`; package, script, test, CI, CUDA-qualification,
+and source-hash imports were updated to the new authoritative module. This
+changes the model class identity used by exact-resume signatures, so a
+hypothetical pre-migration trainer checkpoint would remain exportable but would
+intentionally fail exact resume. No such production pre-training checkpoint
+exists, so no compatibility exception or checkpoint-schema weakening was
+introduced.
+
+Project notes moved under categorized `docs/data`, `docs/training`,
+`docs/operations`, `docs/posttraining`, and `docs/experiment` directories. A
+central documentation index and a CI-tested relative-link contract prevent
+future silent link breakage. The command-line tools received their own index;
+server wrappers now accept explicit environment path overrides while retaining
+their existing defaults; and `pyarrow`, which is imported directly by SFT data
+tools, became a direct data-runtime dependency rather than a transitive one.
+
+The live curation process was not stopped or re-executed for this source-tree
+migration. It had already loaded its running code and keeps all live state under
+the separately versioned local/durable curation paths.
+
+The post-migration CPU suite passed all 364 tests with two platform skips,
+including the real localhost Gloo distributed and process-restart gates. Python
+compilation, package imports, model meta-device construction, shell syntax,
+runbook contracts, and repository-relative documentation links also passed.

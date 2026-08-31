@@ -1,4 +1,4 @@
-"""Native PyTorch implementation of the experiment's 1.284B causal LM.
+"""Native PyTorch model package for the experiment's 1.284B causal LM.
 
 The model consumes the batch contract produced by :mod:`pretrain.data`:
 

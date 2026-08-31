@@ -11,7 +11,7 @@ the standalone training requirements:
 
 ```bash
 pip install -r requirements-train.txt
-python -c "import model, pretrain.data, pretrain.train, pretrain.tokenizer_identity; from tokenizers import Tokenizer"
+python -c "import pretrain.model, pretrain.data, pretrain.train, pretrain.tokenizer_identity; from tokenizers import Tokenizer"
 python scripts/launch_pretraining.py --help >/dev/null
 ```
 

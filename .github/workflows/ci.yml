@@ -29,11 +29,11 @@ jobs:
           python -m pip install -r requirements-train.txt
       - name: Verify standalone training runtime
         run: |
-          python -c "import model, pretrain.data, pretrain.train, pretrain.tokenizer_identity; from tokenizers import Tokenizer"
+          python -c "import pretrain.model, pretrain.data, pretrain.train, pretrain.tokenizer_identity; from tokenizers import Tokenizer"
           python scripts/launch_pretraining.py --help >/dev/null
       - name: Install data-pipeline dependencies
         run: python -m pip install -r requirements-data.txt
       - name: Compile Python sources
-        run: python -m compileall -q model.py pretrain posttrain environments scripts tests
+        run: python -m compileall -q pretrain posttrain environments scripts tests
       - name: Run full CPU suite
         run: python -m unittest discover -s tests
