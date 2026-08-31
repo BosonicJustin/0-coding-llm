@@ -18,7 +18,7 @@ Downloaded SFT data is quarantined until benchmark decontamination, schema
 normalization, length analysis, split construction, and a separate SFT
 publication manifest are complete.
 
-## Last verified server state at 2026-08-31 07:47 UTC
+## Last verified server state at 2026-08-31 14:04 UTC
 
 - The resized CPU pod exposes a 320 GiB local overlay
   (343,597,383,680 bytes total) and the durable NFS network volume at
@@ -58,6 +58,23 @@ publication manifest are complete.
   hourly snapshot for this full-run interval is due after 08:04 UTC; the
   authenticated controlled-run snapshot remains durable as
   `snapshot-000000000001`.
+- Inventory completed all 51,328,930 documents across 4,345 archives with exact
+  per-source totals matching the frozen collection authority. Snapshot
+  `snapshot-000000000003` published successfully at 13:35 UTC with a
+  31,412,785,152-byte SQLite payload. Its synchronous NFS copy, two full
+  integrity scans, and SHA-256 publication blocked processing for roughly three
+  hours; do not retain this hourly full-snapshot design for the next rollout.
+- The curator advanced automatically into canonicalization. At 14:03 UTC it was
+  running `canonicalize.exact_choice` with a healthy current checkpoint, the
+  bound curator alive as PID 368, no storage violation, and 293,162,405,888
+  local bytes free.
+- The monitor briefly exited at 13:54 UTC because it interpreted the legitimate
+  `inventory.bulk_indexes` transition as an active archive and required the
+  archive-only `expected_documents` field. The curator never stopped. The
+  monitor was restarted at 14:03 UTC after the phase had advanced and
+  immediately published a healthy record. The monitor now distinguishes the
+  exact bulk-index subphase, requires terminal inventory accounting for it, and
+  still rejects every unknown inventory subphase.
 - The accelerated output is durable at
   `/workspace/dataset/curated/selection-fast-local-v2`; its live SQLite/WAL
   authority is `/local/curation/selection-fast-local-v2`. Full authenticated
@@ -92,13 +109,12 @@ publication manifest are complete.
   metadata-verified rows. A streaming SHA-256 inventory completed successfully
   and published `SOURCE.json` plus `COMPLETION.json`. It is still quarantined
   and is not yet approved as SFT training input.
-- The active server checkout was safely fast-forwarded to organization commit
-  `4d81d2a` without restarting the curator or monitor; the running curator was
+- The active server checkout was safely fast-forwarded through the repository
+  organization changes without restarting the curator; the running curator was
   launched from the preceding `4b2e985` code state, and its curation code and
-  policy were not changed by that commit. Nine lightweight documentation,
-  runbook, and dependency-contract tests plus all four shell-wrapper syntax
-  checks passed on the pod. The checkout is clean. Never mutate the preserved
-  baseline `.work` tree in place.
+  policy were not changed by those commits. The checkout is kept clean and
+  synchronized with GitHub `main`. Never mutate the preserved baseline `.work`
+  tree in place.
 
 The accelerated checkpoint and health log are the live authorities. Re-read
 them together with `tmux ls`, mount identities, and `df` before intervention.

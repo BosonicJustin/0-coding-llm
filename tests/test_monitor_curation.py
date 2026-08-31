@@ -121,6 +121,65 @@ class CurationMonitorTest(unittest.TestCase):
         self.assertEqual(health["counts"]["documents"], 13)
         self.assertAlmostEqual(health["counts"]["inventory_percent"], 100 * 13 / 18)
 
+    def test_healthy_post_inventory_bulk_index_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.fixture(Path(temporary))
+            checkpoint_path = output / ".work" / "CHECKPOINT.json"
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            checkpoint["counts"]["documents"] = 10
+            checkpoint["storage"]["preflight"]["documents_expected"] = 10
+            checkpoint["subphases"] = [
+                checkpoint["subphases"][0],
+                {
+                    "subphase": "inventory.bulk_indexes",
+                    "status": "running",
+                    "processed_rows": 2,
+                    "details": {
+                        "transaction_class": "sqlite_create_index",
+                        "restart_unit": "one_complete_index",
+                    },
+                },
+            ]
+            write_json(checkpoint_path, checkpoint)
+            health = self.inspect(output)
+        self.assertEqual(health["status"], "healthy")
+        self.assertEqual(health["counts"]["inventory_percent"], 100.0)
+        self.assertEqual(health["active_subphase"], "inventory.bulk_indexes")
+        self.assertEqual(health["active_processed_rows"], 2)
+
+    def test_inventory_rejects_unrecognized_running_subphase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.fixture(Path(temporary))
+            checkpoint_path = output / ".work" / "CHECKPOINT.json"
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            checkpoint["subphases"][-1]["subphase"] = "inventory.unknown"
+            write_json(checkpoint_path, checkpoint)
+            with self.assertRaisesRegex(
+                MODULE.HealthError, "unexpected running subphase"
+            ):
+                self.inspect(output)
+
+    def test_bulk_indexes_require_complete_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.fixture(Path(temporary))
+            checkpoint_path = output / ".work" / "CHECKPOINT.json"
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            checkpoint["counts"]["documents"] = 10
+            checkpoint["subphases"] = [
+                checkpoint["subphases"][0],
+                {
+                    "subphase": "inventory.bulk_indexes",
+                    "status": "running",
+                    "processed_rows": 0,
+                    "details": {"transaction_class": "sqlite_create_index"},
+                },
+            ]
+            write_json(checkpoint_path, checkpoint)
+            with self.assertRaisesRegex(
+                MODULE.HealthError, "started before inventory completed"
+            ):
+                self.inspect(output)
+
     def test_local_sqlite_mode_reads_live_work_without_changing_output_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -348,21 +348,36 @@ def inspect(
                 payload.get("documents"), label="archive event documents"
             )
         active_rows = 0
+        accounted_documents = committed_documents
         if running:
+            running_name = running[0].get("subphase")
+            if not isinstance(running_name, str):
+                raise HealthError("running inventory subphase name is invalid")
             active_rows = _plain_int(
                 running[0].get("processed_rows"), label="running processed rows"
             )
-            details = running[0].get("details")
-            if not isinstance(details, dict):
-                raise HealthError("running inventory details are invalid")
-            active_expected = _plain_int(
-                details.get("expected_documents"),
-                label="running expected documents",
-                minimum=1,
-            )
-            if active_rows > active_expected:
-                raise HealthError("running archive processed rows exceed its report")
-        if committed_documents + active_rows != documents:
+            if running_name.startswith("inventory.archive."):
+                details = running[0].get("details")
+                if not isinstance(details, dict):
+                    raise HealthError("running inventory details are invalid")
+                active_expected = _plain_int(
+                    details.get("expected_documents"),
+                    label="running expected documents",
+                    minimum=1,
+                )
+                if active_rows > active_expected:
+                    raise HealthError("running archive processed rows exceed its report")
+                accounted_documents += active_rows
+            elif running_name == "inventory.bulk_indexes":
+                if documents != expected_documents:
+                    raise HealthError(
+                        "bulk index construction started before inventory completed"
+                    )
+            else:
+                raise HealthError(
+                    f"inventory has unexpected running subphase: {running_name}"
+                )
+        if accounted_documents != documents:
             raise HealthError(
                 "inventory durable count differs from completed journal plus active cursor"
             )

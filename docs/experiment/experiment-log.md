@@ -1001,3 +1001,32 @@ The post-migration CPU suite passed all 364 tests with two platform skips,
 including the real localhost Gloo distributed and process-restart gates. Python
 compilation, package imports, model meta-device construction, shell syntax,
 runbook contracts, and repository-relative documentation links also passed.
+
+## 2026-08-31 inventory completion and monitor transition fix
+
+The accelerated inventory completed all 51,328,930 documents across 4,345
+archives. Durable snapshot generation three published at 13:35 UTC with a
+31,412,785,152-byte SQLite database. The database was 71% larger than generation
+two. Its synchronous NFS backup, in-connection integrity scan, reopened
+integrity scan, and final SHA-256 read paused curation for roughly three hours.
+The integrity and authenticated-manifest gates passed, but that measured cost
+disqualifies hourly synchronous full-database verification as the next rollout's
+steady-state checkpoint design. A replacement must expose stage heartbeats,
+validate the database on local storage, stream-copy with a checksum, publish
+atomically, and reserve expensive durable rereads for phase boundaries or
+asynchronous certification.
+
+Immediately after inventory, the curator correctly entered the restartable
+`inventory.bulk_indexes` unit and then canonicalization. The health monitor had
+assumed that every running subphase while the top-level phase remained
+`inventory` was an `inventory.archive.*` unit. It therefore requested the
+archive-only `expected_documents` detail from `inventory.bulk_indexes` and
+exited with a false failure. The curator and its data remained healthy.
+
+The monitor now classifies the exact subphase name. Archive ingestion retains
+its existing active-row/report accounting. `inventory.bulk_indexes` is allowed
+only after the durable document count equals the frozen expected count and
+contributes no synthetic document rows. Every other running inventory subphase
+still fails closed. Three regression tests cover the valid terminal transition,
+premature index construction, and an unknown subphase. The complete CPU suite
+passed all 367 tests with two platform skips.
