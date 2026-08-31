@@ -18,14 +18,14 @@ Downloaded SFT data is quarantined until benchmark decontamination, schema
 normalization, length analysis, split construction, and a separate SFT
 publication manifest are complete.
 
-## Last verified server state at 2026-08-31 07:08 UTC
+## Last verified server state at 2026-08-31 07:15 UTC
 
 - The resized CPU pod exposes a 320 GiB local overlay
   (343,597,383,680 bytes total) and the durable NFS network volume at
   `/workspace`. The exact accelerated admission gate required
   323,918,545,920 bytes free; 343,580,889,088 bytes were initially free, for a
   19,662,343,168-byte margin.
-- Commit `7a6d35e` and a minimal Python 3.11 runtime were deployed in the
+- Commit `85fb98a` and a minimal Python 3.11 runtime were deployed in the
   separate checkout `/workspace/0-coding-llm`. The 56 focused target-runtime
   curation, local-store, and monitor tests passed.
 - A controlled one-archive run created the fresh accelerated generation
@@ -37,12 +37,20 @@ publication manifest are complete.
   07:05 UTC reported 8 archives, 733,993 documents (1.430%), a live curator,
   no warnings, and 342,497,202,176 local bytes free. The monitor runs in
   `curation-fast-local-v2-monitor`; its first failed record was a harmless
-  startup race before the curator had published its running-archive subphase,
-  followed by the healthy record.
+  publication-boundary race before the curator had published its next
+  running-archive subphase, followed by the healthy record.
 - At 07:08 UTC the live checkpoint had advanced to 28 archives and 2,583,958
   documents (5.034%), with archive 29 running, no storage violation,
   340,704,468,992 local bytes free, a 1.75 GB database, and a bounded 641 MB
   WAL. Both curator and monitor tmux sessions remained alive.
+- Commit `85fb98a` makes that monitor race bounded and explicit: a fresh
+  zero-active inventory projection is warning-only for at most 60 seconds when
+  the bound curator is alive and every other invariant passes; stale, dead,
+  inconsistent, or over-bound states still fail. All 12 focused monitor tests
+  passed on the pod, only the monitor was restarted, and its first record from
+  the new code was healthy at 66 archives / 6,001,567 documents (11.692%). The
+  curator was never stopped and advanced to 69 archives / 6,301,563 documents
+  (12.276%) by 07:15 UTC with no violation.
 - The accelerated output is durable at
   `/workspace/dataset/curated/selection-fast-local-v2`; its live SQLite/WAL
   authority is `/local/curation/selection-fast-local-v2`. Full authenticated
@@ -77,7 +85,7 @@ publication manifest are complete.
   metadata-verified rows. A streaming SHA-256 inventory completed successfully
   and published `SOURCE.json` plus `COMPLETION.json`. It is still quarantined
   and is not yet approved as SFT training input.
-- The active server checkout is clean at commit `7a6d35e`. Never mutate the
+- The active server checkout is clean at commit `85fb98a`. Never mutate the
   preserved baseline `.work` tree in place.
 
 The accelerated checkpoint and health log are the live authorities. Re-read

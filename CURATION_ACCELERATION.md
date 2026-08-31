@@ -234,11 +234,11 @@ mount identity first. Do not point the new invocation at the baseline output.
 The live health monitor reads the local checkpoint while keeping its health log
 and alert on durable storage:
 
-During the narrow resume-startup window before the curator publishes an active
-archive, the monitor emits a warning-only `startup_publication_grace` record for
-at most 60 seconds, and only while the bound curator process is alive and all
-other checkpoint, journal, count, and storage invariants pass. The condition is
-fatal after that bound.
+During the narrow resume-startup or inter-archive window before the curator
+publishes its next active archive, the monitor emits a warning-only
+`startup_publication_grace` record for at most 60 seconds, and only while the
+bound curator process is alive and all other checkpoint, journal, count, and
+storage invariants pass. The condition is fatal after that bound.
 
 ```bash
 python scripts/monitor_curation.py \

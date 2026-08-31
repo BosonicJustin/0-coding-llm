@@ -940,17 +940,28 @@ qualified generation in tmux session `curation-fast-local-v2`. At 07:05 UTC,
 the first stable health record reported the curator alive with no warnings,
 eight completed archives, 733,993 documents (1.430% of inventory), bounded WAL,
 and 342,497,202,176 local bytes free. The monitor runs separately in
-`curation-fast-local-v2-monitor`. Its first invocation observed the valid brief
-resume interval between phase publication and running-archive publication and
-exited with a zero-running-archive alert; restarting it after the active archive
-appeared immediately produced a healthy record. This startup record does not
-indicate curator failure.
+`curation-fast-local-v2-monitor`. Its first invocation observed a valid brief
+publication boundary before the next running archive was published and exited
+with a zero-running-archive alert; restarting it after the active archive
+appeared immediately produced a healthy record. This record does not indicate
+curator failure.
 
 At 07:08 UTC, the checkpoint had advanced to 28 completed archives and
 2,583,958 documents (5.034%), with the next archive running, no storage
 violation, and 340,704,468,992 local bytes free. The live database was about
 1.75 GB and its WAL about 641 MB. Both curator and monitor tmux sessions
 remained alive.
+
+Commit `85fb98a` added bounded checkpoint/journal coherence retries, required a
+nonempty journal to begin at sequence one, and made the zero-active publication
+window warning-only for at most 60 seconds when the bound curator process is
+alive and every other invariant passes. Dead, stale, inconsistent, and
+over-bound states remain fatal. All 12 focused tests passed both locally and in
+the pod's minimal runtime. The server checkout was fast-forwarded and only the
+monitor was restarted; the curator continued uninterrupted. The first record
+from the new monitor was healthy at 66 archives / 6,001,567 documents
+(11.692%). At 07:15 UTC the curator had reached 69 archives / 6,301,563
+documents (12.276%) with no storage violation.
 
 The accelerated generation was already more than 3x faster than the historical
 roughly 600,000-documents/hour baseline during qualification and early rollout.
