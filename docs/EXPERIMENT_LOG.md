@@ -881,3 +881,27 @@ the real two-process Gloo checkpoint/resume gates and 39 focused Prime/SFT
 integration tests. The Prime TOML also parsed successfully through the exact
 pinned upstream `SFTConfig`, and the renderer patch applied and validated
 against clean temporary copies of both pinned upstream checkouts.
+
+## 2026-08-31 baseline-curator stop for local-storage upgrade
+
+At 05:25 UTC, the network-volume `selection-fast-v1` curator was deliberately
+interrupted through its tmux foreground job. The purpose was to replace/resize
+the CPU pod with 1 TB of pod-local storage before qualifying the local-WAL
+acceleration in commit `6b7decc`. The pod available at shutdown exposed 844 GB
+free on the durable NFS volume, but only 3.4 GB of local overlay and 60 GB of
+tmpfs. Read-only block-device enumeration showed host NVMe names without usable
+device nodes in the container; no device was mounted, formatted, or modified.
+
+The final durable checkpoint records inventory phase, 113 completed archives,
+11,236,456 / 51,328,930 documents (21.891%), and no storage violation. The
+active archive cursor is `raw/other_code/part-000020.tar.zst` at 30,000 /
+151,510 rows and 25,207,482 tokens. The SQLite database is 7,679,508,480 bytes.
+Shutdown verification found no remaining Python curator, SQLite journal/WAL/SHM
+sidecar, or cross-client lease, so the baseline remains safely resumable.
+
+The accelerated path is not an in-place migration. It requires a fresh output,
+a separately identified local filesystem with roughly 322 GB initially free
+(500 GB recommended), and the same durable network volume for authenticated
+snapshots. The baseline output must remain untouched as rollback authority until
+the accelerated generation passes semantic equivalence, crash recovery, and the
+minimum 3x representative performance gate.

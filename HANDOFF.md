@@ -18,12 +18,28 @@ Downloaded SFT data is quarantined until benchmark decontamination, schema
 normalization, length analysis, split construction, and a separate SFT
 publication manifest are complete.
 
-## Last verified live state at 2026-08-30 15:58 UTC
+## Last verified server state at 2026-08-31 05:25 UTC
 
-- `curation-fast-v1` is alive in detached `tmux` on the CPU pod.
-- The curator is in `inventory`: 3,183,945 / 51,328,930 documents (6.2030%),
-  34 archives have completed, and archive 35 is in progress, with no storage
-  violation.
+- The network-volume baseline curator was stopped deliberately with `Ctrl-C`
+  through its `curation-fast-v1` tmux foreground job so the CPU pod can be
+  replaced with one exposing 1 TB of pod-local storage.
+- Its resumable checkpoint is in `inventory`: 11,236,456 / 51,328,930 documents
+  (21.891%), 113 archives completed, and `other_code/part-000020` is durable at
+  30,000 / 151,510 rows, with no recorded storage violation.
+- Shutdown verification found no Python `curate_corpus.py` process, no SQLite
+  journal/WAL/SHM sidecar, and no cross-client lease. The canonical working
+  database is 7,679,508,480 bytes and remains on the network volume.
+- The old pod had 844 GB free on NFS but only 3.4 GB free local overlay and
+  60 GB `/dev/shm`; that is insufficient for accelerated local-WAL curation.
+  The visible unmounted NVMe devices had no corresponding `/dev` nodes inside
+  the container and were not claimed, mounted, formatted, or modified.
+- The accelerated implementation is commit `6b7decc`. It requires a fresh
+  output and about 322 GB initially free on a positively identified local
+  filesystem; 500 GB is recommended, so the planned 1 TB local disk is ample.
+  It deliberately refuses to convert or overwrite the baseline output.
+- The baseline checkpoint remains a rollback/resume authority. A local-WAL
+  rollout will start a new output generation and must not delete
+  `selection-fast-v1` until equivalence and performance gates pass.
 - Quality/benchmark filtering, exact/normalized canonicalization,
   leakage-safe grouping, split assignment, and quota selection are later
   phases of that same restart-safe process.
@@ -35,15 +51,13 @@ publication manifest are complete.
   metadata-verified rows. A streaming SHA-256 inventory completed successfully
   and published `SOURCE.json` plus `COMPLETION.json`. It is still quarantined
   and is not yet approved as SFT training input.
-- The public repository is deployed separately at `/workspace/0-coding-llm`
-  on commit `44a365b`; the active curator continues from its original checkout
-  so deployment cannot mutate its running code.
+- The last authenticated server checkout state predates commit `6b7decc`.
+  Deploy that commit to a separate checkout after the new pod/local disk is
+  available; never mutate the preserved baseline `.work` tree in place.
 
-This is the last authenticated server snapshot, not a claim about current
-progress. A later connection reached the RunPod SSH gateway and the server
-accepted the correct public key, but the local 1Password agent did not complete
-the signing operation. Re-read `CHECKPOINT.json`, `tmux ls`, and `df` before
-reporting a newer percentage or deploying another commit.
+This is the last authenticated server snapshot. Re-read `CHECKPOINT.json`,
+`tmux ls`, mount identities, and `df` after the pod/storage change before any
+rollout.
 
 ## Monitoring without mutating state
 
@@ -62,10 +76,11 @@ progress commits are recorded in `CHECKPOINT.json` and SQLite.
 
 ## What follows automatically
 
-The running curator advances its own bounded phases and resumes from durable
-subphase cursors after an interruption. It must not be replaced with an ad hoc
-filtering process. A storage violation, lease conflict, identity mismatch, or
-accounting mismatch is a hard stop.
+Nothing is currently advancing the pre-training curator. The baseline can be
+resumed from its durable subphase cursor with its original command, while the
+accelerated path intentionally uses a fresh output generation. It must not be
+replaced with an ad hoc filtering process. A storage violation, lease conflict,
+identity mismatch, or accounting mismatch is a hard stop.
 
 ## What requires a separate launch
 
