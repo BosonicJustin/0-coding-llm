@@ -885,8 +885,8 @@ against clean temporary copies of both pinned upstream checkouts.
 ## 2026-08-31 baseline-curator stop for local-storage upgrade
 
 At 05:25 UTC, the network-volume `selection-fast-v1` curator was deliberately
-interrupted through its tmux foreground job. The purpose was to replace/resize
-the CPU pod with 1 TB of pod-local storage before qualifying the local-WAL
+interrupted through its tmux foreground job. The purpose was to resize the CPU
+pod's local storage before qualifying the local-WAL
 acceleration in commit `6b7decc`. The pod available at shutdown exposed 844 GB
 free on the durable NFS volume, but only 3.4 GB of local overlay and 60 GB of
 tmpfs. Read-only block-device enumeration showed host NVMe names without usable
@@ -900,8 +900,62 @@ Shutdown verification found no remaining Python curator, SQLite journal/WAL/SHM
 sidecar, or cross-client lease, so the baseline remains safely resumable.
 
 The accelerated path is not an in-place migration. It requires a fresh output,
-a separately identified local filesystem with roughly 322 GB initially free
-(500 GB recommended), and the same durable network volume for authenticated
+a separately identified local filesystem passing the exact admission gate, and
+the same durable network volume for authenticated
 snapshots. The baseline output must remain untouched as rollback authority until
 the accelerated generation passes semantic equivalence, crash recovery, and the
 minimum 3x representative performance gate.
+
+## 2026-08-31 local-WAL qualification and full rollout
+
+The replacement CPU pod exposed a 320 GiB local overlay
+(343,597,383,680 bytes total) and the durable network volume at `/workspace`.
+The frozen batch-100,000 admission calculation was 315,364,945,920 bytes for
+the 2x projected database growth, 6,553,600,000 bytes for the bounded
+transaction sidecar, and 2,000,000,000 bytes reserved after projection:
+323,918,545,920 bytes required in total. Initial free space was
+343,580,889,088 bytes, leaving a 19,662,343,168-byte margin. The local root is
+therefore admitted but must not hold unrelated material during curation.
+
+The separate server checkout `/workspace/0-coding-llm` was advanced to commit
+`7a6d35e`. A minimal `/opt/coding-model-venv` used Python 3.11.13, SQLite
+3.31.1, zstandard 0.25.0, and xxhash 3.8.1. The 56 focused target-runtime tests
+for curation, local storage, acceleration, and monitoring passed in 23.037
+seconds.
+
+A fresh controlled generation, `selection-fast-local-v2`, was launched with
+local live state under `/local/curation/selection-fast-local-v2`, durable state
+under `/workspace/dataset/curated/selection-fast-local-v2`, batch size 100,000,
+hourly snapshots, retention two, and deferred raw-archive hashing. The
+one-archive qualification processed 100,000 FineWeb-Edu documents and exited
+cleanly in approximately 49 seconds including initialization and durable
+publication. Snapshot `snapshot-000000000001` authenticated against its SHA-256
+sidecar; its manifest bound a 68,067,328-byte database, one archive, and 100,000
+documents. `PRAGMA integrity_check` returned `ok` and counts `(1, 100000)` for
+both the local database and durable canonical database. No lease or live process
+remained after the controlled exit.
+
+At 07:04 UTC, the same command without the one-archive limit resumed the exact
+qualified generation in tmux session `curation-fast-local-v2`. At 07:05 UTC,
+the first stable health record reported the curator alive with no warnings,
+eight completed archives, 733,993 documents (1.430% of inventory), bounded WAL,
+and 342,497,202,176 local bytes free. The monitor runs separately in
+`curation-fast-local-v2-monitor`. Its first invocation observed the valid brief
+resume interval between phase publication and running-archive publication and
+exited with a zero-running-archive alert; restarting it after the active archive
+appeared immediately produced a healthy record. This startup record does not
+indicate curator failure.
+
+At 07:08 UTC, the checkpoint had advanced to 28 completed archives and
+2,583,958 documents (5.034%), with the next archive running, no storage
+violation, and 340,704,468,992 local bytes free. The live database was about
+1.75 GB and its WAL about 641 MB. Both curator and monitor tmux sessions
+remained alive.
+
+The accelerated generation was already more than 3x faster than the historical
+roughly 600,000-documents/hour baseline during qualification and early rollout.
+That establishes the performance gate for continuing the new generation, not
+semantic equivalence of the eventual final corpus. The untouched
+`selection-fast-v1` baseline remains the rollback authority until the
+accelerated corpus completes, publishes, and passes final accounting, integrity,
+and training-data certification.

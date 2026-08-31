@@ -18,11 +18,38 @@ Downloaded SFT data is quarantined until benchmark decontamination, schema
 normalization, length analysis, split construction, and a separate SFT
 publication manifest are complete.
 
-## Last verified server state at 2026-08-31 05:25 UTC
+## Last verified server state at 2026-08-31 07:08 UTC
+
+- The resized CPU pod exposes a 320 GiB local overlay
+  (343,597,383,680 bytes total) and the durable NFS network volume at
+  `/workspace`. The exact accelerated admission gate required
+  323,918,545,920 bytes free; 343,580,889,088 bytes were initially free, for a
+  19,662,343,168-byte margin.
+- Commit `7a6d35e` and a minimal Python 3.11 runtime were deployed in the
+  separate checkout `/workspace/0-coding-llm`. The 56 focused target-runtime
+  curation, local-store, and monitor tests passed.
+- A controlled one-archive run created the fresh accelerated generation
+  `selection-fast-local-v2`, processed 100,000 documents, published and
+  authenticated snapshot `snapshot-000000000001`, and passed SQLite
+  `integrity_check` for both the local database and durable canonical copy.
+- The full accelerated run resumed that exact local generation at 07:04 UTC in
+  tmux session `curation-fast-local-v2`. Its first healthy monitor record at
+  07:05 UTC reported 8 archives, 733,993 documents (1.430%), a live curator,
+  no warnings, and 342,497,202,176 local bytes free. The monitor runs in
+  `curation-fast-local-v2-monitor`; its first failed record was a harmless
+  startup race before the curator had published its running-archive subphase,
+  followed by the healthy record.
+- At 07:08 UTC the live checkpoint had advanced to 28 archives and 2,583,958
+  documents (5.034%), with archive 29 running, no storage violation,
+  340,704,468,992 local bytes free, a 1.75 GB database, and a bounded 641 MB
+  WAL. Both curator and monitor tmux sessions remained alive.
+- The accelerated output is durable at
+  `/workspace/dataset/curated/selection-fast-local-v2`; its live SQLite/WAL
+  authority is `/local/curation/selection-fast-local-v2`. Full authenticated
+  snapshots are written hourly to NFS with retention two.
 
 - The network-volume baseline curator was stopped deliberately with `Ctrl-C`
-  through its `curation-fast-v1` tmux foreground job so the CPU pod can be
-  replaced with one exposing 1 TB of pod-local storage.
+  through its `curation-fast-v1` tmux foreground job before the storage resize.
 - Its resumable checkpoint is in `inventory`: 11,236,456 / 51,328,930 documents
   (21.891%), 113 archives completed, and `other_code/part-000020` is durable at
   30,000 / 151,510 rows, with no recorded storage violation.
@@ -33,10 +60,9 @@ publication manifest are complete.
   60 GB `/dev/shm`; that is insufficient for accelerated local-WAL curation.
   The visible unmounted NVMe devices had no corresponding `/dev` nodes inside
   the container and were not claimed, mounted, formatted, or modified.
-- The accelerated implementation is commit `6b7decc`. It requires a fresh
-  output and about 322 GB initially free on a positively identified local
-  filesystem; 500 GB is recommended, so the planned 1 TB local disk is ample.
-  It deliberately refuses to convert or overwrite the baseline output.
+- The accelerated implementation landed in commit `6b7decc`; the authenticated
+  stop record is commit `7a6d35e`. It deliberately refuses to convert or
+  overwrite the baseline output.
 - The baseline checkpoint remains a rollback/resume authority. A local-WAL
   rollout will start a new output generation and must not delete
   `selection-fast-v1` until equivalence and performance gates pass.
@@ -51,13 +77,11 @@ publication manifest are complete.
   metadata-verified rows. A streaming SHA-256 inventory completed successfully
   and published `SOURCE.json` plus `COMPLETION.json`. It is still quarantined
   and is not yet approved as SFT training input.
-- The last authenticated server checkout state predates commit `6b7decc`.
-  Deploy that commit to a separate checkout after the new pod/local disk is
-  available; never mutate the preserved baseline `.work` tree in place.
+- The active server checkout is clean at commit `7a6d35e`. Never mutate the
+  preserved baseline `.work` tree in place.
 
-This is the last authenticated server snapshot. Re-read `CHECKPOINT.json`,
-`tmux ls`, mount identities, and `df` after the pod/storage change before any
-rollout.
+The accelerated checkpoint and health log are the live authorities. Re-read
+them together with `tmux ls`, mount identities, and `df` before intervention.
 
 ## Monitoring without mutating state
 
@@ -67,8 +91,9 @@ Inside the CPU pod:
 tmux ls
 pgrep -af 'curate_corpus.py|download_sft_dataset.py|hf download'
 python3 -m json.tool \
-  /workspace/dataset/curated/selection-fast-v1/.work/CHECKPOINT.json
-df -h /workspace
+  /local/curation/selection-fast-local-v2/CHECKPOINT.json
+tail -n 2 /workspace/dataset/logs/curation-fast-local-v2-monitor.log
+df -h / /workspace
 ```
 
 The curation checkpoint is authoritative; the curation log may be empty because
@@ -76,11 +101,13 @@ progress commits are recorded in `CHECKPOINT.json` and SQLite.
 
 ## What follows automatically
 
-Nothing is currently advancing the pre-training curator. The baseline can be
-resumed from its durable subphase cursor with its original command, while the
-accelerated path intentionally uses a fresh output generation. It must not be
-replaced with an ad hoc filtering process. A storage violation, lease conflict,
-identity mismatch, or accounting mismatch is a hard stop.
+The accelerated curator is advancing inventory and will continue into quality
+filtering, exact/normalized canonicalization, leakage-safe grouping, split
+assignment, quota selection, final deferred raw-integrity verification, and
+atomic publication. It must not be replaced with an ad hoc filtering process.
+A storage violation, lease conflict, identity mismatch, accounting mismatch, or
+failed health record after startup is a hard stop. Token materialization remains
+a separate launch after final curation certification.
 
 ## What requires a separate launch
 

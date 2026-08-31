@@ -156,15 +156,16 @@ and mandatory final raw hashing. They do not replace a target-pod benchmark.
 
 ## Capacity and expected speed
 
-For approximately 51 million inventory documents, the frozen admission contract
-projects 3,072 bytes per document: about 156.7 GB before its 2x safety factor,
-or about 313.3 GB. At batch size 100,000, the bounded transaction sidecar adds
-6.55 GB and the post-projection reserve adds 2 GB, so the local work filesystem
-must expose roughly 322 GB free at first startup. Resumes credit authenticated
+For the frozen inventory, the first-start admission requirement is exactly
+323,918,545,920 bytes (about 301.67 GiB): 315,364,945,920 bytes for the projected
+database including its 2x safety factor, 6,553,600,000 bytes for the bounded
+100,000-row transaction sidecar, and a 2,000,000,000-byte reserve. The 320 GiB
+rollout exposed 343,580,889,088 bytes free at admission, leaving a
+19,662,343,168-byte margin (about 18.31 GiB). Resumes credit authenticated
 database/WAL bytes already occupying that volume against the final projection;
-they never require room for a second complete local database. Use at least a
-350 GB local volume; 500 GB leaves materially safer headroom for filesystem
-allocation and sorter variability.
+they never require room for a second complete local database. A larger local
+volume still leaves safer headroom for filesystem allocation and sorter
+variability.
 
 An observed inventory density near 1,438 bytes/document would put one real
 database near 73 GB. Durable steady state then uses about 220 GB for the canonical
@@ -232,6 +233,12 @@ mount identity first. Do not point the new invocation at the baseline output.
 
 The live health monitor reads the local checkpoint while keeping its health log
 and alert on durable storage:
+
+During the narrow resume-startup window before the curator publishes an active
+archive, the monitor emits a warning-only `startup_publication_grace` record for
+at most 60 seconds, and only while the bound curator process is alive and all
+other checkpoint, journal, count, and storage invariants pass. The condition is
+fatal after that bound.
 
 ```bash
 python scripts/monitor_curation.py \

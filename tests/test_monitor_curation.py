@@ -100,6 +100,18 @@ class CurationMonitorTest(unittest.TestCase):
             process_checker=lambda pid, path: (True, f"fake:{pid}:{path}"),
         )
 
+    def remove_active_archive(self, output: Path, *, documents: int = 10) -> Path:
+        checkpoint_path = output / ".work" / "CHECKPOINT.json"
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        checkpoint["counts"]["documents"] = documents
+        checkpoint["subphases"] = [
+            subphase
+            for subphase in checkpoint["subphases"]
+            if subphase["status"] == "complete"
+        ]
+        write_json(checkpoint_path, checkpoint)
+        return checkpoint_path
+
     def test_healthy_inventory_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = self.fixture(Path(temporary))
@@ -181,6 +193,88 @@ class CurationMonitorTest(unittest.TestCase):
                 health = self.inspect(output)
         self.assertEqual(health["status"], "healthy")
         sleep.assert_called_once()
+
+    def test_persistent_projection_mismatch_fails_after_bounded_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.fixture(Path(temporary))
+            journal = output / ".work" / "journal.jsonl"
+            stale = MODULE._read_journal(journal)[:1]
+            with mock.patch.object(
+                MODULE,
+                "_read_journal",
+                return_value=stale,
+            ), mock.patch.object(MODULE.time, "sleep") as sleep:
+                with self.assertRaisesRegex(
+                    MODULE.HealthError, "mismatch after publication-race retries"
+                ):
+                    self.inspect(output)
+        self.assertEqual(sleep.call_count, 4)
+
+    def test_fresh_live_resume_without_active_archive_gets_bounded_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.fixture(Path(temporary))
+            checkpoint = self.remove_active_archive(output)
+            health = MODULE.inspect(
+                output,
+                stall_seconds=3_600,
+                now=checkpoint.stat().st_mtime,
+                process_checker=lambda pid, path: (True, f"fake:{pid}:{path}"),
+            )
+        self.assertEqual(health["status"], "warning")
+        self.assertTrue(health["startup_publication_grace"])
+        self.assertIsNone(health["active_subphase"])
+        self.assertIn(
+            "inventory_active_archive_pending_startup_publication",
+            health["warnings"],
+        )
+
+    def test_missing_active_archive_fails_after_narrow_grace_even_before_stall(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.fixture(Path(temporary))
+            checkpoint = self.remove_active_archive(output)
+            with self.assertRaisesRegex(
+                MODULE.HealthError, "outside startup publication grace"
+            ):
+                MODULE.inspect(
+                    output,
+                    stall_seconds=3_600,
+                    now=(
+                        checkpoint.stat().st_mtime
+                        + MODULE.STARTUP_PUBLICATION_GRACE_SECONDS
+                        + 1
+                    ),
+                    process_checker=lambda pid, path: (
+                        True,
+                        f"fake:{pid}:{path}",
+                    ),
+                )
+
+    def test_missing_active_archive_never_gets_grace_for_dead_curator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.fixture(Path(temporary))
+            checkpoint = self.remove_active_archive(output)
+            with self.assertRaisesRegex(MODULE.HealthError, "process is not healthy"):
+                MODULE.inspect(
+                    output,
+                    stall_seconds=3_600,
+                    now=checkpoint.stat().st_mtime,
+                    process_checker=lambda pid, path: (False, "process_missing"),
+                )
+
+    def test_startup_grace_does_not_mask_inventory_count_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.fixture(Path(temporary))
+            checkpoint = self.remove_active_archive(output, documents=11)
+            with self.assertRaisesRegex(MODULE.HealthError, "durable count"):
+                MODULE.inspect(
+                    output,
+                    stall_seconds=3_600,
+                    now=checkpoint.stat().st_mtime,
+                    process_checker=lambda pid, path: (
+                        True,
+                        f"fake:{pid}:{path}",
+                    ),
+                )
 
 
 if __name__ == "__main__":

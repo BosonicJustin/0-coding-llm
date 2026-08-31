@@ -34,6 +34,7 @@ PHASE_ORDER = {
     "emitted": 7,
     "complete": 8,
 }
+STARTUP_PUBLICATION_GRACE_SECONDS = 60.0
 
 
 class HealthError(RuntimeError):
@@ -235,6 +236,7 @@ def inspect(
         checkpoint_path, journal_path
     )
     now = time.time() if now is None else now
+    age_seconds = max(0.0, now - checkpoint_path.stat().st_mtime)
 
     phase = checkpoint.get("phase")
     if phase not in PHASE_ORDER:
@@ -291,52 +293,13 @@ def inspect(
             running.append(subphase)
     if len(running) > 1:
         raise HealthError(f"active phase has multiple running subphases: {len(running)}")
-    if phase == "inventory" and len(running) != 1:
-        raise HealthError(
-            f"inventory must have exactly one running archive, found {len(running)}"
-        )
     if phase == "complete" and running:
         raise HealthError("complete run still has a running subphase")
-
-    if phase == "inventory":
-        archive_events = [event for event in events if event.get("event") == "archive_ingested"]
-        if len(archive_events) != archives:
-            raise HealthError(
-                f"archive journal/count mismatch: {len(archive_events)} != {archives}"
-            )
-        committed_documents = 0
-        for event in archive_events:
-            payload = event.get("payload")
-            if not isinstance(payload, dict):
-                raise HealthError("archive event payload is invalid")
-            committed_documents += _plain_int(
-                payload.get("documents"), label="archive event documents"
-            )
-        active_rows = _plain_int(
-            running[0].get("processed_rows"), label="running processed rows"
-        )
-        details = running[0].get("details")
-        if not isinstance(details, dict):
-            raise HealthError("running inventory details are invalid")
-        active_expected = _plain_int(
-            details.get("expected_documents"),
-            label="running expected documents",
-            minimum=1,
-        )
-        if active_rows > active_expected:
-            raise HealthError("running archive processed rows exceed its report")
-        if committed_documents + active_rows != documents:
-            raise HealthError(
-                "inventory durable count differs from completed journal plus active cursor"
-            )
-        if selected_documents != 0 or output_archives != 0:
-            raise HealthError("selection/output counters advanced during inventory")
 
     # The storage contract describes the active SQLite filesystem. In the
     # accelerated mode that is pod-local storage, not the durable publication
     # volume. Durable snapshot capacity is enforced by the snapshot manager.
     warnings, storage = _storage_checks(checkpoint, work)
-    age_seconds = max(0.0, now - checkpoint_path.stat().st_mtime)
     if age_seconds > stall_seconds:
         warnings.append(f"checkpoint_stale_for_{int(age_seconds)}_seconds")
 
@@ -356,6 +319,55 @@ def inspect(
             raise HealthError(f"curator process is not healthy: {process_detail}")
     else:
         pid = None
+
+    startup_publication_grace = False
+    if phase == "inventory" and not running:
+        grace_seconds = min(stall_seconds, STARTUP_PUBLICATION_GRACE_SECONDS)
+        if process_alive and age_seconds <= grace_seconds:
+            startup_publication_grace = True
+            warnings.append("inventory_active_archive_pending_startup_publication")
+        else:
+            raise HealthError(
+                "inventory has no running archive outside startup publication grace: "
+                f"checkpoint_age_seconds={age_seconds:.3f}, "
+                f"grace_seconds={grace_seconds:.3f}"
+            )
+
+    if phase == "inventory":
+        archive_events = [event for event in events if event.get("event") == "archive_ingested"]
+        if len(archive_events) != archives:
+            raise HealthError(
+                f"archive journal/count mismatch: {len(archive_events)} != {archives}"
+            )
+        committed_documents = 0
+        for event in archive_events:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                raise HealthError("archive event payload is invalid")
+            committed_documents += _plain_int(
+                payload.get("documents"), label="archive event documents"
+            )
+        active_rows = 0
+        if running:
+            active_rows = _plain_int(
+                running[0].get("processed_rows"), label="running processed rows"
+            )
+            details = running[0].get("details")
+            if not isinstance(details, dict):
+                raise HealthError("running inventory details are invalid")
+            active_expected = _plain_int(
+                details.get("expected_documents"),
+                label="running expected documents",
+                minimum=1,
+            )
+            if active_rows > active_expected:
+                raise HealthError("running archive processed rows exceed its report")
+        if committed_documents + active_rows != documents:
+            raise HealthError(
+                "inventory durable count differs from completed journal plus active cursor"
+            )
+        if selected_documents != 0 or output_archives != 0:
+            raise HealthError("selection/output counters advanced during inventory")
 
     progress_percent = 100.0 * documents / expected_documents
     if not math.isfinite(progress_percent) or not 0.0 <= progress_percent <= 100.0:
@@ -377,6 +389,7 @@ def inspect(
         },
         "active_subphase": None if active is None else active.get("subphase"),
         "active_processed_rows": 0 if active is None else active.get("processed_rows"),
+        "startup_publication_grace": startup_publication_grace,
         "checkpoint_age_seconds": age_seconds,
         "live_work_root": str(work),
         "last_event_sequence": last_event_sequence,
