@@ -18,7 +18,7 @@ Downloaded SFT data is quarantined until benchmark decontamination, schema
 normalization, length analysis, split construction, and a separate SFT
 publication manifest are complete.
 
-## Last verified server state at 2026-08-31 07:15 UTC
+## Last verified server state at 2026-08-31 07:47 UTC
 
 - The resized CPU pod exposes a 320 GiB local overlay
   (343,597,383,680 bytes total) and the durable NFS network volume at
@@ -51,6 +51,13 @@ publication manifest are complete.
   the new code was healthy at 66 archives / 6,001,567 documents (11.692%). The
   curator was never stopped and advanced to 69 archives / 6,301,563 documents
   (12.276%) by 07:15 UTC with no violation.
+- At 07:45 UTC the monitor reported 235 archives and 18,503,372 / 51,328,930
+  documents inventoried (36.049%), with `other_code.000142` active, the curator
+  alive as PID 368, a current checkpoint, and no warnings. The live database
+  was 12,673,970,176 bytes with 329,775,230,976 local bytes free. The first
+  hourly snapshot for this full-run interval is due after 08:04 UTC; the
+  authenticated controlled-run snapshot remains durable as
+  `snapshot-000000000001`.
 - The accelerated output is durable at
   `/workspace/dataset/curated/selection-fast-local-v2`; its live SQLite/WAL
   authority is `/local/curation/selection-fast-local-v2`. Full authenticated
@@ -85,8 +92,13 @@ publication manifest are complete.
   metadata-verified rows. A streaming SHA-256 inventory completed successfully
   and published `SOURCE.json` plus `COMPLETION.json`. It is still quarantined
   and is not yet approved as SFT training input.
-- The active server checkout is clean at commit `85fb98a`. Never mutate the
-  preserved baseline `.work` tree in place.
+- The active server checkout was safely fast-forwarded to organization commit
+  `4d81d2a` without restarting the curator or monitor; the running curator was
+  launched from the preceding `4b2e985` code state, and its curation code and
+  policy were not changed by that commit. Nine lightweight documentation,
+  runbook, and dependency-contract tests plus all four shell-wrapper syntax
+  checks passed on the pod. The checkout is clean. Never mutate the preserved
+  baseline `.work` tree in place.
 
 The accelerated checkpoint and health log are the live authorities. Re-read
 them together with `tmux ls`, mount identities, and `df` before intervention.
