@@ -258,7 +258,7 @@ def _required_schema(connection: sqlite3.Connection) -> dict[str, list[str]]:
     objects = {
         str(row[0]): str(row[1])
         for row in connection.execute(
-            "SELECT name, type FROM sqlite_schema "
+            "SELECT name, type FROM sqlite_master "
             "WHERE name IN "
             "('metadata','archives','documents','events','groups','reasons',"
             "'phase_progress')"

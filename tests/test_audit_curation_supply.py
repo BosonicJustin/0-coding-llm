@@ -372,6 +372,11 @@ class SupplyAuditTest(unittest.TestCase):
         self.assertFalse(any("documents_selection_v2" in detail for detail in plan))
         self.assertFalse(any("documents_source_group" in detail for detail in plan))
 
+    def test_schema_discovery_uses_legacy_compatible_master_table(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("FROM sqlite_master", source)
+        self.assertNotIn("FROM sqlite_schema", source)
+
 
 if __name__ == "__main__":
     unittest.main()
