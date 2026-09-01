@@ -1079,3 +1079,77 @@ crash on the same pod. Until the next complete six-hour snapshot publishes,
 loss of the pod's local disk would still fall back to generation three and lose
 newer canonicalization, so the pod/local volume must remain intact. The exact
 repeatable procedure is now in the production runbook.
+
+## 2026-09-01 exact supply audit and fast generation-v2 decision
+
+The local-WAL curator later completed global exact/normalized canonicalization
+and leakage-safe group assignment. Exact quota selection was stopped after the
+other-code test cell exhausted its available supply at 149,115,274 tokens; the
+partial `selected` table is retained as evidence but is not a corpus authority.
+No curator is now active, and no token-ID materialization has started.
+
+A dedicated WAL-aware read-only audit scanned the documents authority once,
+used primary-key lookups for reasons/groups, and completed in 255.2 seconds. It
+reported `safe: true`, zero accounting anomalies, 49,461,115 eligible canonical
+documents, and 14,968,335 leakage-safe groups. The result is
+`/workspace/dataset/audits/supply-audit-fast-v1-20260901/supply-audit.json`,
+SHA-256
+`74de45bdf3438395f74f6c492f11017e6c0be6b76e0f08ec73e88a0b77169230`.
+
+Exact eligible supply was:
+
+| Split | Python tokens/docs | Other-code tokens/docs | English tokens/docs |
+|---|---:|---:|---:|
+| Train | 22,914,037,162 / 22,757,415 | 16,527,423,703 / 15,422,386 | 12,244,232,284 / 10,382,610 |
+| Validation | 199,245,719 / 212,616 | 134,812,854 / 139,251 | 116,983,633 / 99,123 |
+| Test | 209,365,037 / 212,653 | 149,115,274 / 136,162 | 117,502,816 / 98,899 |
+| All | 23,322,647,918 / 23,182,684 | 16,811,351,831 / 15,697,799 | 12,478,718,733 / 10,580,632 |
+
+Other code is the train bottleneck. Against 25,952,231,562 audited raw
+other-code tokens, the eligible train split retained 16,527,423,703 tokens, a
+63.684% measured train yield. The 21,032,000,000 train target is short by
+4,504,576,297. At the measured yield the point-estimate raw increment is
+7,073,323,057 tokens. The versioned v2 target is instead 35,000,000,000
+cumulative raw other-code tokens, an increment of 9,047,768,438 and 27.914%
+headroom over that estimate. Python, FineWeb-Edu, Wikipedia, and all reference
+final-budget rows remain unchanged.
+
+The operational decision is to freeze `/workspace/dataset` and selectively
+hard-link immutable acquisition/preprocess state into the independent
+`/workspace/dataset-other-code-topup-v2` generation. At the 06:30 UTC check,
+the clone was still running in tmux `dataset-clone-topup-v2` as PID 1600 and
+had only an unpublished `.dataset-other-code-topup-v2.incoming-*` directory.
+The other-code collector and incremental preprocessor had not started at that
+instant.
+
+The clone completed at 06:30:51 UTC and atomically published its final root.
+Its manifest SHA-256 is
+`815c6256f0354f1b6a6cc524d96e745331c68afd02f3e72b19bb2d66ed2b3de9`;
+the manifest records 21,181 hard links totaling 72,337,391,686 bytes and five
+copied control files. A first 06:32 collector attempt failed on missing Python
+dependencies before touching data. A dedicated
+`/opt/coding-model-data-venv` was then built and passed 20 focused
+collector/clone tests. Its sorted `pip freeze` was stored at
+`/workspace/dataset-other-code-topup-v2/logs/data-environment.freeze.txt`,
+SHA-256
+`c84c69f333754bfbd97b3ec851ec132916466a06424043349ae273429ef81bfb`.
+The collector relaunched at 06:36:50 UTC in tmux `stack-v3-topup-v2`; at the
+06:40:36 UTC check all eight workers were active and committed other-code
+supply had advanced from 25,952,231,562 to 26,066,335,409 tokens while Python
+remained exactly 25,770,142,666. Incremental preprocessing was also active at
+low priority in tmux `preprocess-topup-v2-live`; it authenticated and
+fingerprinted new other-code archive 550 (27,966 documents / 28,085,641 tokens)
+with zero benchmark hits.
+
+After the clone publishes, only other-code collection resumes. Incremental
+preprocessing reuses immutable v1 report/fingerprint shards and processes new
+archives with the same versioned v2 quota config. Curation itself must be a
+full new inventory/canonical/group generation because new documents can change
+global exact/normalized canonical winners.
+
+Fuzzy English near-deduplication and a second code MinHash/LSH pass remain
+deferred. Exact curation quota selection is also skipped: the v7 publisher will
+emit per-archive keep bitmaps for every eligible canonical full document, and
+packed order v4 will become the sole 40/40/20 and model-input-budget authority.
+Validation/test may use their largest feasible balanced whole-row cap no larger
+than 0.5B instead of acquiring data solely to fill the nominal held-out size.

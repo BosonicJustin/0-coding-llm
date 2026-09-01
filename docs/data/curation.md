@@ -1,5 +1,15 @@
 # Final corpus curation and selection
 
+> **Generation-v2 route:** exact quota selection in `curate_corpus.py` is no
+> longer the intended final publication path. After the other-code top-up, v2
+> must rebuild inventory, reasons, global exact/normalized canonicalization,
+> and leakage-safe groups from all old plus new inputs. A separate v7 publisher
+> then keeps every eligible canonical full document with per-archive bitmaps;
+> packed order v4 becomes the only 40/40/20 and token-budget authority. See
+> [fast-generation-v2.md](fast-generation-v2.md). The v5/v6 quota-selection
+> algorithm below remains the historical implementation contract and must not
+> be mistaken for the v2 launch procedure.
+
 `scripts/curate_corpus.py` is the immutable boundary between the streaming raw
 audit and the later raw-text reader/tokenizer/packer. It consumes the finalized
 collection quota records and completion markers plus
@@ -122,6 +132,33 @@ provenance. Rejected records retain deterministic reasons such as
 `residual_normalized_duplicate`, `english_near_duplicate` (full v5),
 `english_normalized_duplicate` (fast v6), a policy quality reason, or
 `quota_overflow`.
+
+## All-eligible v7 publication
+
+Generation v2 stops treating curation as the mixture sampler. Once a complete,
+immutable snapshot proves reasons, canonical winners, group coverage, split
+assignments, source identities, and zero leakage, the read-only v7 publisher:
+
+1. validates the durable snapshot manifest, database checksum, checkpoint,
+   source/preprocess/policy/quota identities, and SQLite query plans;
+2. recomputes exact eligible document/token totals for all nine split/domain
+   cells;
+3. writes one restartable keep bitmap per input archive, aligned to manifest
+   row order, with a 1 only for an eligible canonical document;
+4. records every kept document at full source length and records no terminal
+   token prefix or curation mixture claim; and
+5. atomically publishes an identity-v7 manifest only after every bitmap,
+   checksum, accounting total, and source-stability check passes.
+
+Partial v1 exact-selector rows and quota progress remain audit evidence only.
+They cannot affect a bitmap or be accepted as selection authority. The v7
+manifest reports `selected_totals` as observed supply and keeps reference
+quotas informational. The materializer preserves separate split/domain packed
+streams, and deterministic order v4 later selects the actual 40/40/20 rows.
+
+Publisher/materializer v7 qualification is still in progress. No production
+command should be frozen until the fresh v2 canonical/group snapshot exists
+and the producer/consumer contract suite passes.
 
 ## Token accounting boundary
 

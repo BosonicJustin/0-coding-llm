@@ -1,5 +1,13 @@
 # Stack v3 raw-code collector
 
+> **Current generation-v2 override (2026-09-01):** the 25.7184B targets below
+> describe the frozen first acquisition generation. The audited eligible
+> other-code train supply was only 16.527B tokens, so a selectively hard-linked
+> v2 generation is being created at
+> `/workspace/dataset-other-code-topup-v2`. Its versioned configuration raises
+> only cumulative raw other code to 35B; Python and English stay frozen. See
+> [fast-generation-v2.md](fast-generation-v2.md) for current state and commands.
+
 This pipeline streams the pinned `HuggingFaceCode/stack-v3-train` dataset and
 saves only an explicit allowlist of programming languages. It maintains two
 independent buckets:
@@ -63,6 +71,11 @@ these same hashes propagate contamination. It does not perform fuzzy semantic
 near-deduplication. The raw inputs are preserved so the
 implemented cross-source English pass can be tested later as a controlled
 corpus ablation.
+
+Final generation v2 also skips exact token-quota selection in SQLite. It keeps
+every eligible canonical full document and delegates mixture/budget selection
+to deterministic packed order v4. This does not weaken benchmark filtering,
+exact/normalized canonicalization, or leakage-safe group splitting.
 
 Stack v3 itself is hosted in Parquet source shards, so the Hugging Face reader
 must decode Parquet internally. Those source shards are streamed from Hugging

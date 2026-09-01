@@ -10,8 +10,9 @@ coding model from scratch and evaluating it on MBPP without training on MBPP.
 - Context: 4,096 tokens with causal, block-diagonal attention across packed
   document boundaries.
 - Tokenizer: pinned `bigcode/starcoder2-tokenizer` revision.
-- Pre-training target: 52.58B train tokens plus immutable 0.50B validation and
-  0.50B language-model test sets.
+- Pre-training target: 52.58B train tokens. Immutable validation and
+  language-model test orders each use the largest feasible balanced cap no
+  greater than the nominal 0.50B.
 - Train mixture: 40% Python, 40% other programming languages, 20% English.
 - Evaluation-isolation invariant: MBPP and every frozen final benchmark must be
   absent from training and checkpoint selection. MBPP filtering is already in
@@ -22,18 +23,31 @@ The raw acquisition deliberately includes headroom. Final token budgets are
 enforced only after quality filtering, contamination propagation, leakage-safe
 group splitting, tokenization, and packing.
 
-## Current status — 2026-08-31
+## Current status — 2026-09-01 06:40:36 UTC
 
-- Raw acquisition is complete: 64.582B audited content tokens in 4,345
-  finalized archives, with zero archive errors.
-- Restart-safe accelerated curation is running with live SQLite/WAL state on
-  pod-local storage and authenticated snapshots on the network volume. It
-  performs quality/benchmark filtering, exact and normalized-hash
-  canonicalization, leakage-safe grouping, split assignment, and exact mixture
-  selection. The original network-volume generation remains an untouched
-  rollback authority.
+- The original `/workspace/dataset` generation is frozen. Its WAL-aware supply
+  audit found 49,461,115 eligible canonical documents and exact train supply of
+  22.914B Python, 16.527B other-code, and 12.244B English content tokens. The
+  signed audit result is documented in
+  [fast-generation-v2.md](docs/data/fast-generation-v2.md).
+- Exact curation quota selection was stopped: other-code supply cannot satisfy
+  the 21.032B train share, and doing corpus-scale random selection in SQLite is
+  unnecessary. No curator is currently running; its partial exact-selection
+  rows are non-authoritative.
+- The selective hard-link clone atomically published
+  `/workspace/dataset-other-code-topup-v2` with a verified manifest. The
+  other-code-only collector is running eight workers in tmux
+  `stack-v3-topup-v2` toward a 35B cumulative raw-token target. It has proven
+  forward progress from 25.952B to 26.066B committed other-code tokens while
+  Python remained unchanged at 25.770B. Low-priority incremental preprocessing
+  is consuming each new finalized archive in tmux
+  `preprocess-topup-v2-live`; the fresh v2 canonical/group build has not started.
 - Fuzzy English near-deduplication is intentionally deferred for the first
   baseline and remains available as a later controlled ablation.
+- Generation v2 will publish every eligible canonical document with compact
+  keep bitmaps. Deterministic packed `order.bin` files—not curation quota
+  prefixes—will enforce the 40/40/20 mixture and final input-token caps.
+- No token-ID materialization has started.
 - The native PyTorch model, packed loader, deterministic distributed sampler,
   materializer, checkpoint/resume harness, validation, W&B integration, and
   production launcher are implemented.
@@ -70,6 +84,7 @@ The complete categorized index is [docs/README.md](docs/README.md).
 ### Pre-training
 
 - [Data pipeline](docs/data/data-pipeline.md)
+- [Current fast corpus generation v2](docs/data/fast-generation-v2.md)
 - [Curation contract](docs/data/curation.md)
 - [Materialization](docs/data/materialization.md)
 - [Training data and loader](docs/training/training-data.md)

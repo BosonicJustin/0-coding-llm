@@ -2,13 +2,18 @@
 
 ## Status
 
-The compatible local-WAL path is implemented as an explicit opt-in. It does not
-authorize modifying or replacing a running generation. A live generation remains
-the rollback authority until the accelerated generation passes the equivalence,
-fault-recovery, and performance gates below. The append-staging/parallel-decoder
-work is split: an append-only staging prototype and benchmark are implemented but
-not integrated, while parallel decoding remains a future optimization that should
-be attempted only if the local-WAL benchmark shows decoding is the next bottleneck.
+No curator is running. The `selection-fast-local-v2` database described here is
+stopped and retained as first-generation audit evidence; do not resume these
+commands for the current corpus. The independent top-up generation must run a
+fresh full canonical and leakage-safe group build, then use all-eligible bitmap
+publication. See [fast-generation-v2.md](fast-generation-v2.md).
+
+The compatible local-WAL path remains implemented as an explicit opt-in for
+that future fresh output. It does not authorize modifying or replacing an
+existing generation. The append-staging/parallel-decoder work is split: an
+append-only staging prototype and benchmark are implemented but not integrated,
+while parallel decoding remains a future optimization that should be attempted
+only if a new local-WAL benchmark shows decoding is the next bottleneck.
 
 ## Why the baseline is slow
 

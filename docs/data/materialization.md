@@ -1,5 +1,12 @@
 # Production corpus materialization
 
+> **Current generation-v2 boundary:** token-ID materialization has not started.
+> The intended input is an all-eligible identity-v7 keep-bitmap publication,
+> not the stopped v1 exact-quota selection. Packed order v4 will be the only
+> authority for 40/40/20 and final model-input caps. The v5/v6 commands later in
+> this document are retained as tested historical contracts and must not be run
+> for v2. See [fast-generation-v2.md](fast-generation-v2.md).
+
 `pretrain/materialize.py` and `scripts/materialize_training_corpus.py` are the
 cold-path bridge from immutable raw archives plus completed curation decisions
 to the binary shards consumed by pre-training. This stage does no filtering,
@@ -9,10 +16,18 @@ those choices; the bridge validates them,
 re-reads the selected raw text, tokenizes it with the pinned tokenizer, packs
 it, and publishes deterministic order-v4 artifacts.
 
+The v7 branch has the same raw-text verification, pinned tokenizer, packing,
+boundary-isolation, provenance, restart, and checksum obligations. Its
+selection input differs: an archive bitmap says keep/reject for each complete
+source document, `selected_tokens` must equal `source_tokens`, and observed
+nine-cell totals are supply rather than exact quotas. Draft v7 support is not a
+production launch authority until the producer/consumer contract tests and a
+frozen durable v2 snapshot pass.
+
 ## Required completed inputs
 
 The bridge fails closed unless the curation manifest and checksum are complete
-and internally consistent. Both accepted branches require
+and internally consistent. Both historical v5/v6 branches require
 `production_ready: true`, a complete decision-shard inventory, the zero-leakage
 audit, and the pre-packing StarCoder2 token unit. The full-near v5 branch
 requires `english_near_dedup_complete: true` and the complete five-file English
@@ -77,6 +92,9 @@ For every raw archive, in canonical inventory order, the materializer:
    token count to equal `source_tokens`, and keeps exactly
    `token_ids[:selected_tokens]`. Thus a quota-ending partial document is
    preserved exactly; it is never silently rounded to a whole document.
+
+   In the generation-v2 v7 branch, every keep is a complete document and
+   `selected_tokens == source_tokens`; quota-ending prefixes are forbidden.
 3. Sends the selected prefix to one of nine independent writers:
    `{train,validation,test} x {python,other_code,english}`. Each document gets
    one EOS token. A document-start bit marks its first content token, and every
@@ -134,6 +152,12 @@ domain, order construction independently permutes every available row and takes
 the required prefix, then globally shuffles the selected references. Selection
 is deterministic, without replacement, and is not biased toward the earliest
 packed shards.
+
+For generation v2, train still targets the largest optimizer-update-aligned
+balanced prefix at or below 52.58B input tokens. Validation and test each use
+the largest feasible balanced 40/40/20 whole-row cap at or below 0.5B. A
+held-out split may therefore be smaller than 0.5B when one domain is limiting;
+do not acquire extra raw data solely to fill a language-model held-out cap.
 
 `rows`, `rows_per_domain`, `input_tokens_per_domain`, and
 `valid_loss_tokens_per_domain` describe only the selected order. The manifest's

@@ -4,7 +4,12 @@ This is the required path from the current raw acquisition jobs to the first
 full 1.3B-parameter pre-training run. Do not train directly from the raw
 `.tar.zst` collection archives.
 
-## 1. Finish and freeze acquisition
+The current authority is generation v2 in
+[fast-generation-v2.md](../data/fast-generation-v2.md). Exact curation-quota
+selection is no longer required: retain every eligible canonical full
+document, then enforce mixture and budgets in packed order v4.
+
+## 1. Preserve v1 and complete the v2 other-code top-up
 
 - [x] Python reaches 25,718,400,000 collected StarCoder2 tokens.
 - [x] Other code reaches 25,718,400,000 collected tokens.
@@ -14,11 +19,25 @@ full 1.3B-parameter pre-training run. Do not train directly from the raw
   zero. A small whole-document overshoot is expected.
 - [x] Save the final quota report, source manifests, resolved dataset commits,
   tokenizer manifest, collector versions, logs, and configuration hashes.
-- [ ] Stop the CPU download pod only after all open `.part-*` archives have
-  been finalized. Keep the network volume.
+- [x] Freeze `/workspace/dataset`; no job may mutate the v1 root.
+- [x] Atomically publish `/workspace/dataset-other-code-topup-v2` with a valid
+  `CLONE_MANIFEST.json`: 21,181 hard links / 72,337,391,686 bytes, five copied
+  controls, manifest SHA-256
+  `815c6256f0354f1b6a6cc524d96e745331c68afd02f3e72b19bb2d66ed2b3de9`.
+- [x] Qualify the active `stack-v3-topup-v2` checkpoint recovery: all eight
+  workers advanced committed other-code supply from 25,952,231,562 to
+  26,066,335,409 tokens while Python remained exactly 25,770,142,666.
+- [ ] Let `stack-v3-topup-v2` reach 35,000,000,000 cumulative raw other-code
+  tokens. Require Python and English to remain unchanged and keep
+  `preprocess-topup-v2-live` auditing finalized archives concurrently.
+- [ ] Stop the CPU download pod only after every new `.part-*` has finalized,
+  the v2 collection completion marker is published, and incremental
+  preprocessing has passed closed-collection coverage. Keep the network volume.
 
-Acquisition totals 64.296B tokens because it includes 20% headroom. The final
-corpus is smaller: 52.58B train tokens plus 0.50B validation and 0.50B test.
+The original acquisition totaled about 64.58B audited tokens, but measured
+other-code train retention was lower than the nominal headroom assumption. The
+v2 35B raw other-code target provides 27.914% margin over the measured-yield
+point estimate. The final train order remains capped at 52.58B input tokens.
 
 ## 2. Audit raw-corpus integrity
 
@@ -45,6 +64,13 @@ it has caught up completely and that its error count is zero.
   index is rebuildable and is not a production curation prerequisite.
 - [x] Preserve raw archives as immutable inputs. Write every later phase to a
   new directory rather than modifying raw data.
+- [x] Publish the exact v1 WAL-aware supply audit at
+  `/workspace/dataset/audits/supply-audit-fast-v1-20260901/supply-audit.json`
+  with SHA-256
+  `74de45bdf3438395f74f6c492f11017e6c0be6b76e0f08ec73e88a0b77169230`.
+- [ ] Incrementally audit/fingerprint only the newly added v2 other-code
+  archives using the same versioned v2 quota configuration as collection;
+  require complete v2 ledger/raw/report/fingerprint identity afterward.
 
 ## 3. Define the final filtering policy before running it
 
@@ -111,7 +137,7 @@ assignment. Baseline v1 skips only fuzzy/semantic English near-deduplication.
 The 20% acquisition headroom remains available for quality filtering and hash
 canonicalization.
 
-## 5. Construct leakage-safe splits and exact budgets
+## 5. Construct leakage-safe splits and packed-order budgets
 
 Assign whole groups to one split only. For code, group by pinned source revision
 and `repo_id`; for English, group by stable source/article identity. Exact and
@@ -121,7 +147,9 @@ split a known source group between train and evaluation. Use a recorded random
 seed and stable source IDs. Upstream deduplication and split grouping are
 distinct: the former does not make file-level random splitting safe.
 
-| Split | Python | Other code | English | Total |
+The nominal rows below are reference maxima, not SQLite selection quotas:
+
+| Split | Python | Other code | English | Total cap |
 |---|---:|---:|---:|---:|
 | Train | 21.032B | 21.032B | 10.516B | 52.580B |
 | Validation | 0.200B | 0.200B | 0.100B | 0.500B |
@@ -138,6 +166,14 @@ prefix using the GPU-smoke-chosen global microbatch and gradient accumulation,
 then freezes that geometry. Read the exact row/update/token count from the
 finalized manifest; report valid supervised targets and packed surplus
 separately.
+
+Generation v2 must rebuild canonical winners and groups from every old and new
+archive. Its publication keeps all eligible canonical documents at full length.
+Deterministic `order.bin` construction then chooses without replacement from
+separate domain streams. Validation and test each use the largest feasible
+balanced whole-row cap at or below 0.5B; a smaller held-out set is acceptable
+when one domain is limiting and is preferable to acquiring more data solely for
+the nominal held-out size.
 
 - [ ] Make validation and test immutable after selection.
 - [ ] Never use the language-model test set or MBPP to choose checkpoints or
@@ -170,6 +206,8 @@ sampler, and synthetic correctness tests are implemented in `pretrain/data.py`;
 see [training-data.md](../training/training-data.md). The boxes below remain
 unchecked until those tools have
 been run and validated on the final selected corpus.
+
+No production token-ID materialization has started as of the current handoff.
 
 - [ ] Convert selected documents into large sequential binary shards, roughly
   0.5-2 GB each, plus indexes and checksums. Do not make the GPU loader open

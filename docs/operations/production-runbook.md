@@ -11,6 +11,20 @@ resume/DDP gates, and a contamination-clean validation loop are mandatory below.
 MBPP and the final test order are never used to choose hyperparameters or
 checkpoints.
 
+> **Generation-v2 override (2026-09-01):** the v1 acquisition root is frozen,
+> exact curation-quota selection has been abandoned, and neither a curator nor
+> a token-ID materializer is running. The selective hard-link clone to
+> `/workspace/dataset-other-code-topup-v2` completed successfully. An
+> other-code-only collector is running eight workers toward a 35B cumulative
+> raw-token target, and low-priority incremental preprocessing is active. Stable
+> progress and unchanged Python accounting were proven at 06:40 UTC. The
+> current state and ordered commands are in
+> [fast-generation-v2.md](../data/fast-generation-v2.md). Stage 4 exact-selector
+> and Stage 5 v5/v6 materializer commands below are retained as historical
+> tested contracts; do **not** execute them for v2. The v2 publisher keeps all
+> eligible canonical documents, and packed order v4 owns the 40/40/20 mixture
+> and input-token caps.
+
 Canonical contracts live in
 [pretraining-checklist.md](pretraining-checklist.md),
 [streaming-preprocess.md](../data/streaming-preprocess.md),
@@ -48,7 +62,8 @@ Storage ownership is strict:
 
 | Location | Contents | Authority |
 | --- | --- | --- |
-| Network volume, `/workspace/dataset` | raw archives; quota ledgers and completion markers; source, tokenizer, preprocessing, calibration, cluster, current fast-curation `.work`, packed, order, provenance, audit, W&B, and checkpoint artifacts | Durable source of truth |
+| Network volume, `/workspace/dataset` | frozen v1 raw archives; quota ledgers and completion markers; source, tokenizer, preprocessing, stopped curation evidence, and audits | Durable frozen v1 authority |
+| Network volume, `/workspace/dataset-other-code-topup-v2` | v2 hard-link clone after atomic publication; new other-code archives, incremental preprocessing, fresh curation, packed data, and orders | Planned durable v2 authority |
 | CPU pod local NVMe, `/local-nvme` | optional rebuildable scratch for a separately qualified future run | Never the sole copy of state required for the current network-volume run |
 | Preprocessor `/tmp/coding-model-preprocess` | rebuildable uncompressed spool | Disposable |
 | GPU pod local NVMe, `/local-nvme/packed-v1` | verified, read-only hot copy of the finalized packed corpus and orders | Performance copy only |
@@ -380,10 +395,11 @@ exact local-capacity admission gate at first startup with the 100,000-row batch
 contract, keeps SQLite/WAL/temp state on pod-local storage, and periodically
 publishes verified recovery snapshots to the network volume. The CLI refuses
 same-filesystem "durable" storage and refuses converting or overwriting the
-baseline canonical database. The active `selection-fast-local-v2` generation
-passed the controlled snapshot/integrity qualification and minimum 3x
-performance gate before its full rollout; its live status is recorded in
-[handoff.md](handoff.md).
+baseline canonical database. The now-stopped `selection-fast-local-v2`
+generation passed the controlled snapshot/integrity qualification and minimum
+3x performance gate. Its canonical and group state fed the exact supply audit,
+but its incomplete exact-quota rows are not publication authority. Current
+state is recorded in [handoff.md](handoff.md).
 
 First certify rollback-journal locking, abrupt-process recovery, and a minimum
 write rate on this exact mounted filesystem:
@@ -695,8 +711,8 @@ time since the last successful snapshot, potentially more than six hours if a
 new snapshot is still incomplete. Do not delete the pod or its local volume
 until the next complete snapshot—or the final certified publication—is durable.
 
-The command above writes directly to the durable network publication
-`$DATA_ROOT/curated/selection-fast-v1`; no second copy or rename is needed.
+The historical command above wrote directly to the durable network publication
+`$DATA_ROOT/curated/selection-fast-v1`; no second copy or rename was needed.
 Only `manifest.json`, `manifest.sha256`, and `decisions/` are closed inputs to
 the next stage. The live `.work/` tree remains restart state and must not be
 copied or used as materializer input.

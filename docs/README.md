@@ -13,6 +13,7 @@ the production runbook for ordered execution.
 ## Data pipeline
 
 - [End-to-end data pipeline](data/data-pipeline.md)
+- [Current fast corpus generation v2](data/fast-generation-v2.md)
 - [Stack and English curation contract](data/curation.md)
 - [Local-WAL curation acceleration](data/curation-acceleration.md)
 - [Streaming raw audit](data/streaming-preprocess.md)
