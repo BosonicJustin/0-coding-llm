@@ -1,9 +1,13 @@
 # Final training-corpus qualification
 
 Run `scripts/qualify_training_corpus.py` after the materializer has published
-all three order-v4 splits and before copying data to a GPU pod or renting the
-six-GPU training pod. A zero exit status and an authenticated `status: pass`
-receipt are required. The gate never modifies the corpus.
+all three order-v4 splits and before authorizing the multi-day pre-training
+launch. Packing can finish before GPU rental, but the final train order depends
+on geometry measured during a short six-GPU qualification rental. The normal
+sequence is therefore: pack on the data pod, qualify candidate GPU geometry,
+finalize all three orders, run this corpus gate, then authorize the long run. A
+zero exit status and an authenticated `status: pass` receipt are required. The
+gate never modifies the corpus.
 
 This is deliberately a full cold-path scan, not the launcher's metadata-only
 preflight. It composes the canonical readers and validators already used by
@@ -50,8 +54,9 @@ Do **not** invoke this command with
 environment has no PyTorch, while the canonical packed/order validators and
 `PackedBatchCollator` are PyTorch-native. Reimplementing them in the qualifier
 would create a second, potentially divergent data contract. Create a dedicated
-CPU-only qualification environment on the CPU pod instead; this does not
-require renting a GPU:
+CPU-only qualification environment on the CPU pod instead. Preparing this
+environment and executing the corpus scan require no GPU, although the final
+order geometry must already have been frozen by the short GPU qualification:
 
 ```bash
 python3 -m venv /opt/coding-model-qualification-venv
