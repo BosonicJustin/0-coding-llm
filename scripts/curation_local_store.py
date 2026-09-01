@@ -222,6 +222,7 @@ def storage_admission(
     minimum_free_bytes: int,
     reclaimable_existing_bytes: int = 0,
     cgroup_memory: Mapping[str, Any] | None = None,
+    projection_basis: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fail unless the projected database can fit on the local filesystem.
 
@@ -258,6 +259,15 @@ def storage_admission(
             "Local-work storage projection inputs must be positive integers; "
             "reclaimable_existing_bytes may be zero"
         )
+    measured_basis: dict[str, Any] | None = None
+    if projection_basis is not None:
+        if not isinstance(projection_basis, Mapping):
+            raise LocalStoreError("Storage projection basis must be a mapping")
+        measured_basis = dict(projection_basis)
+        # Admission evidence is persisted into the immutable store identity;
+        # reject objects that cannot be represented canonically before doing
+        # any capacity arithmetic.
+        canonical_json_bytes(measured_basis)
     probe = local_root
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
@@ -302,6 +312,10 @@ def storage_admission(
         "filesystem_type": filesystem_type,
         "ram_backed": normalized_fs in RAM_FILESYSTEMS,
         "expected_documents": expected_documents,
+        "projected_bytes_per_document": projected_bytes_per_document,
+        "safety_numerator": safety_numerator,
+        "safety_denominator": safety_denominator,
+        "projection_basis": measured_basis,
         "projected_database_bytes_with_safety": projected_database_bytes,
         "reclaimable_existing_bytes": reclaimable_existing_bytes,
         "remaining_database_bytes_with_safety": remaining_database_bytes,

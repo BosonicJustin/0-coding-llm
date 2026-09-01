@@ -1,6 +1,6 @@
 """Immutable, fail-closed authorization artifact for a production pretraining run.
 
-The authority is deliberately separate from the launcher.  It records every
+The authority records every
 operator-controlled input that can change the scientific or economic meaning
 of a run and can be revalidated without network access.  Publication is
 write-once and accompanied by a SHA-256 sidecar.
@@ -743,8 +743,10 @@ def inspect_recipe(path: str | Path) -> dict[str, Any]:
         raise RunAuthorityError("Production recipe must evaluate at start")
     if recipe.get("wandb_mode") not in ("offline", "online"):
         raise RunAuthorityError("Production recipe must enable offline or online W&B")
-    if not isinstance(recipe.get("activation_checkpointing"), bool):
-        raise RunAuthorityError("activation_checkpointing must be boolean")
+    if recipe.get("activation_checkpointing") is not True:
+        raise RunAuthorityError(
+            "The production 1.3B DDP recipe requires activation_checkpointing=true"
+        )
     if not isinstance(recipe.get("compile_model"), bool):
         raise RunAuthorityError("compile_model must be boolean")
     return {"artifact": descriptor, "recipe": recipe}
@@ -847,6 +849,16 @@ def inspect_launcher_argv(
     for name, expected in path_options.items():
         if not _same_path(_option(launcher_argv, name), expected, project_root=project_root):
             raise RunAuthorityError(f"Canonical argv {name} is not bound to the authorized input")
+    authority_destination = Path(_option(launcher_argv, "--run-authority"))
+    if not authority_destination.is_absolute():
+        raise RunAuthorityError("Canonical argv --run-authority must be absolute")
+    authority_destination = authority_destination.resolve(strict=False)
+    if authority_destination == project_root or authority_destination.is_relative_to(
+        project_root
+    ):
+        raise RunAuthorityError(
+            "Canonical argv --run-authority must be outside the Git worktree"
+        )
     scalar_options = {
         "--nproc-per-node": str(WORLD_SIZE),
         "--model-size": MODEL_SIZE,
@@ -888,8 +900,19 @@ def inspect_launcher_argv(
             raise RunAuthorityError(f"Canonical argv {name} differs from the recipe")
     if _option(trainer_argv, "--log-every") != str(cadence["log_every"]):
         raise RunAuthorityError("Canonical argv --log-every differs from the recipe")
-    activation_on = _flag(trainer_argv, "--activation-checkpointing")
-    activation_off = _flag(trainer_argv, "--no-activation-checkpointing")
+    # Activation checkpointing is owned by the production launcher because it
+    # is part of the launcher's 1.3B memory-admission contract.  Requiring the
+    # flag in trainer passthrough made the authority impossible to execute: the
+    # launcher correctly rejects owned options after ``--``.  Freeze the
+    # explicit launcher-level decision and reject a duplicate passthrough.
+    if _flag(trainer_argv, "--activation-checkpointing") or _flag(
+        trainer_argv, "--no-activation-checkpointing"
+    ):
+        raise RunAuthorityError(
+            "Canonical argv must place activation checkpointing before the -- delimiter"
+        )
+    activation_on = _flag(launcher_argv, "--activation-checkpointing")
+    activation_off = _flag(launcher_argv, "--no-activation-checkpointing")
     if activation_on == activation_off or activation_on != recipe["activation_checkpointing"]:
         raise RunAuthorityError("Canonical argv activation checkpointing differs from recipe")
     fused_on = _flag(trainer_argv, "--fused-adamw")
@@ -1187,6 +1210,19 @@ def publish_run_authority(output: str | Path, payload: Mapping[str, Any]) -> dic
     destination = Path(output)
     parent = destination.parent.resolve(strict=True)
     destination = parent / destination.name
+    if payload.get("format") == AUTHORITY_FORMAT:
+        try:
+            authorized_destination = Path(
+                _option(payload["launcher"]["argv"], "--run-authority")
+            ).resolve(strict=False)
+        except (KeyError, TypeError) as exc:
+            raise RunAuthorityError(
+                "Run authority lacks its canonical --run-authority destination"
+            ) from exc
+        if authorized_destination != destination:
+            raise RunAuthorityError(
+                "Publication path differs from canonical --run-authority destination"
+            )
     sidecar = destination.with_name(f"{destination.name}.sha256")
     if destination.exists() or destination.is_symlink() or sidecar.exists() or sidecar.is_symlink():
         raise RunAuthorityError(

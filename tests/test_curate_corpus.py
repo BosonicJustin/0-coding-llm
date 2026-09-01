@@ -26,6 +26,8 @@ import curate_corpus as curate_corpus_module
 from curate_corpus import (
     BENCHMARK_CONTENT_CLUSTER_SQL,
     BENCHMARK_FINAL_CLUSTER_SQL,
+    CURATION_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT,
+    CURATION_STORAGE_PREFLIGHT_VERSION,
     CurationBuilder,
     CurationError,
     QUOTA_CANDIDATE_AFTER_SQL,
@@ -1347,6 +1349,8 @@ class CurateCorpusTest(unittest.TestCase):
                     "projected_additional_bytes_per_document"
                 ] = 1_024
                 current_contract["contract_version"] = 1
+                del current_contract["projection_basis"]
+                del current_contract["projection_method"]
                 del current_contract["sqlite_temp_relative_path"]
                 del current_contract["sqlite_temp_same_device_as_database"]
                 preflight = json.loads(
@@ -1427,10 +1431,13 @@ class CurateCorpusTest(unittest.TestCase):
                         "WHERE key='curation_storage_contract'"
                     ).fetchone()[0]
                 )
-                self.assertEqual(migrated_contract["contract_version"], 2)
+                self.assertEqual(
+                    migrated_contract["contract_version"],
+                    CURATION_STORAGE_PREFLIGHT_VERSION,
+                )
                 self.assertEqual(
                     migrated_contract["projected_additional_bytes_per_document"],
-                    3_072,
+                    CURATION_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT,
                 )
                 self.assertEqual(
                     migrated_contract["sqlite_temp_relative_path"],
@@ -1444,7 +1451,10 @@ class CurateCorpusTest(unittest.TestCase):
                         "SELECT preflight_json FROM storage_metrics WHERE singleton=1"
                     ).fetchone()[0]
                 )
-                self.assertEqual(migrated_preflight["preflight_version"], 2)
+                self.assertEqual(
+                    migrated_preflight["preflight_version"],
+                    CURATION_STORAGE_PREFLIGHT_VERSION,
+                )
                 self.assertEqual(
                     migrated_preflight["measurement_reason"][
                         "from_database_version"
@@ -1478,6 +1488,8 @@ class CurateCorpusTest(unittest.TestCase):
                 )
                 contract["contract_version"] = 1
                 contract["projected_additional_bytes_per_document"] = 1_024
+                del contract["projection_basis"]
+                del contract["projection_method"]
                 preflight = json.loads(
                     connection.execute(
                         "SELECT preflight_json FROM storage_metrics WHERE singleton=1"
@@ -1518,12 +1530,15 @@ class CurateCorpusTest(unittest.TestCase):
                         "SELECT preflight_json FROM storage_metrics WHERE singleton=1"
                     ).fetchone()[0]
                 )
-                self.assertEqual(migrated["preflight_version"], 2)
+                self.assertEqual(
+                    migrated["preflight_version"],
+                    CURATION_STORAGE_PREFLIGHT_VERSION,
+                )
                 self.assertEqual(
                     migrated["contract"][
                         "projected_additional_bytes_per_document"
                     ],
-                    3_072,
+                    CURATION_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT,
                 )
                 self.assertEqual(
                     migrated["measurement_reason"]["reason"],
@@ -2353,6 +2368,17 @@ class CurateCorpusTest(unittest.TestCase):
                     output=fixture.root / "fast-with-diagnostic",
                     english_near_clusters=None,
                     allow_missing_english_near_dedup=True,
+                    **common,
+                )
+            with self.assertRaisesRegex(
+                CurationError, "requires --sqlite-local-work-root"
+            ):
+                CurationBuilder(
+                    output=fixture.root / "fast-handoff-without-local-store",
+                    english_near_clusters=None,
+                    allow_missing_english_near_dedup=False,
+                    defer_raw_archive_integrity_until_finalize=True,
+                    fast_all_eligible_handoff=True,
                     **common,
                 )
 

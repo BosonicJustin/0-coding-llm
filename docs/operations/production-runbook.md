@@ -1195,6 +1195,7 @@ LAUNCH_COMMON=(
   --resume-generation none
   --nproc-per-node "$GPU_COUNT"
   --model-size 1.3b
+  --activation-checkpointing
   --workers "$TRAIN_WORKERS"
   --checkpoint-every "$CHECKPOINT_EVERY"
   --eval-every "$EVAL_EVERY"
@@ -1217,23 +1218,19 @@ LAUNCH_COMMON=(
   --max-grad-norm "$TRAIN_MAX_GRAD_NORM" \
   --seed "$TRAIN_SEED"
 
-# Review the immutable dry-run report and rendered argv, then execute once.
-"$PYTHON_BIN" scripts/launch_pretraining.py "${LAUNCH_COMMON[@]}" \
-  --preflight-report "$DATA_ROOT/audits/$RUN_ID/launch-execute.json" \
-  --execute -- \
-  --learning-rate "$TRAIN_LR" \
-  --min-learning-rate "$TRAIN_MIN_LR" \
-  --warmup-steps "$TRAIN_WARMUP_STEPS" \
-  --weight-decay "$TRAIN_WEIGHT_DECAY" \
-  --max-grad-norm "$TRAIN_MAX_GRAD_NORM" \
-  --seed "$TRAIN_SEED"
+# Review the dry run. Then construct the exact execute argv and its self-bound
+# immutable --run-authority using the linked authority procedure; invoke that
+# JSON argv verbatim rather than reconstructing this shell array.
 ```
 
-The production launcher owns data, topology, precision, determinism,
-validation, checkpoint, and W&B arguments. The train order owns steps, global
-microbatch rows, and accumulation. Ordinary trainer options belong after `--`.
-Resume with the exact same command and a fresh preflight report after changing
-the launcher-owned generation selector to:
+Follow [the immutable run-authority procedure](../training/pretraining-run-authority.md)
+and the [six-GPU launch checklist](six-gpu-launch-qualification.md) for execute
+mode. The production launcher owns data, topology, precision, determinism,
+activation checkpointing, validation, checkpoint, and W&B arguments. The train
+order owns steps, global microbatch rows, and accumulation. Ordinary trainer
+options belong after `--`. Resume requires a new authority and canonical argv
+with a fresh preflight report after changing the launcher-owned generation
+selector to:
 
 ```bash
 --resume-generation latest

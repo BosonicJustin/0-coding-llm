@@ -7,6 +7,10 @@ file sizes without reading ``order.bin`` or packed token/start payload bytes.
 The expensive checksum/semantic scan is certified separately by
 ``scripts/certify_pretraining_data.py`` and its exact evidence is mandatory for
 execution.
+
+The accepted 1.3B execute path is exactly six-rank DDP and additionally
+requires a self-bound immutable run authority whose canonical argv matches the
+current invocation.
 """
 
 from __future__ import annotations
@@ -42,6 +46,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from pretrain.model import ModelConfig  # noqa: E402
 from pretrain import data as training_data  # noqa: E402
+from pretrain.run_authority import (  # noqa: E402
+    RunAuthorityError,
+    canonical_sha256,
+    validate_run_authority,
+)
 from pretrain.tokenizer_identity import (  # noqa: E402
     TokenizerIdentityError,
     verify_tokenizer_identity,
@@ -98,6 +107,7 @@ _PROTECTED_TRAINER_OPTIONS = frozenset(
         "--order-manifest",
         "--precision",
         "--resume",
+        "--run-authority",
         "--steps",
         "--tokenizer",
         "--validation-order-manifest",
@@ -267,8 +277,8 @@ def _require_regular_file(path: Path, *, label: str, expected_device: int) -> Pa
         raise PreflightError(f"{label} is not a regular file: {resolved}")
     if metadata.st_dev != expected_device:
         raise PreflightError(
-            f"{label} is on device {metadata.st_dev}, not the authorized local-data "
-            f"device {expected_device}: {resolved}"
+            f"{label} is on device {metadata.st_dev}, not authorized device "
+            f"{expected_device}: {resolved}"
         )
     return resolved
 
@@ -1369,6 +1379,72 @@ def validate_extra_trainer_args(values: Sequence[str]) -> list[str]:
     return result
 
 
+def validate_production_launch_selection(
+    *,
+    model_size: str,
+    nproc_per_node: int,
+    activation_checkpointing: bool | None,
+) -> bool:
+    """Resolve and enforce the production strategy before CUDA inspection.
+
+    The accepted 1.3B experiment authority is specifically a six-replica DDP
+    trajectory.  Allowing a different world size would change optimizer and
+    checkpoint identity; allowing checkpointing to be implicit would leave a
+    memory-critical recipe decision outside the canonical launch argv.
+    """
+
+    if model_size not in ("tiny", "1.3b"):
+        raise PreflightError(f"Unsupported model size: {model_size!r}")
+    if not _is_plain_int(nproc_per_node, minimum=1):
+        raise PreflightError("nproc_per_node must be a positive integer")
+    if activation_checkpointing is not None and not isinstance(
+        activation_checkpointing, bool
+    ):
+        raise PreflightError("activation_checkpointing must be boolean or omitted")
+    if model_size == "1.3b":
+        if nproc_per_node != 6:
+            raise PreflightError(
+                "The production 1.3B trajectory requires exactly six DDP ranks"
+            )
+        if activation_checkpointing is not True:
+            raise PreflightError(
+                "The production 1.3B trajectory requires the explicit "
+                "--activation-checkpointing flag"
+            )
+        return True
+    return bool(activation_checkpointing)
+
+
+def validate_launch_authority(
+    path: Path,
+    *,
+    invocation_argv: Sequence[str],
+) -> dict[str, Any]:
+    """Revalidate an authority and bind it to this exact launcher invocation."""
+
+    if (
+        not invocation_argv
+        or any(
+            not isinstance(value, str) or not value or "\x00" in value
+            for value in invocation_argv
+        )
+    ):
+        raise PreflightError("Cannot authenticate an invalid launcher argv")
+    try:
+        result = validate_run_authority(path)
+    except (RunAuthorityError, OSError, ValueError) as exc:
+        raise PreflightError(f"Run-authority validation failed: {exc}") from exc
+    expected = result.get("launcher_argv_sha256")
+    actual = canonical_sha256(list(invocation_argv))
+    if not isinstance(expected, str) or _LOWERCASE_SHA256.fullmatch(expected) is None:
+        raise PreflightError("Run authority lacks a valid canonical launcher digest")
+    if actual != expected:
+        raise PreflightError(
+            "Current launcher argv differs from the exact command authorized for this run"
+        )
+    return {**result, "current_launcher_argv_sha256": actual}
+
+
 def render_torchrun_command(
     *,
     runtime: RuntimeInspection,
@@ -1389,6 +1465,7 @@ def render_torchrun_command(
     wandb_group: str | None,
     wandb_tags: Sequence[str],
     extra_trainer_args: Sequence[str],
+    activation_checkpointing: bool,
 ) -> list[str]:
     command = [
         runtime.python_executable,
@@ -1428,11 +1505,10 @@ def render_torchrun_command(
         "--wandb-project",
         wandb_project,
     ]
-    if model_size == "1.3b":
-        # The memory admission model and accepted production geometry both
-        # assume whole-block activation checkpointing. Do not leave this as an
-        # implicit model-size default that a passthrough flag could reverse.
+    if activation_checkpointing:
         command.append("--activation-checkpointing")
+    else:
+        command.append("--no-activation-checkpointing")
     if eval_at_start:
         command.append("--eval-at-start")
     if checkpoint.resume_path is not None:
@@ -1694,6 +1770,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--nproc-per-node", type=int, required=True)
     parser.add_argument("--model-size", choices=("tiny", "1.3b"), default="1.3b")
+    parser.add_argument(
+        "--activation-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "explicit whole-block activation-checkpointing decision; production "
+            "1.3B execution requires --activation-checkpointing"
+        ),
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--checkpoint-every", type=int, required=True)
     parser.add_argument(
@@ -1721,6 +1806,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-group")
     parser.add_argument("--wandb-tag", action="append", default=[])
     parser.add_argument("--preflight-report", type=Path)
+    parser.add_argument(
+        "--run-authority",
+        type=Path,
+        help=(
+            "write-once immutable six-GPU run authority; mandatory for --execute "
+            "and forbidden for --dry-run"
+        ),
+    )
     parser.add_argument("--train-data-evidence", type=Path)
     parser.add_argument("--validation-data-evidence", type=Path)
     launch = parser.add_mutually_exclusive_group(required=True)
@@ -1736,8 +1829,21 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
     try:
+        activation_checkpointing = validate_production_launch_selection(
+            model_size=args.model_size,
+            nproc_per_node=args.nproc_per_node,
+            activation_checkpointing=args.activation_checkpointing,
+        )
+        if args.execute and args.run_authority is None:
+            raise PreflightError("--execute requires --run-authority")
+        if args.dry_run and args.run_authority is not None:
+            raise PreflightError(
+                "--run-authority authorizes an exact --execute argv and cannot be "
+                "used with --dry-run"
+            )
         if args.workers < 0:
             raise PreflightError("workers must be non-negative")
         if args.checkpoint_every < 1:
@@ -1762,6 +1868,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             resume_generation=args.resume_generation,
             checkpoint_generation_bytes=args.checkpoint_generation_bytes,
         )
+        authority_path: Path | None = None
+        if args.run_authority is not None:
+            authority_path = _require_inside(
+                args.run_authority,
+                Path(durable_mount.path),
+                label="run authority",
+            )
+            authority_path = _require_regular_file(
+                authority_path,
+                label="run authority",
+                expected_device=durable_mount.device,
+            )
         train_order = inspect_order(
             args.train_order_manifest,
             expected_split="train",
@@ -1848,10 +1966,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             wandb_group=args.wandb_group,
             wandb_tags=args.wandb_tag,
             extra_trainer_args=extra_args,
+            activation_checkpointing=activation_checkpointing,
         )
+        run_authority: dict[str, Any]
+        if authority_path is None:
+            run_authority = {
+                "status": "not-validated",
+                "required_for_execute": True,
+            }
+        else:
+            invocation_argv = [
+                sys.executable,
+                (
+                    sys.argv[0]
+                    if argv is None
+                    else str(Path(__file__).resolve())
+                ),
+                *raw_argv,
+            ]
+            run_authority = validate_launch_authority(
+                authority_path,
+                invocation_argv=invocation_argv,
+            )
         report: dict[str, Any] = {
             "format": "production-pretraining-preflight",
-            "format_version": 2,
+            "format_version": 3,
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "status": "pass",
             "mode": "execute" if args.execute else "dry-run",
@@ -1867,6 +2006,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "train": train_evidence,
                 "validation": validation_evidence,
             },
+            "run_authority": run_authority,
+            "distributed_strategy": "ddp",
             "runtime": asdict(runtime),
             "model_memory": asdict(model_memory),
             "process_handoff": {

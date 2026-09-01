@@ -364,6 +364,8 @@ python scripts/launch_pretraining.py \
   --checkpoint-generation-bytes "$CHECKPOINT_GENERATION_BYTES" \
   --resume-generation none \
   --nproc-per-node 6 \
+  --model-size 1.3b \
+  --activation-checkpointing \
   --workers 4 \
   --checkpoint-every "$CHECKPOINT_EVERY" \
   --eval-every "$EVAL_EVERY" \
@@ -385,12 +387,16 @@ python scripts/launch_pretraining.py \
   --seed 1234
 ```
 
-Review the emitted JSON and shell-rendered command. Then repeat the same
-arguments with a new immutable report path and replace `--dry-run` with
-`--execute`. Options owned by the launcher—including data, geometry, device,
-precision, validation, checkpoint, W&B, and determinism flags—are rejected
-after `--`; only ordinary trainer trajectory options belong there. The wrapper
-never passes `--verify-packed-payloads` to every rank.
+Review the emitted JSON and shell-rendered command. Execute mode additionally
+requires a self-bound, write-once `--run-authority`; follow
+[pretraining-run-authority.md](pretraining-run-authority.md) and the concise
+[six-GPU launch checklist](../operations/six-gpu-launch-qualification.md).
+The canonical execute argv must include its authority path and a new immutable
+preflight-report path. Options owned by the launcher—including data, geometry,
+device, precision, activation checkpointing, validation, checkpoint, W&B, and
+determinism flags—are rejected after `--`; only ordinary trainer trajectory
+options belong there. The wrapper never passes `--verify-packed-payloads` to
+every rank.
 
 Do not replace the read-only bind mount with ordinary file permissions. A
 writable mount leaves a time-of-check/time-of-use window between evidence
@@ -502,9 +508,9 @@ spending the full token budget, run these gates in the frozen GPU container:
 7. Measure peak memory. The 1.3B entry point defaults complete-transformer-block
    activation checkpointing on, but the current DDP path still replicates
    parameters and optimizer state. If that does not meet the target
-   batch/context, add native FSDP and sharded checkpoints before the long run;
-   do not reduce context or silently change optimizer precision merely to make
-   the smoke test fit.
+  batch/context, add native FSDP and sharded checkpoints before the long run;
+  do not reduce context or silently change optimizer precision merely to make
+  the smoke test fit.
 8. Exercise the reserved, contamination-clean, unfrozen validation order with
    the pinned `eval_every` and `eval_batches`; verify global/per-domain metrics,
    RNG preservation, uninterrupted-versus-resumed equality, and DDP summed-loss

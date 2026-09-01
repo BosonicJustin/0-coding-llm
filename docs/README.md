@@ -14,9 +14,11 @@ the production runbook for ordered execution.
 
 - [End-to-end data pipeline](data/data-pipeline.md)
 - [Current fast corpus generation v2](data/fast-generation-v2.md)
+- [Fast all-eligible curation runbook](data/fast-all-eligible-curation.md)
 - [Stack and English curation contract](data/curation.md)
 - [Local-WAL curation acceleration](data/curation-acceleration.md)
 - [Streaming raw audit](data/streaming-preprocess.md)
+- [Curation-independent raw token cache](data/raw-token-cache.md)
 - [FineWeb-Edu acquisition](data/english-pipeline.md)
 - [Wikipedia acquisition](data/wikipedia-pipeline.md)
 - [Optional English near-deduplication](data/english-near-dedup.md)
@@ -29,6 +31,7 @@ the production runbook for ordered execution.
 - [Packed training data and loader](training/training-data.md)
 - [Training harness](training/training.md)
 - [Immutable pre-training run authority](training/pretraining-run-authority.md)
+- [Six-GPU launch qualification](operations/six-gpu-launch-qualification.md)
 
 ## Post-training
 

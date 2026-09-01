@@ -207,10 +207,12 @@ the local exact/normalized pass and benchmark propagation still run. Preserve
 raw inputs so English fuzzy near-dedup can be tested later if results or a
 duplicate audit justify it.
 
-The production command for this step is intentionally not frozen here yet. It
-must name a new v2 curation output/local-work generation, the v2 root and v2
-quota config, and it must stop only after a complete, verified canonical/group
-snapshot exists. Never point it at the stopped v1 database.
+The production command and completion checks are now frozen in
+[Fast all-eligible curation runbook](fast-all-eligible-curation.md).
+It uses `--fast-all-eligible-handoff`: exact quotas and legacy decisions are
+never created, periodic full NFS snapshots are suppressed, and one final
+immutable LocalSQLiteStore snapshot is returned for the v7 publisher. Never
+point it at the stopped v1 database.
 
 ### 4. Publish all eligible canonical documents
 

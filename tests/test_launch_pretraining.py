@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import signal
 import tempfile
 import unittest
@@ -409,6 +410,121 @@ class FullValidationEvidenceTest(unittest.TestCase):
 
 
 class RuntimeAndCommandTest(unittest.TestCase):
+    def test_execute_requires_authority_before_runtime_or_data_access(self) -> None:
+        arguments = [
+            "--train-order-manifest",
+            "/missing/train.json",
+            "--validation-order-manifest",
+            "/missing/validation.json",
+            "--tokenizer",
+            "/missing/tokenizer",
+            "--local-data-root",
+            "/missing/local",
+            "--durable-checkpoint-root",
+            "/missing/durable",
+            "--checkpoint",
+            "/missing/durable/last.pt",
+            "--checkpoint-generation-bytes",
+            "1",
+            "--nproc-per-node",
+            "6",
+            "--model-size",
+            "1.3b",
+            "--activation-checkpointing",
+            "--checkpoint-every",
+            "1",
+            "--eval-every",
+            "1",
+            "--eval-batches",
+            "1",
+            "--execute",
+        ]
+        standard_error = io.StringIO()
+        with (
+            contextlib.redirect_stderr(standard_error),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            launch.main(arguments)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--execute requires --run-authority", standard_error.getvalue())
+
+    def test_production_selection_requires_explicit_six_rank_checkpointing(self) -> None:
+        self.assertTrue(
+            launch.validate_production_launch_selection(
+                model_size="1.3b",
+                nproc_per_node=6,
+                activation_checkpointing=True,
+            )
+        )
+        for ranks, checkpointing, pattern in (
+            (5, True, "six DDP ranks"),
+            (6, None, "explicit --activation-checkpointing"),
+            (6, False, "explicit --activation-checkpointing"),
+        ):
+            with self.subTest(ranks=ranks, checkpointing=checkpointing):
+                with self.assertRaisesRegex(launch.PreflightError, pattern):
+                    launch.validate_production_launch_selection(
+                        model_size="1.3b",
+                        nproc_per_node=ranks,
+                        activation_checkpointing=checkpointing,
+                    )
+        self.assertFalse(
+            launch.validate_production_launch_selection(
+                model_size="tiny",
+                nproc_per_node=2,
+                activation_checkpointing=None,
+            )
+        )
+
+    def test_execute_authority_is_bound_to_exact_current_argv(self) -> None:
+        invocation = [
+            "/opt/venv/bin/python",
+            "/workspace/repo/scripts/launch_pretraining.py",
+            "--run-authority",
+            "/durable/authority.json",
+            "--execute",
+        ]
+        digest = launch.canonical_sha256(invocation)
+        validated = {
+            "status": "valid",
+            "launcher_argv_sha256": digest,
+            "authorization_sha256": "a" * 64,
+        }
+        with mock.patch.object(
+            launch, "validate_run_authority", return_value=validated
+        ) as validator:
+            result = launch.validate_launch_authority(
+                Path("/durable/authority.json"),
+                invocation_argv=invocation,
+            )
+        validator.assert_called_once_with(Path("/durable/authority.json"))
+        self.assertEqual(result["current_launcher_argv_sha256"], digest)
+
+        changed = [*invocation[:-1], "--dry-run"]
+        with (
+            mock.patch.object(
+                launch, "validate_run_authority", return_value=validated
+            ),
+            self.assertRaisesRegex(launch.PreflightError, "differs"),
+        ):
+            launch.validate_launch_authority(
+                Path("/durable/authority.json"),
+                invocation_argv=changed,
+            )
+
+        with (
+            mock.patch.object(
+                launch,
+                "validate_run_authority",
+                side_effect=launch.RunAuthorityError("mutated recipe"),
+            ),
+            self.assertRaisesRegex(launch.PreflightError, "mutated recipe"),
+        ):
+            launch.validate_launch_authority(
+                Path("/durable/authority.json"),
+                invocation_argv=invocation,
+            )
+
     def test_planned_six_gpu_single_node_launch_contract(self) -> None:
         class FakeCuda:
             @staticmethod
@@ -563,6 +679,7 @@ class RuntimeAndCommandTest(unittest.TestCase):
             wandb_group=None,
             wandb_tags=(),
             extra_trainer_args=(),
+            activation_checkpointing=True,
         )
         self.assertIn("--standalone", command)
         self.assertIn("--nnodes=1", command)
@@ -885,6 +1002,7 @@ class RuntimeAndCommandTest(unittest.TestCase):
             wandb_group=None,
             wandb_tags=("production",),
             extra_trainer_args=("--compile",),
+            activation_checkpointing=True,
         )
         self.assertEqual(
             command[:3],

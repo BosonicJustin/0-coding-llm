@@ -21,8 +21,12 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 
 from pretrain.data import validate_packed_manifest, validate_training_order
 from pretrain.materialize import (
+    ALL_ELIGIBLE_CURATION_STORAGE_CONTRACT_VERSION,
+    ALL_ELIGIBLE_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT,
+    ALL_ELIGIBLE_STORAGE_PROJECTION_BASIS,
     CorpusMaterializer,
     FAST_CURATION_PROFILE,
+    FAST_ALL_ELIGIBLE_HANDOFF_PROFILE,
     MaterializationConfig,
     MaterializationError,
     canonical_sha256,
@@ -1262,6 +1266,26 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
         )
         return manifest
 
+    @staticmethod
+    def _upgrade_source_identity_for_all_eligible_handoff(
+        identity: dict[str, Any],
+    ) -> None:
+        storage = identity["curation_storage_contract"]
+        storage.update(
+            contract_version=ALL_ELIGIBLE_CURATION_STORAGE_CONTRACT_VERSION,
+            projection_basis=dict(ALL_ELIGIBLE_STORAGE_PROJECTION_BASIS),
+            projection_method=(
+                "ceil(observed_v1_database_bytes/observed_v1_documents)"
+                "*expected_documents*safety"
+            ),
+            projected_additional_bytes_per_document=(
+                ALL_ELIGIBLE_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT
+            ),
+        )
+        identity["fast_all_eligible_handoff"] = dict(
+            FAST_ALL_ELIGIBLE_HANDOFF_PROFILE
+        )
+
     @classmethod
     def _convert_fixture_to_all_eligible_profile(
         cls, fixture: MaterializationFixture
@@ -1407,6 +1431,10 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
                 )
 
         source_identity = dict(manifest["identity"])
+        source_identity["curation_storage_contract"] = dict(
+            source_identity["curation_storage_contract"]
+        )
+        cls._upgrade_source_identity_for_all_eligible_handoff(source_identity)
         source_identity["quota_config_sha256"] = file_sha256(fixture.quota_path)
         source_identity["raw_archive_integrity_policy"] = (
             "deferred-full-sha256-mandatory-before-publication"
@@ -1652,6 +1680,7 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
                 "locking_mode": "exclusive",
             },
         )
+        cls._upgrade_source_identity_for_all_eligible_handoff(source_identity)
 
         thresholds = split_thresholds(quota_targets)
         seed = policy["selection"]["seed"]
@@ -2086,6 +2115,16 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
             )
             self.assertEqual(source["curation_profile"], FAST_CURATION_PROFILE)
             self.assertEqual(
+                source["curation_storage_contract"]["contract_version"], 2
+            )
+            self.assertEqual(
+                source["curation_storage_contract"][
+                    "projected_additional_bytes_per_document"
+                ],
+                3_072,
+            )
+            self.assertNotIn("fast_all_eligible_handoff", source)
+            self.assertEqual(
                 source["known_provenance_limitations"],
                 source_manifest["known_provenance_limitations"],
             )
@@ -2169,6 +2208,18 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
                 "local-wal-with-durable-snapshots",
             )
             self.assertEqual(
+                source["curation_storage_contract"]["contract_version"],
+                ALL_ELIGIBLE_CURATION_STORAGE_CONTRACT_VERSION,
+            )
+            self.assertEqual(
+                source["curation_storage_contract"]["projection_basis"],
+                ALL_ELIGIBLE_STORAGE_PROJECTION_BASIS,
+            )
+            self.assertEqual(
+                source["fast_all_eligible_handoff"],
+                FAST_ALL_ELIGIBLE_HANDOFF_PROFILE,
+            )
+            self.assertEqual(
                 policy["selection_profile"], ALL_ELIGIBLE_SELECTION_PROFILE
             )
             self.assertEqual(
@@ -2205,6 +2256,16 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
                 published["publication_scope"], "production-durable-snapshot"
             )
             self.assertNotIn("quotas", published)
+            self.assertEqual(
+                published["identity"]["curation_storage_contract"][
+                    "contract_version"
+                ],
+                ALL_ELIGIBLE_CURATION_STORAGE_CONTRACT_VERSION,
+            )
+            self.assertEqual(
+                published["identity"]["fast_all_eligible_handoff"],
+                FAST_ALL_ELIGIBLE_HANDOFF_PROFILE,
+            )
             fixture.selection = publication
             output = root / "materialized"
             result = fixture.materializer(output).run()
@@ -2258,6 +2319,36 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
                 "missing-sqlite-execution",
                 lambda manifest: manifest["identity"].pop("sqlite_execution"),
                 "selection.identity schema mismatch",
+            ),
+            (
+                "missing-handoff-profile",
+                lambda manifest: manifest["identity"].pop(
+                    "fast_all_eligible_handoff"
+                ),
+                "selection.identity schema mismatch",
+            ),
+            (
+                "handoff-profile-drift",
+                lambda manifest: manifest["identity"][
+                    "fast_all_eligible_handoff"
+                ].__setitem__("decision_emission", True),
+                "Unsupported fast all-eligible handoff profile",
+            ),
+            (
+                "storage-projection-basis-drift",
+                lambda manifest: manifest["identity"][
+                    "curation_storage_contract"
+                ]["projection_basis"].__setitem__(
+                    "observed_database_bytes", 67_824_914_431
+                ),
+                "storage projection basis changed",
+            ),
+            (
+                "storage-projection-method-drift",
+                lambda manifest: manifest["identity"][
+                    "curation_storage_contract"
+                ].__setitem__("projection_method", "unfrozen-estimator"),
+                "storage contract mismatch for projection_method",
             ),
             (
                 "read-performance-drift",

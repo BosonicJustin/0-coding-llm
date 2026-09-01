@@ -115,6 +115,38 @@ CURATION_DISK_SAFETY_NUMERATOR = 2
 CURATION_DISK_SAFETY_DENOMINATOR = 1
 CURATION_MINIMUM_FREE_BYTES_AFTER_PROJECTION = 2 * 1_000_000_000
 CURATION_SQLITE_TEMP_RELATIVE_PATH = ".work/sqlite-tmp"
+ALL_ELIGIBLE_CURATION_STORAGE_CONTRACT_VERSION = 3
+ALL_ELIGIBLE_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT = 1_322
+ALL_ELIGIBLE_STORAGE_PROJECTION_METHOD = (
+    "ceil(observed_v1_database_bytes/observed_v1_documents)"
+    "*expected_documents*safety"
+)
+ALL_ELIGIBLE_STORAGE_PROJECTION_BASIS = {
+    "format": "curation-observed-production-storage-v1",
+    "source_generation": "selection-fast-local-v2",
+    "measurement_scope": (
+        "post-global-canonicalization-and-leakage-safe-group-assignment"
+    ),
+    "observed_documents": 51_328_930,
+    "observed_database_bytes": 67_824_914_432,
+    "observed_bytes_per_document_numerator": 67_824_914_432,
+    "observed_bytes_per_document_denominator": 51_328_930,
+    "projected_bytes_per_document_ceiling": 1_322,
+    "observed_maximum_wal_bytes": 4_132_940_952,
+    "observed_maximum_journal_bytes": 0,
+    "observed_maximum_transaction_rows": 100_000,
+    "observed_committed_transactions": 10_415,
+    "observed_minimum_free_bytes": 275_562_160_128,
+}
+FAST_ALL_ELIGIBLE_HANDOFF_PROFILE = {
+    "contract_version": 1,
+    "name": "fast-all-eligible-publisher-handoff-v1",
+    "exact_quota_selection": False,
+    "decision_emission": False,
+    "periodic_full_snapshots": False,
+    "final_snapshot_required": True,
+    "publisher": "all-eligible-identity-v7",
+}
 FAST_CURATION_IDENTITY_FORMAT_VERSION = 6
 FAST_CURATION_PROFILE = {
     "contract_version": 1,
@@ -994,23 +1026,28 @@ class CorpusMaterializer:
     @staticmethod
     def _validate_curation_storage_contract(
         identity: Mapping[str, Any],
+        *,
+        all_eligible: bool,
     ) -> dict[str, Any]:
         """Validate the curator's frozen production-scale storage contract."""
+        keys = {
+            "contract_version",
+            "progress_version",
+            "maximum_transaction_rows",
+            "transaction_sidecar_limit_bytes",
+            "projected_additional_bytes_per_document",
+            "disk_safety_numerator",
+            "disk_safety_denominator",
+            "minimum_free_bytes_after_projection",
+            "sqlite_temp_store",
+            "sqlite_temp_relative_path",
+            "sqlite_temp_same_device_as_database",
+        }
+        if all_eligible:
+            keys.update(("projection_basis", "projection_method"))
         contract = _require_exact_object_keys(
             identity.get("curation_storage_contract"),
-            {
-                "contract_version",
-                "progress_version",
-                "maximum_transaction_rows",
-                "transaction_sidecar_limit_bytes",
-                "projected_additional_bytes_per_document",
-                "disk_safety_numerator",
-                "disk_safety_denominator",
-                "minimum_free_bytes_after_projection",
-                "sqlite_temp_store",
-                "sqlite_temp_relative_path",
-                "sqlite_temp_same_device_as_database",
-            },
+            keys,
             "selection.identity.curation_storage_contract",
         )
         maximum_rows = _require_nonnegative_int(
@@ -1023,14 +1060,20 @@ class CorpusMaterializer:
                 "supported production range"
             )
         expected = {
-            "contract_version": CURATION_STORAGE_CONTRACT_VERSION,
+            "contract_version": (
+                ALL_ELIGIBLE_CURATION_STORAGE_CONTRACT_VERSION
+                if all_eligible
+                else CURATION_STORAGE_CONTRACT_VERSION
+            ),
             "progress_version": CURATION_PROGRESS_VERSION,
             "transaction_sidecar_limit_bytes": max(
                 CURATION_MINIMUM_SIDECAR_LIMIT_BYTES,
                 maximum_rows * CURATION_SIDECAR_BYTES_PER_TRANSACTION_ROW,
             ),
             "projected_additional_bytes_per_document": (
-                CURATION_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT
+                ALL_ELIGIBLE_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT
+                if all_eligible
+                else CURATION_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT
             ),
             "disk_safety_numerator": CURATION_DISK_SAFETY_NUMERATOR,
             "disk_safety_denominator": CURATION_DISK_SAFETY_DENOMINATOR,
@@ -1041,6 +1084,39 @@ class CorpusMaterializer:
             "sqlite_temp_relative_path": CURATION_SQLITE_TEMP_RELATIVE_PATH,
             "sqlite_temp_same_device_as_database": True,
         }
+        if all_eligible:
+            basis = _require_exact_object_keys(
+                contract["projection_basis"],
+                set(ALL_ELIGIBLE_STORAGE_PROJECTION_BASIS),
+                "selection.identity.curation_storage_contract.projection_basis",
+            )
+            for field in (
+                "observed_documents",
+                "observed_database_bytes",
+                "observed_bytes_per_document_numerator",
+                "observed_bytes_per_document_denominator",
+                "projected_bytes_per_document_ceiling",
+                "observed_maximum_wal_bytes",
+                "observed_maximum_journal_bytes",
+                "observed_maximum_transaction_rows",
+                "observed_committed_transactions",
+                "observed_minimum_free_bytes",
+            ):
+                _require_nonnegative_int(
+                    basis[field],
+                    "selection.identity.curation_storage_contract."
+                    f"projection_basis.{field}",
+                )
+            if dict(basis) != ALL_ELIGIBLE_STORAGE_PROJECTION_BASIS:
+                raise MaterializationError(
+                    "All-eligible curation storage projection basis changed"
+                )
+            expected.update(
+                {
+                    "projection_basis": ALL_ELIGIBLE_STORAGE_PROJECTION_BASIS,
+                    "projection_method": ALL_ELIGIBLE_STORAGE_PROJECTION_METHOD,
+                }
+            )
         for field, expected_value in expected.items():
             if contract[field] != expected_value:
                 raise MaterializationError(
@@ -2954,6 +3030,15 @@ class CorpusMaterializer:
         identity: Mapping[str, Any],
         manifest: Mapping[str, Any],
     ) -> None:
+        handoff = _require_exact_object_keys(
+            identity.get("fast_all_eligible_handoff"),
+            set(FAST_ALL_ELIGIBLE_HANDOFF_PROFILE),
+            "selection.identity.fast_all_eligible_handoff",
+        )
+        if dict(handoff) != FAST_ALL_ELIGIBLE_HANDOFF_PROFILE:
+            raise MaterializationError(
+                "Unsupported fast all-eligible handoff profile"
+            )
         policy = identity.get("raw_archive_integrity_policy")
         if policy not in RAW_ARCHIVE_INTEGRITY_POLICIES:
             raise MaterializationError(
@@ -3125,6 +3210,7 @@ class CorpusMaterializer:
         if all_eligible:
             identity_keys.update(
                 {
+                    "fast_all_eligible_handoff",
                     "raw_archive_integrity_policy",
                     "sqlite_execution",
                     "selection_profile",
@@ -3247,7 +3333,10 @@ class CorpusMaterializer:
             )
             self._validate_english_near_artifact(identity, manifest)
         self._validate_sqlite_runtime(identity)
-        self._validate_curation_storage_contract(identity)
+        self._validate_curation_storage_contract(
+            identity,
+            all_eligible=all_eligible,
+        )
         if all_eligible:
             self._validate_all_eligible_identity_fields(identity, manifest)
             self._validate_all_eligible_totals(manifest)
@@ -5000,6 +5089,9 @@ class CorpusMaterializer:
                         "raw_archive_integrity_policy"
                     ],
                     "curation_sqlite_execution": identity["sqlite_execution"],
+                    "fast_all_eligible_handoff": identity[
+                        "fast_all_eligible_handoff"
+                    ],
                     "source_curation": identity["source_curation"],
                 }
             )

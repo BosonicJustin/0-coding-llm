@@ -144,10 +144,17 @@ class CurationLocalStoreTests(unittest.TestCase):
                 transaction_sidecar_bytes=25,
                 minimum_free_bytes=50,
                 reclaimable_existing_bytes=100,
+                projection_basis={"format": "measured-fixture-v1"},
             )
         self.assertEqual(admission["projected_database_bytes_with_safety"], 200)
         self.assertEqual(admission["remaining_database_bytes_with_safety"], 100)
         self.assertEqual(admission["required_free_bytes"], 175)
+        self.assertEqual(admission["projected_bytes_per_document"], 10)
+        self.assertEqual(admission["safety_numerator"], 2)
+        self.assertEqual(admission["safety_denominator"], 1)
+        self.assertEqual(
+            admission["projection_basis"], {"format": "measured-fixture-v1"}
+        )
 
         # Existing database occupancy cannot pay for the transaction reserve
         # or the minimum-free invariant.

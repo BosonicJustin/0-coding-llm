@@ -215,8 +215,10 @@ expansion, and wrapper ambiguity:
   "--tokenizer", "/absolute/tokenizer",
   "--train-data-evidence", "/absolute/train-certification.json",
   "--validation-data-evidence", "/absolute/validation-certification.json",
+  "--run-authority", "/network-volume/run-evidence/pretraining-authority.json",
   "--nproc-per-node", "6",
   "--model-size", "1.3b",
+  "--activation-checkpointing",
   "--workers", "4",
   "--checkpoint-every", "1000",
   "--eval-every", "1000",
@@ -235,15 +237,15 @@ expansion, and wrapper ambiguity:
   "--max-grad-norm", "1",
   "--seed", "1234",
   "--log-every", "1",
-  "--activation-checkpointing",
   "--fused-adamw"
 ]
 ```
 
 The real launcher also requires storage/checkpoint/preflight arguments; they
-must be present in the real argv even though they are abbreviated above. False
-activation-checkpointing/fused decisions must use the corresponding explicit
-`--no-*` flag. Compile-on must include `--compile`; compile-off is its absence.
+must be present in the real argv even though they are abbreviated above. The
+1.3B DDP authority requires activation checkpointing. A false fused-optimizer
+decision must use `--no-fused-adamw`. Compile-on must include `--compile`;
+compile-off is its absence.
 
 ## Build and validate
 
@@ -269,18 +271,20 @@ python scripts/build_pretraining_run_authority.py build \
   --total-cost-cap-usd <operator-approved-cap>
 ```
 
-Immediately before executing the canonical argv:
+Immediately before executing the canonical argv, an explicit validation is a
+useful operator check:
 
 ```bash
 python scripts/build_pretraining_run_authority.py validate \
   /network-volume/run-evidence/pretraining-authority.json
 ```
 
-The authority and sidecar are never overwritten. Any change requires a new
-authority filename and a fresh operator decision. Until the production launcher
-accepts the authority as a mandatory argument, validation and launch must be
-treated as one operational step; launcher integration is deliberately outside
-this isolated implementation.
+The authority and sidecar are never overwritten. Its publication path must
+exactly equal canonical argv's absolute `--run-authority` value and must be
+outside the Git worktree. Any change requires a new authority filename and a
+fresh operator decision. `scripts/launch_pretraining.py --execute` now requires
+this authority, recollects all bound inputs, and verifies that the current
+canonical argv digest is the authorized digest before starting torchrun.
 
 ## Acceptance tests before renting the long-running pod
 
@@ -297,3 +301,4 @@ this isolated implementation.
 8. Re-running `build` at the same output path refuses to overwrite evidence.
 9. The launcher CUDA preflight and backend qualification pass on the same pod;
    then the exact canonical argv—not a reconstructed shell command—is executed.
+   The launcher itself reports the matching authority/argv digests.

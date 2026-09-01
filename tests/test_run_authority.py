@@ -136,6 +136,8 @@ class RunAuthorityUnitTests(unittest.TestCase):
                 str(train_cert),
                 "--validation-data-evidence",
                 str(validation_cert),
+                "--run-authority",
+                str(root / "authority.json"),
                 "--nproc-per-node",
                 "5",
                 "--model-size",
@@ -148,11 +150,10 @@ class RunAuthorityUnitTests(unittest.TestCase):
                 "10",
                 "--eval-batches",
                 "2",
-                "--log-every",
-                "1",
                 "--wandb-mode",
                 "offline",
                 "--eval-at-start",
+                "--activation-checkpointing",
                 "--execute",
                 "--",
                 "--learning-rate",
@@ -173,7 +174,8 @@ class RunAuthorityUnitTests(unittest.TestCase):
                 "1",
                 "--seed",
                 "1234",
-                "--activation-checkpointing",
+                "--log-every",
+                "1",
                 "--fused-adamw",
             ]
             argv_file = root / "argv.json"
@@ -216,6 +218,40 @@ class RunAuthorityUnitTests(unittest.TestCase):
                     recipe=recipe,
                     geometry={"receipt": {"accepted": {"workers": 4}}},
                 )
+            argv[argv.index("--nproc-per-node") + 1] = "6"
+            _write_json(argv_file, argv)
+            inspected = authority.inspect_launcher_argv(
+                argv_file,
+                project_root=project,
+                train_order=order(train_manifest),
+                validation_order=order(validation_manifest),
+                tokenizer_root=tokenizer,
+                train_certification=certification(train_cert),
+                validation_certification=certification(validation_cert),
+                recipe=recipe,
+                geometry={"receipt": {"accepted": {"workers": 4}}},
+            )
+            self.assertEqual(inspected["argv"], argv)
+
+    def test_publication_must_match_self_authorized_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            intended = root / "intended.json"
+            payload = {
+                "format": authority.AUTHORITY_FORMAT,
+                "launcher": {
+                    "argv": [
+                        sys.executable,
+                        "/fixture/launch_pretraining.py",
+                        "--run-authority",
+                        str(intended),
+                    ]
+                },
+            }
+            with self.assertRaisesRegex(
+                authority.RunAuthorityError, "Publication path differs"
+            ):
+                authority.publish_run_authority(root / "wrong.json", payload)
 
     def test_certified_inventory_detects_payload_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -412,8 +448,18 @@ class RunAuthorityMutationTest(unittest.TestCase):
             tokenizer_root.mkdir()
             tokenizer_manifest = tokenizer_root / "TOKENIZER_MANIFEST.json"
             tokenizer_manifest.write_text("{}", encoding="utf-8")
+            output = root / "authority.json"
             argv_file = root / "launcher-argv.json"
-            _write_json(argv_file, [sys.executable, str(launcher_source), "--execute"])
+            _write_json(
+                argv_file,
+                [
+                    sys.executable,
+                    str(launcher_source),
+                    "--run-authority",
+                    str(output),
+                    "--execute",
+                ],
+            )
 
             def fake_certification(
                 path, *, expected_split, order, project_root, environment
@@ -488,7 +534,6 @@ class RunAuthorityMutationTest(unittest.TestCase):
                     hourly_cost_usd="18",
                     total_cost_cap_usd="100",
                 )
-                output = root / "authority.json"
                 authority.publish_run_authority(output, payload)
                 self.assertEqual(authority.validate_run_authority(output)["status"], "valid")
                 recipe_payload["optimizer"]["learning_rate"] = "0.0002"

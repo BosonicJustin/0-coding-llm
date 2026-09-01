@@ -151,13 +151,21 @@ SQLITE_JOURNAL_MODES = frozenset(("auto", "delete", "wal"))
 CURATION_LEASE_VERSION = 1
 CURATION_LEASE_FILE = ".curation.cross-client-lease.json"
 CURATION_PROGRESS_VERSION = 1
-CURATION_STORAGE_PREFLIGHT_VERSION = 2
-# A representative 200k-row schema probe reached ~1,438 bytes/document before
-# decision shards, temp spill, sidecars, fragmentation, and real path lengths.
-# Reserve 3 KiB/document and then apply the frozen 2x safety factor.  At the
-# planned ~51M-document scale this makes the executable gate slightly stronger
-# than the 300 GB local-NVMe runbook requirement instead of a false ~106 GB GO.
-CURATION_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT = 3_072
+CURATION_STORAGE_PREFLIGHT_VERSION = 3
+# The stopped v1 production authority is the closest available measurement of
+# this exact schema and critical path: 51,328,930 inventoried documents occupied
+# 67,824,914,432 database bytes after global canonicalization and leakage-safe
+# group assignment.  Round the observed 1,321.378 bytes/document upward, then
+# retain a separate 2x growth/fragmentation factor.  This is substantially more
+# realistic than multiplying a synthetic 3 KiB probe by 2, while still leaving
+# almost one complete measured database of headroom.
+CURATION_OBSERVED_V1_DOCUMENTS = 51_328_930
+CURATION_OBSERVED_V1_DATABASE_BYTES = 67_824_914_432
+CURATION_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT = (
+    CURATION_OBSERVED_V1_DATABASE_BYTES
+    + CURATION_OBSERVED_V1_DOCUMENTS
+    - 1
+) // CURATION_OBSERVED_V1_DOCUMENTS
 CURATION_DISK_SAFETY_NUMERATOR = 2
 CURATION_DISK_SAFETY_DENOMINATOR = 1
 CURATION_MINIMUM_FREE_BYTES = 2 * 1_000_000_000
@@ -165,6 +173,34 @@ CURATION_MINIMUM_SIDECAR_LIMIT_BYTES = 256 * 1024 * 1024
 CURATION_SIDECAR_BYTES_PER_TRANSACTION_ROW = 64 * 1024
 DEFAULT_LOCAL_SQLITE_SNAPSHOT_INTERVAL_SECONDS = 60 * 60
 LOCAL_WAL_AUTOCHECKPOINT_PAGES = 32_768
+FAST_ALL_ELIGIBLE_HANDOFF_PROFILE = {
+    "contract_version": 1,
+    "name": "fast-all-eligible-publisher-handoff-v1",
+    "exact_quota_selection": False,
+    "decision_emission": False,
+    "periodic_full_snapshots": False,
+    "final_snapshot_required": True,
+    "publisher": "all-eligible-identity-v7",
+}
+CURATION_STORAGE_PROJECTION_BASIS = {
+    "format": "curation-observed-production-storage-v1",
+    "source_generation": "selection-fast-local-v2",
+    "measurement_scope": (
+        "post-global-canonicalization-and-leakage-safe-group-assignment"
+    ),
+    "observed_documents": CURATION_OBSERVED_V1_DOCUMENTS,
+    "observed_database_bytes": CURATION_OBSERVED_V1_DATABASE_BYTES,
+    "observed_bytes_per_document_numerator": CURATION_OBSERVED_V1_DATABASE_BYTES,
+    "observed_bytes_per_document_denominator": CURATION_OBSERVED_V1_DOCUMENTS,
+    "projected_bytes_per_document_ceiling": (
+        CURATION_PROJECTED_ADDITIONAL_BYTES_PER_DOCUMENT
+    ),
+    "observed_maximum_wal_bytes": 4_132_940_952,
+    "observed_maximum_journal_bytes": 0,
+    "observed_maximum_transaction_rows": 100_000,
+    "observed_committed_transactions": 10_415,
+    "observed_minimum_free_bytes": 275_562_160_128,
+}
 MIGRATABLE_IDENTITY_KEYS = frozenset(
     ("raw_archive_integrity_policy", "sqlite_execution")
 )
@@ -1100,6 +1136,7 @@ class CurationBuilder:
         sqlite_snapshot_retention: int = DEFAULT_SNAPSHOT_RETENTION,
         defer_raw_archive_integrity_until_finalize: bool = False,
         allow_same_device_local_store_for_testing: bool = False,
+        fast_all_eligible_handoff: bool = False,
     ) -> None:
         self.root = root
         self.staging_root = staging_root
@@ -1120,6 +1157,8 @@ class CurationBuilder:
         self.allow_same_device_local_store_for_testing = (
             allow_same_device_local_store_for_testing
         )
+        self.fast_all_eligible_handoff = fast_all_eligible_handoff
+        self._final_handoff_snapshot_published = False
         if batch_size < 1 or batch_size > 100_000:
             raise CurationError("batch_size must be between 1 and 100,000")
         if sqlite_snapshot_interval_seconds < 1:
@@ -1138,6 +1177,11 @@ class CurationBuilder:
         }
         self.storage_contract = {
             "contract_version": CURATION_STORAGE_PREFLIGHT_VERSION,
+            "projection_basis": dict(CURATION_STORAGE_PROJECTION_BASIS),
+            "projection_method": (
+                "ceil(observed_v1_database_bytes/observed_v1_documents)"
+                "*expected_documents*safety"
+            ),
             "progress_version": CURATION_PROGRESS_VERSION,
             "maximum_transaction_rows": batch_size,
             "transaction_sidecar_limit_bytes": max(
@@ -1159,7 +1203,11 @@ class CurationBuilder:
         # a v2 resume; migration replaces it atomically with the current
         # contract before any phase work can continue.
         self.legacy_v3_storage_contract = {
-            **self.storage_contract,
+            **{
+                key: value
+                for key, value in self.storage_contract.items()
+                if key not in ("projection_basis", "projection_method")
+            },
             "contract_version": 1,
             "projected_additional_bytes_per_document": 1_024,
         }
@@ -1176,6 +1224,15 @@ class CurationBuilder:
         self.policy_sha = canonical_sha256(self.policy)
         self.curation_profile = curation_profile(self.policy)
         self.fast_canonical_profile = self.curation_profile is not None
+        if fast_all_eligible_handoff and not self.fast_canonical_profile:
+            raise CurationError(
+                "Fast all-eligible handoff requires the production fast canonical policy"
+            )
+        if fast_all_eligible_handoff and sqlite_local_work_root is None:
+            raise CurationError(
+                "Fast all-eligible handoff requires --sqlite-local-work-root so a "
+                "final immutable publisher snapshot can be created"
+            )
         if self.fast_canonical_profile:
             if english_near_clusters is not None:
                 raise CurationError(
@@ -1195,6 +1252,11 @@ class CurationBuilder:
             raise CurationError(
                 "Deferred raw-archive integrity is allowed only by the production "
                 "fast canonical profile; English near-dedup requires eager evidence"
+            )
+        if fast_all_eligible_handoff and not defer_raw_archive_integrity_until_finalize:
+            raise CurationError(
+                "Fast all-eligible handoff requires deferred raw-archive integrity; "
+                "the v7 publisher is the mandatory full-payload SHA-256 boundary"
             )
         self.quotas = load_final_quotas(quota_path)
         self.collection_targets = load_collection_targets(quota_path)
@@ -1254,6 +1316,10 @@ class CurationBuilder:
             }
         if self.fast_canonical_profile:
             self.identity["curation_profile"] = self.curation_profile
+        if self.fast_all_eligible_handoff:
+            self.identity["fast_all_eligible_handoff"] = dict(
+                FAST_ALL_ELIGIBLE_HANDOFF_PROFILE
+            )
         self.durable_work = output / ".work"
         self.work = (
             self.sqlite_local_work_root
@@ -3125,17 +3191,27 @@ class CurationBuilder:
                     self.storage_contract["minimum_free_bytes_after_projection"]
                 ),
                 reclaimable_existing_bytes=reclaimable_existing_bytes,
+                projection_basis=CURATION_STORAGE_PROJECTION_BASIS,
             )
-            store_identity = {
-                "output": str(self.output.resolve()),
-                "policy_sha256": self.policy_sha,
-                "quota_config_sha256": self.quota_sha,
-                "report_inventory_sha256": self.inventory_sha,
-                "preprocess_manifest_sha256": self.identity[
-                    "preprocess_manifest_sha256"
-                ],
-                "sqlite_execution": self.identity["sqlite_execution"],
-            }
+            # The v7 publisher requires the immutable snapshot manifest and
+            # its CHECKPOINT.json to bind the exact same full curation
+            # identity. Keep the historical subset for legacy local-mode
+            # generations so their resume control files remain compatible;
+            # handoff mode is a fresh-generation-only contract.
+            store_identity = (
+                dict(self.identity)
+                if self.fast_all_eligible_handoff
+                else {
+                    "output": str(self.output.resolve()),
+                    "policy_sha256": self.policy_sha,
+                    "quota_config_sha256": self.quota_sha,
+                    "report_inventory_sha256": self.inventory_sha,
+                    "preprocess_manifest_sha256": self.identity[
+                        "preprocess_manifest_sha256"
+                    ],
+                    "sqlite_execution": self.identity["sqlite_execution"],
+                }
+            )
             self.local_store = LocalSQLiteStore(
                 local_root=self.work,
                 durable_work=self.durable_work,
@@ -3376,12 +3452,19 @@ class CurationBuilder:
                     if self.connection.in_transaction:
                         self.connection.rollback()
                     try:
-                        phase = self._phase()
-                        self._snapshot_local_state(
-                            reason=f"builder-exit:{phase}",
-                            force=True,
-                        )
-                        self.local_store.promote_latest()
+                        if not self._final_handoff_snapshot_published:
+                            phase = self._phase()
+                            self._snapshot_local_state(
+                                reason=f"builder-exit:{phase}",
+                                force=True,
+                            )
+                        # The all-eligible publisher consumes the authenticated
+                        # immutable generation directly.  Copying that same
+                        # multi-gigabyte database again into the legacy
+                        # canonical slot adds no recovery or publication
+                        # authority.  Other profiles retain canonical promotion.
+                        if not self.fast_all_eligible_handoff:
+                            self.local_store.promote_latest()
                     except BaseException as snapshot_error:
                         # Best-effort emergency publication must never hide the
                         # exception that caused context exit. With no original
@@ -3607,9 +3690,9 @@ class CurationBuilder:
             self._validate_legacy_storage_preflight(
                 migrated_preflight, version=version
             )
-            # Re-measure instead of relabeling the old 1 KiB/document pass as
-            # satisfying the stronger 3 KiB/document contract.  The old
-            # evidence remains cryptographically linked for auditability.
+            # Re-measure instead of relabeling the old synthetic
+            # 1 KiB/document pass as satisfying the measured-production v3
+            # contract. The old evidence remains cryptographically linked.
             migrated_preflight = self._build_storage_preflight(
                 reason="database_contract_migration",
                 from_database_version=version,
@@ -4331,6 +4414,12 @@ class CurationBuilder:
     ) -> dict[str, Any] | None:
         if self.local_store is None:
             return None
+        if self.fast_all_eligible_handoff and not force:
+            # Full synchronous SQLite backups to NFS are intentionally absent
+            # from the critical path. Local WAL/checkpoint state remains
+            # restartable on the pod; explicit exits and the final publisher
+            # handoff still force one authenticated snapshot.
+            return None
         if not self.local_store.snapshot_due(force=force):
             return None
         checkpoint = (
@@ -4518,7 +4607,7 @@ class CurationBuilder:
         therefore one complete index, while the earlier storage projection
         reserves database plus transient WAL space for the largest unit.
         """
-        specs = (
+        specs = [
             (
                 "documents_content",
                 "CREATE INDEX IF NOT EXISTS documents_content ON documents(content_hash)",
@@ -4531,15 +4620,20 @@ class CurationBuilder:
                 "documents_source_group",
                 "CREATE INDEX IF NOT EXISTS documents_source_group ON documents(source_group)",
             ),
-            (
-                QUOTA_SELECTION_INDEX,
-                f"CREATE INDEX IF NOT EXISTS {QUOTA_SELECTION_INDEX} "
-                "ON documents(bucket, selection_rank, doc_id)",
-            ),
+        ]
+        if not self.fast_all_eligible_handoff:
+            specs.append(
+                (
+                    QUOTA_SELECTION_INDEX,
+                    f"CREATE INDEX IF NOT EXISTS {QUOTA_SELECTION_INDEX} "
+                    "ON documents(bucket, selection_rank, doc_id)",
+                )
+            )
+        specs.append(
             (
                 "reasons_reason",
                 "CREATE INDEX IF NOT EXISTS reasons_reason ON reasons(reason)",
-            ),
+            )
         )
         subphase = "inventory.bulk_indexes"
         progress = self._start_subphase(
@@ -4606,9 +4700,16 @@ class CurationBuilder:
             )
         }
         missing = [name for name, _sql in specs if name not in present]
-        if missing or "documents_selection" in present:
+        unexpected = [
+            name
+            for name in ("documents_selection", QUOTA_SELECTION_INDEX)
+            if name in present
+            and (name == "documents_selection" or self.fast_all_eligible_handoff)
+        ]
+        if missing or unexpected:
             raise CurationError(
-                f"Post-inventory index authority mismatch; missing={missing}"
+                "Post-inventory index authority mismatch; "
+                f"missing={missing}, unexpected={unexpected}"
             )
 
     def _record_bulk_index_metrics(self) -> None:
@@ -5541,6 +5642,7 @@ class CurationBuilder:
         self._sync_audit_files()
 
     def assign_splits_and_quotas(self) -> None:
+        """Assign leakage-safe groups and, unless handoff mode, exact quotas."""
         if self._phase() != "canonicalized":
             return
         self._ensure_storage_preflight()
@@ -5681,6 +5783,12 @@ class CurationBuilder:
             ):
                 raise CurationError("Completed split-group table changed")
 
+        if self.fast_all_eligible_handoff:
+            # The v7 publisher keeps every reason-free canonical document.
+            # Exact quotas, terminal prefixes, and decision JSON are therefore
+            # intentionally not curation work in this frozen execution mode.
+            return
+
         # Each quota has its own committed total-order cursor. This makes a
         # terminal prefix and its exact token counter atomic with selection.
         for split in self.policy["selection"]["split_order"]:
@@ -5780,6 +5888,15 @@ class CurationBuilder:
             raise
         self._bound_wal_after_commit()
         self._sync_audit_files()
+
+    def assign_leakage_safe_groups(self) -> None:
+        """Run only the split-group authority required by the v7 publisher."""
+
+        if not self.fast_all_eligible_handoff:
+            raise CurationError(
+                "Leakage-safe-groups-only execution requires fast all-eligible handoff"
+            )
+        self.assign_splits_and_quotas()
 
     def _select_quota_bounded(self, *, split: str, category: str) -> None:
         target = self.quotas[(split, category)]
@@ -6181,6 +6298,160 @@ class CurationBuilder:
             if file_sha256(path) != row[1]:
                 raise CurationError(f"Decision output checksum mismatch: {path}")
 
+    def _verify_all_eligible_handoff_inputs(self) -> None:
+        """Reconcile immutable metadata without duplicating publisher payload I/O."""
+
+        current_reports, current_completeness = self._load_complete_report_inventory(
+            force_raw_integrity=False
+        )
+        if current_completeness != self.collection_completeness:
+            raise CurationError(
+                "Collection completeness identity changed before all-eligible handoff"
+            )
+        current_report_identity = [
+            (relative, checksum)
+            for relative, _path, checksum, _report in current_reports
+        ]
+        frozen_report_identity = [
+            (relative, checksum)
+            for relative, _path, checksum, _report in self.report_inventory
+        ]
+        if current_report_identity != frozen_report_identity:
+            raise CurationError(
+                "Frozen report inventory changed before all-eligible handoff"
+            )
+        if self._validate_english_near_artifact() is not None:
+            raise CurationError(
+                "Fast all-eligible handoff unexpectedly acquired a fuzzy near mapping"
+            )
+
+    def finalize_all_eligible_handoff(self) -> dict[str, Any]:
+        """Publish one immutable canonical/group snapshot for the v7 publisher."""
+
+        if not self.fast_all_eligible_handoff:
+            raise CurationError("All-eligible handoff execution is not enabled")
+        if self.local_store is None:
+            raise CurationError("All-eligible handoff has no local snapshot store")
+        if self._phase() != "canonicalized":
+            raise CurationError(
+                f"Cannot publish all-eligible handoff from phase {self._phase()}"
+            )
+        self._assert_no_storage_violation()
+        counts = self._validate_durable_counts_full()
+        quota_subphases = int(
+            self.db.execute(
+                "SELECT COUNT(*) FROM phase_progress "
+                "WHERE subphase LIKE 'selection.quota.%'"
+            ).fetchone()[0]
+        )
+        group_progress = self._progress("selection.groups")
+        near_rows = int(self.db.execute("SELECT COUNT(*) FROM near_map").fetchone()[0])
+        if (
+            group_progress is None
+            or group_progress["status"] != "complete"
+            or counts["selected_documents"] != 0
+            or counts["output_archives"] != 0
+            or quota_subphases != 0
+            or near_rows != 0
+        ):
+            raise CurationError(
+                "All-eligible handoff contains quota, decision, near-map, or "
+                "incomplete group state"
+            )
+        canonicalized_rows = list(
+            self.db.execute(
+                "SELECT payload FROM events WHERE event='canonicalized' "
+                "ORDER BY sequence"
+            )
+        )
+        if len(canonicalized_rows) != 1:
+            raise CurationError(
+                "All-eligible handoff requires exactly one canonicalized event"
+            )
+        canonicalized = self._checked_json_object(
+            str(canonicalized_rows[0][0]), label="canonicalized event"
+        )
+        accepted = canonicalized.get("accepted_canonical_documents")
+        if (
+            not isinstance(accepted, int)
+            or isinstance(accepted, bool)
+            or accepted < 1
+        ):
+            raise CurationError("Canonicalized event has invalid accepted authority")
+        group_details = group_progress["details"]
+        groups = group_details.get("groups")
+        if (
+            not isinstance(groups, int)
+            or isinstance(groups, bool)
+            or groups < 1
+            or groups != group_progress["processed_rows"]
+            or group_details.get("mismatched_assignments") != 0
+        ):
+            raise CurationError("Leakage-safe group authority is malformed")
+        self._verify_all_eligible_handoff_inputs()
+        event_payload = {
+            "profile": FAST_ALL_ELIGIBLE_HANDOFF_PROFILE,
+            "phase": "canonicalized",
+            "input_documents": counts["documents"],
+            "eligible_canonical_documents": accepted,
+            "leakage_safe_groups": groups,
+            "selected_documents": 0,
+            "decision_archives": 0,
+            "quota_subphases": 0,
+            "fuzzy_near_map_rows": 0,
+            "raw_payload_sha256_authority": "required-v7-publisher-boundary",
+        }
+        existing_events = list(
+            self.db.execute(
+                "SELECT payload FROM events "
+                "WHERE event='all_eligible_handoff_ready' ORDER BY sequence"
+            )
+        )
+        if existing_events:
+            if len(existing_events) != 1 or self._checked_json_object(
+                str(existing_events[0][0]), label="all-eligible handoff event"
+            ) != event_payload:
+                raise CurationError("All-eligible handoff event authority changed")
+        else:
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+                self._record_transaction_metrics(0)
+                self._event("all_eligible_handoff_ready", event_payload)
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
+            self._bound_wal_after_commit()
+            self._sync_audit_files()
+        snapshot = self._snapshot_local_state(
+            reason="final-all-eligible-publisher-handoff", force=True
+        )
+        if snapshot is None:
+            raise CurationError("Final all-eligible snapshot was not published")
+        artifacts = snapshot.get("authority_artifacts")
+        database = snapshot.get("database")
+        if (
+            not isinstance(artifacts, dict)
+            or not isinstance(database, dict)
+            or "CHECKPOINT.json" not in artifacts
+        ):
+            raise CurationError("Final all-eligible snapshot authority is incomplete")
+        self._final_handoff_snapshot_published = True
+        return {
+            "complete": True,
+            "phase": "canonicalized",
+            "ready_for_all_eligible_publication": True,
+            "execution_profile": FAST_ALL_ELIGIBLE_HANDOFF_PROFILE,
+            "source_snapshot": {
+                "generation": snapshot["generation"],
+                "manifest_path": snapshot["_manifest_path"],
+                "manifest_sha256": snapshot["_manifest_sha256"],
+                "database": database,
+                "checkpoint": artifacts["CHECKPOINT.json"],
+            },
+            "authority": event_payload,
+        }
+
     def finalize(self) -> dict[str, Any]:
         if self._phase() == "complete":
             return json.loads((self.output / "manifest.json").read_text(encoding="utf-8"))
@@ -6476,6 +6747,13 @@ class CurationBuilder:
         self.canonicalize()
         if stop_after_phase == "canonicalized":
             return {"complete": False, "phase": self._phase()}
+        if self.fast_all_eligible_handoff:
+            if stop_after_phase in ("selected", "emitted"):
+                raise CurationError(
+                    "Fast all-eligible handoff has no selected or emitted phase"
+                )
+            self.assign_leakage_safe_groups()
+            return self.finalize_all_eligible_handoff()
         self.assign_splits_and_quotas()
         if stop_after_phase == "selected":
             return {"complete": False, "phase": self._phase()}
@@ -6550,6 +6828,16 @@ def build_parser() -> argparse.ArgumentParser:
             "fail-closed immediately before publication"
         ),
     )
+    parser.add_argument(
+        "--fast-all-eligible-handoff",
+        action="store_true",
+        help=(
+            "fast-canonical policy only: assign leakage-safe groups, skip exact "
+            "quota selection and legacy decision emission, suppress periodic "
+            "full snapshots, and publish one final immutable snapshot for the "
+            "v7 all-eligible publisher"
+        ),
+    )
     parser.add_argument("--max-new-archives", type=int)
     parser.add_argument(
         "--recover-stale-cross-client-lease",
@@ -6599,6 +6887,7 @@ def main() -> int:
             defer_raw_archive_integrity_until_finalize=(
                 args.defer_raw_archive_integrity_until_finalize
             ),
+            fast_all_eligible_handoff=args.fast_all_eligible_handoff,
         ) as builder:
             result = builder.run(
                 max_new_archives=args.max_new_archives, stop_after_phase=args.stop_after_phase

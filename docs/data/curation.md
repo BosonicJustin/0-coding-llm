@@ -194,16 +194,16 @@ coverage scans. Quota cursors persist the exact
 selected rows are precisely the prefix ending at that cursor, including the
 terminal partial-document token count.
 
-Before the first inventory write, a durable storage preflight requires free
-scratch space for 3,072 projected bytes per document with a 2x safety factor,
-the transaction-sidecar reserve, and a 2 GB remaining floor. This projection
-was raised from 1,024 after a representative schema probe reached roughly
-1,438 bytes/document before decision shards, temp spill, sidecars,
-fragmentation, and real path lengths. At 51 million documents and a 10,000-row
-batch, the executable requirement is about 316 GB including sidecar and
-remaining-space floors. Provision at least 350 GB genuinely free (preferably a
-400+ GB device) and treat the emitted `required_free_bytes_at_measurement` as
-authoritative rather than relying on a marketed device size.
+Before the first inventory write, a durable storage preflight uses the measured
+v1 production peak: 67,824,914,432 database bytes for 51,328,930 documents.
+It rounds 1,321.378 bytes/document up to 1,322, applies a separate 2x safety
+factor, then adds the transaction-sidecar reserve and a 2 GB remaining floor.
+At the measured v1 document count and a 100,000-row batch, the executable gate
+is 144,267,290,920 bytes (134.36 GiB), versus 323,918,545,920 bytes under the
+obsolete synthetic projection. The complete observed provenance—including the
+4,132,940,952-byte maximum WAL—is frozen in the storage contract. Treat the
+run-specific `required_free_bytes_at_measurement` as authoritative because v2's
+final document count is determined by its completed report inventory.
 The sidecar reserve is the larger of 256 MiB and 64 KiB per configured batch
 row. Every bounded transaction records database, rollback-journal, WAL, free
 space, and row-count high/low-water marks in `storage_metrics`; a pre-commit

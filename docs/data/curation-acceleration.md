@@ -161,27 +161,24 @@ and mandatory final raw hashing. They do not replace a target-pod benchmark.
 
 ## Capacity and expected speed
 
-For the frozen inventory, the first-start admission requirement is exactly
-323,918,545,920 bytes (about 301.67 GiB): 315,364,945,920 bytes for the projected
-database including its 2x safety factor, 6,553,600,000 bytes for the bounded
-100,000-row transaction sidecar, and a 2,000,000,000-byte reserve. The 320 GiB
-rollout exposed 343,580,889,088 bytes free at admission, leaving a
-19,662,343,168-byte margin (about 18.31 GiB). Resumes credit authenticated
-database/WAL bytes already occupying that volume against the final projection;
-they never require room for a second complete local database. A larger local
-volume still leaves safer headroom for filesystem allocation and sorter
-variability.
+The stopped v1 production run measured a maximum 67,824,914,432-byte database
+over 51,328,930 documents and a maximum 4,132,940,952-byte WAL over 10,415
+committed transactions. The current admission contract rounds the measured
+1,321.378 bytes/document up to 1,322, applies a separate 2x safety factor, and
+retains the 6,553,600,000-byte bounded 100,000-row transaction sidecar plus a
+2,000,000,000-byte reserve. At the same document count, the first-start gate is
+therefore 144,267,290,920 bytes (134.36 GiB), rather than the obsolete
+323,918,545,920-byte synthetic gate. Resumes credit authenticated database/WAL
+bytes already occupying the local volume only against the projected database;
+they never pay for transaction or remaining-space reserves.
 
-An observed inventory density near 1,438 bytes/document would put one real
-database near 73 GB. Durable steady state then uses about 220 GB for the canonical
-database plus two recovery snapshots. The more conservative unsafetied contract
-projection is about 470 GB for those three copies. Canonical promotion briefly
-needs one additional independent copy and now has a separate fail-closed capacity
-check. A hard link is deliberately not used: mutating a later canonical database
-would otherwise mutate the supposedly immutable recovery snapshot through the
-shared inode. Exact free-space admission is repeated before every full snapshot,
-and the network volume must also retain raw archives, fingerprints, and final
-outputs.
+The all-eligible handoff profile suppresses periodic full NFS snapshots and
+publishes exactly one final immutable snapshot for the v7 publisher. It also
+skips the redundant canonical-database promotion copy, since the publisher
+binds the snapshot generation directly. Other curation profiles retain the
+canonical promotion and snapshot-retention behavior. Exact durable free-space
+admission still runs before the final full snapshot, and the network volume
+must also retain raw archives, fingerprints, and later outputs.
 
 Moving indexed random writes and WAL checkpoints off NFS should plausibly improve
 the database-heavy inventory phase by 5–20x and end-to-end curation by 3–10x,
