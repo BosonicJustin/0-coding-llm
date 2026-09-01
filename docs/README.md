@@ -10,6 +10,7 @@ the production runbook for ordered execution.
 - [Pre-training readiness checklist](operations/pretraining-checklist.md)
 - [Production runbook](operations/production-runbook.md)
 - [RunPod six-GPU pod qualification](operations/runpod-six-gpu-pod-qualification.md)
+- [Six-GPU geometry evidence producer](operations/six-gpu-geometry-evidence-producer.md)
 - [Final training-corpus qualification](operations/training-corpus-qualification.md)
 
 ## Data pipeline
