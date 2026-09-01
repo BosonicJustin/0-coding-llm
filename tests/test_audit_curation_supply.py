@@ -377,6 +377,17 @@ class SupplyAuditTest(unittest.TestCase):
         self.assertIn("FROM sqlite_master", source)
         self.assertNotIn("FROM sqlite_schema", source)
 
+    def test_primary_scan_plan_accepts_legacy_sqlite_wording_only(self) -> None:
+        self.assertTrue(MODULE._is_primary_documents_scan("SCAN d"))
+        self.assertTrue(
+            MODULE._is_primary_documents_scan("SCAN TABLE documents AS d")
+        )
+        self.assertFalse(
+            MODULE._is_primary_documents_scan(
+                "SCAN TABLE documents AS d USING INDEX documents_selection_v2"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

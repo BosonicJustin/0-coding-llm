@@ -695,13 +695,23 @@ def _configure_read_performance(connection: sqlite3.Connection) -> dict[str, Any
     }
 
 
+def _is_primary_documents_scan(detail: str) -> bool:
+    """Accept equivalent modern and legacy SQLite EQP wording."""
+
+    return detail in ("SCAN d", "SCAN TABLE documents AS d")
+
+
 def _supply_query_plan(connection: sqlite3.Connection) -> list[str]:
     plan = [
         str(row[3])
         for row in connection.execute("EXPLAIN QUERY PLAN " + SUPPLY_SQL)
     ]
-    document_scans = [detail for detail in plan if detail.startswith("SCAN d")]
-    if len(document_scans) != 1 or "USING INDEX" in document_scans[0]:
+    document_scans = [
+        detail
+        for detail in plan
+        if _is_primary_documents_scan(detail)
+    ]
+    if len(document_scans) != 1:
         raise SupplyAuditError(
             "eligible-supply query is not pinned to one primary-table documents scan: "
             f"{plan}"
