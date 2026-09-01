@@ -24,7 +24,337 @@ def _write_sidecar(path: Path) -> None:
     )
 
 
+def _qualified_hardware_payload(
+    *,
+    package_identity: dict[str, object],
+    git_identity: dict[str, object],
+    qualification_script: Path,
+    requirements_train: Path,
+    requirements_wandb: Path,
+) -> dict[str, object]:
+    gpu_uuids = [f"GPU-{index:032x}" for index in range(authority.WORLD_SIZE)]
+    devices = [
+        {
+            "visible_index": index,
+            "physical_index": index,
+            "uuid": uuid,
+            "name": "Fixture GPU",
+            "pci_bus_id": f"00000000:{index + 1:02x}:00.0",
+            "compute_capability": [9, 0],
+            "total_memory_bytes": 80 * 1024**3,
+            "available_memory_bytes": 79 * 1024**3,
+            "multiprocessor_count": 100,
+            "bf16_supported": True,
+        }
+        for index, uuid in enumerate(gpu_uuids)
+    ]
+    return {
+        "format": authority.HARDWARE_FORMAT,
+        "format_version": 1,
+        "status": "accepted",
+        "topology": "single-node",
+        "world_size": 6,
+        "gpu_count": 6,
+        "gpu_model": "Fixture GPU",
+        "gpu_memory_bytes": 80 * 1024**3,
+        "compute_capability": [9, 0],
+        "multiprocessor_count": 100,
+        "driver_version": "fixture-driver",
+        "cuda_runtime_version": "12.8",
+        "cudnn_version": "9.8.0",
+        "nccl_version": "2.25.1",
+        "torch_version": package_identity["torch_version"],
+        "bf16_supported": True,
+        "distributed_strategy": "ddp",
+        "created_utc": "2026-09-01T00:00:00+00:00",
+        "qualification": {
+            "format": authority.POD_QUALIFICATION_FORMAT,
+            "format_version": authority.POD_QUALIFICATION_VERSION,
+            "status": "pass",
+            "nvlink_policy": "observe",
+            "gpu": {
+                "devices": devices,
+                "driver_version": "fixture-driver",
+                "cuda_runtime_version": "12.8",
+                "cudnn_version": "9.8.0",
+                "nccl_version": "2.25.1",
+                "torch_version": package_identity["torch_version"],
+                "nccl_smoke": {
+                    "status": "pass",
+                    "backend": "nccl",
+                    "world_size": 6,
+                    "completed_ranks": 6,
+                    "all_reduce_sum": 21,
+                    "all_reduce_dtype": "bfloat16",
+                    "local_ranks": list(range(6)),
+                    "device_uuids_in_rank_order": gpu_uuids,
+                    "rank_results_sha256": "a" * 64,
+                },
+            },
+            "host": {
+                "data": {"status": "pass"},
+                "environment": {"secrets_recorded": False},
+                "wandb": {"credential_value_recorded": False},
+                "package_lock": package_identity,
+            },
+            "source": {
+                "qualification_script": authority._artifact(
+                    qualification_script, label="fixture qualifier"
+                ),
+                "requirements_train": authority._artifact(
+                    requirements_train, label="fixture train requirements"
+                ),
+                "requirements_wandb": authority._artifact(
+                    requirements_wandb, label="fixture W&B requirements"
+                ),
+                "git": git_identity,
+                "argv": [
+                    str(qualification_script),
+                    "verify",
+                    "--package-lock",
+                    str(package_identity["lock"]["path"]),
+                ],
+            },
+        },
+    }
+
+
+def _write_corpus_qualification(
+    *,
+    root: Path,
+    corpus_root: Path,
+    tokenizer_root: Path,
+    train_manifest: Path,
+    validation_manifest: Path,
+    tokenizer_manifest_sha256: str,
+    vocabulary_sha256: str,
+    vocab_size: int = 49_152,
+    eos_token_id: int = 0,
+    sequence_length: int = 4096,
+) -> Path:
+    corpus_manifest = corpus_root / "manifest.json"
+    _write_json(corpus_manifest, {"fixture": "corpus"})
+    corpus_manifest_sidecar = corpus_root / "manifest.sha256"
+    corpus_manifest_sidecar.write_text(
+        f"{authority.sha256_file(corpus_manifest)}  manifest.json\n",
+        encoding="ascii",
+    )
+    test_manifest = corpus_root / "test-manifest.json"
+    _write_json(test_manifest, {"split": "test"})
+    order_paths = {
+        "train": train_manifest,
+        "validation": validation_manifest,
+        "test": test_manifest,
+    }
+    model = authority._validate_model(
+        vocab_size=vocab_size,
+        sequence_length=sequence_length,
+        activation_checkpointing=False,
+    )["config"]
+    project_root = Path(authority.__file__).resolve().parents[1]
+    validator_paths = {
+        "qualification": project_root / "scripts" / "qualify_training_corpus.py",
+        "pretrain_data": project_root / "pretrain" / "data.py",
+        "materialize_contract": project_root / "pretrain" / "materialize.py",
+        "tokenizer_identity": project_root / "pretrain" / "tokenizer_identity.py",
+        "model": project_root / "pretrain" / "model.py",
+        "model_config_loader": project_root / "pretrain" / "hf_export.py",
+    }
+    provenance_root = corpus_root / "provenance"
+    provenance_root.mkdir(exist_ok=True)
+    provenance: dict[str, object] = {}
+    for name in ("source", "policy", "tokenizer", "fingerprints"):
+        provenance_path = provenance_root / f"{name}.json"
+        _write_json(provenance_path, {"fixture": name})
+        provenance[name] = {
+            "path": provenance_path.relative_to(corpus_root).as_posix(),
+            "bytes": provenance_path.stat().st_size,
+            "sha256": authority.sha256_file(provenance_path),
+        }
+    provenance["bindings"] = {
+        "selection_manifest_sha256": "1" * 64,
+        "tokenizer_manifest_sha256": tokenizer_manifest_sha256,
+        "materialization_curation_policy_sha256": "2" * 64,
+        "source_curation_policy_sha256": "3" * 64,
+        "split_authority": "completed-curation-decision-shards",
+        "authenticated_leakage_audit": {
+            "content_hashes_in_multiple_splits": 0,
+            "canonical_clusters_in_multiple_splits": 0,
+            "source_groups_in_multiple_splits": 0,
+            "cross_bucket_code_repo_groups_in_multiple_splits": 0,
+        },
+        "raw_archive_count": 1,
+        "raw_archive_inventory_sha256": "4" * 64,
+    }
+    receipt = {
+        "format": authority.CORPUS_QUALIFICATION_FORMAT,
+        "format_version": authority.CORPUS_QUALIFICATION_VERSION,
+        "status": "pass",
+        "started_utc": "2026-09-01T00:00:00+00:00",
+        "completed_utc": "2026-09-01T00:00:01+00:00",
+        "elapsed_seconds": 1.0,
+        "checks": {name: True for name in authority.CORPUS_QUALIFICATION_CHECKS},
+        "acceptance_policy": {
+            "world_size": 6,
+            "expected_input_tokens": dict(authority.EXPECTED_INPUT_TOKEN_TARGETS),
+            "expected_input_token_weights": dict(authority.EXPECTED_INPUT_TOKEN_WEIGHTS),
+            "maximum_target_shortfall_fraction": 1e-3,
+            "mixture_absolute_tolerance": 1e-6,
+            "sample_rows_per_domain": 8,
+            "sample_seed": 20_260_901,
+            "full_packed_payload_checksums": True,
+            "full_packed_semantic_scan": True,
+            "full_order_uniqueness_scan": True,
+            "full_document_index_scan": True,
+            "exact_disk_backed_split_identity_scan": True,
+        },
+        "corpus": {
+            "manifest_path": str(corpus_manifest.resolve()),
+            "manifest_bytes": corpus_manifest.stat().st_size,
+            "manifest_sha256": authority.sha256_file(corpus_manifest),
+            "sidecar_path": str(corpus_manifest_sidecar.resolve()),
+            "sidecar_sha256": authority.sha256_file(corpus_manifest_sidecar),
+            "stable_tree_inventory": authority._current_tree_identity(
+                corpus_root, label="fixture corpus"
+            ),
+        },
+        "tokenizer": {
+            "root": str(tokenizer_root.resolve()),
+            "manifest_path": str(
+                (tokenizer_root / "TOKENIZER_MANIFEST.json").resolve()
+            ),
+            "manifest_sha256": tokenizer_manifest_sha256,
+            "vocabulary_sha256": vocabulary_sha256,
+            "vocab_size": vocab_size,
+            "eos_token_id": eos_token_id,
+            "stable_tree_inventory": authority._current_tree_identity(
+                tokenizer_root, label="fixture tokenizer"
+            ),
+        },
+        "model": {
+            "source": "pretrain.model.ModelConfig defaults",
+            "sha256": None,
+            "config": model,
+        },
+        "validator": {
+            "sources": {
+                name: authority._artifact(path, label=f"fixture validator {name}")
+                for name, path in validator_paths.items()
+            },
+            "runtime": {
+                "python_executable": str(Path(sys.executable).resolve()),
+                "python_version": sys.version,
+                "numpy_version": "2.2.6",
+                "torch_version": "2.7.1+cpu",
+                "sqlite_version": "3.46.0",
+                "tokenizers_version": "0.21.4",
+                "zstandard_version": "0.23.0",
+                "packed_format_version": authority.training_data.FORMAT_VERSION,
+                "order_format_version": authority.training_data.ORDER_FORMAT_VERSION,
+            },
+        },
+        "common_data_contract": {
+            "sequence_length": sequence_length,
+            "vocab_size": vocab_size,
+            "eos_token_id": eos_token_id,
+            "tokenizer_manifest_sha256": tokenizer_manifest_sha256,
+        },
+        "provenance": provenance,
+        "splits": {
+            split: {
+                "order": {
+                    "manifest": path.relative_to(corpus_root).as_posix(),
+                    "manifest_sha256": authority.sha256_file(path),
+                },
+                "packed": {
+                    domain: {"fixture": True}
+                    for domain in authority.training_data.DOMAIN_ORDER
+                },
+                "deterministic_samples": {
+                    domain: {"fixture": True}
+                    for domain in authority.training_data.DOMAIN_ORDER
+                },
+            }
+            for split, path in order_paths.items()
+        },
+        "document_indexes": {
+            split: {
+                domain: {"fixture": True}
+                for domain in authority.training_data.DOMAIN_ORDER
+            }
+            for split in order_paths
+        },
+        "split_identity_audit": {
+            "method": "exact-sqlite-without-rowid-split-bitmask-union",
+            "identity_kinds": ["source", "split_group"],
+            "cross_split_collisions": {"source": 0, "split_group": 0},
+            "identity_occurrences": {"source": 3, "split_group": 3},
+            "unique_identities": {"source": 3, "split_group": 3},
+            "collision_examples": {"source": [], "split_group": []},
+            "scratch_database_bytes": 4096,
+        },
+    }
+    output = root / "corpus-qualification" / "qualification.json"
+    output.parent.mkdir()
+    _write_json(output, receipt)
+    _write_sidecar(output)
+    return output
+
+
+def _minimal_corpus_qualification(
+    root: Path,
+    *,
+    extra_corpus_files: dict[str, bytes] | None = None,
+) -> tuple[Path, Path, Path]:
+    corpus_root = root / "corpus"
+    corpus_root.mkdir()
+    train_manifest = corpus_root / "train-manifest.json"
+    validation_manifest = corpus_root / "validation-manifest.json"
+    _write_json(train_manifest, {"split": "train"})
+    _write_json(validation_manifest, {"split": "validation"})
+    for relative, payload in (extra_corpus_files or {}).items():
+        destination = corpus_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+    tokenizer_root = root / "tokenizer"
+    tokenizer_root.mkdir()
+    tokenizer_manifest = tokenizer_root / "TOKENIZER_MANIFEST.json"
+    tokenizer_manifest.write_text("{}", encoding="utf-8")
+    tokenizer_digest = authority.sha256_file(tokenizer_manifest)
+    qualification = _write_corpus_qualification(
+        root=root,
+        corpus_root=corpus_root,
+        tokenizer_root=tokenizer_root,
+        train_manifest=train_manifest,
+        validation_manifest=validation_manifest,
+        tokenizer_manifest_sha256=tokenizer_digest,
+        vocabulary_sha256="e" * 64,
+    )
+    return qualification, corpus_root, tokenizer_root
+
+
 class RunAuthorityUnitTests(unittest.TestCase):
+    def test_corpus_qualification_accepts_real_qualifier_generation(self) -> None:
+        from scripts.qualify_training_corpus import publish_receipt, qualify_corpus
+        from tests.test_qualify_training_corpus import QualificationFixture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = QualificationFixture(Path(temporary))
+            config = fixture.config()
+            payload = qualify_corpus(config)
+            receipt, _ = publish_receipt(config.output, payload)
+            with mock.patch.object(
+                authority,
+                "EXPECTED_INPUT_TOKEN_TARGETS",
+                dict(config.expected_targets),
+            ), mock.patch.object(
+                authority,
+                "MINIMUM_SAMPLE_ROWS_PER_DOMAIN",
+                config.sample_rows_per_domain,
+            ):
+                inspected = authority.inspect_corpus_qualification(receipt)
+            self.assertEqual(inspected["receipt"]["status"], "pass")
+
     def test_clean_git_identity_rejects_untracked_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -83,8 +413,138 @@ class RunAuthorityUnitTests(unittest.TestCase):
                 "distributed_strategy": "ddp",
             }
             _write_json(path, payload)
+            _write_sidecar(path)
             with self.assertRaisesRegex(authority.RunAuthorityError, "exactly six"):
                 authority.inspect_hardware_contract(path)
+
+    def test_hardware_contract_requires_passing_qualified_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            (project / "scripts").mkdir(parents=True)
+            qualifier = project / "scripts" / "qualify_runpod_pod.py"
+            qualifier.write_text("# qualifier\n", encoding="utf-8")
+            train_requirements = project / "requirements-train.txt"
+            train_requirements.write_text("torch==fixture\n", encoding="utf-8")
+            wandb_requirements = project / "requirements-wandb.txt"
+            wandb_requirements.write_text("wandb==fixture\n", encoding="utf-8")
+            lock = root / "lock.json"
+            _write_json(lock, {"fixture": True})
+            executable = Path(sys.executable).resolve()
+            package = {
+                "lock": authority._artifact(lock, label="fixture lock"),
+                "python": {
+                    "implementation": "cpython",
+                    "version": "3.12.11",
+                    "executable": str(executable),
+                    "executable_bytes": executable.stat().st_size,
+                    "executable_sha256": authority.sha256_file(executable),
+                },
+                "packages_sha256": "1" * 64,
+                "package_count": 3,
+                "torch_version": "2.7.1+cu128",
+                "numpy_version": "2.2.6",
+            }
+            git = {
+                "project_root": str(project.resolve()),
+                "commit": "2" * 40,
+                "tree": "3" * 40,
+                "head_archive_sha256": "4" * 64,
+                "head_archive_bytes": 10240,
+                "branch": "main",
+                "origin_sha256": None,
+                "clean": True,
+            }
+            payload = _qualified_hardware_payload(
+                package_identity=package,
+                git_identity=git,
+                qualification_script=qualifier,
+                requirements_train=train_requirements,
+                requirements_wandb=wandb_requirements,
+            )
+            payload["qualification"]["status"] = "fail"
+            path = root / "hardware.json"
+            _write_json(path, payload)
+            _write_sidecar(path)
+            with self.assertRaisesRegex(authority.RunAuthorityError, "did not pass"):
+                authority.inspect_hardware_contract(path)
+
+            payload["qualification"]["status"] = "pass"
+            _write_json(path, payload)
+            _write_sidecar(path)
+            inspected = authority.inspect_hardware_contract(path)
+            changed_package = dict(package)
+            changed_package["packages_sha256"] = "5" * 64
+            with self.assertRaisesRegex(authority.RunAuthorityError, "packages_sha256"):
+                authority._validate_qualification_provenance(
+                    hardware=inspected,
+                    environment=changed_package,
+                    git=git,
+                    project_root=project,
+                )
+
+    def test_corpus_qualification_rejects_failed_or_torn_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            qualification, _, _ = _minimal_corpus_qualification(Path(temporary))
+            receipt = json.loads(qualification.read_text(encoding="utf-8"))
+            receipt["status"] = "fail"
+            _write_json(qualification, receipt)
+            _write_sidecar(qualification)
+            with self.assertRaisesRegex(authority.RunAuthorityError, "did not pass"):
+                authority.inspect_corpus_qualification(qualification)
+
+            receipt["status"] = "pass"
+            _write_json(qualification, receipt)
+            qualification.with_name(f"{qualification.name}.sha256").write_text(
+                f"{'0' * 64}  {qualification.name}\n", encoding="ascii"
+            )
+            with self.assertRaisesRegex(authority.RunAuthorityError, "SHA-256 sidecar"):
+                authority.inspect_corpus_qualification(qualification)
+
+    def test_corpus_qualification_rejects_document_index_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            relative = "provenance/documents/test/python/archive-000000.jsonl.zst"
+            qualification, corpus_root, _ = _minimal_corpus_qualification(
+                root, extra_corpus_files={relative: b"certified document index"}
+            )
+            authority.inspect_corpus_qualification(qualification)
+            (corpus_root / relative).write_bytes(b"mutated document index")
+            with self.assertRaisesRegex(
+                authority.RunAuthorityError, "corpus tree identity changed"
+            ):
+                authority.inspect_corpus_qualification(qualification)
+
+    def test_corpus_qualification_rejects_added_corpus_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            qualification, corpus_root, _ = _minimal_corpus_qualification(
+                Path(temporary)
+            )
+            authority.inspect_corpus_qualification(qualification)
+            (corpus_root / "unexpected.bin").write_bytes(b"not qualified")
+            with self.assertRaisesRegex(
+                authority.RunAuthorityError, "corpus tree identity changed"
+            ):
+                authority.inspect_corpus_qualification(qualification)
+
+    def test_corpus_qualification_rejects_loose_policy_or_changed_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            qualification, _, _ = _minimal_corpus_qualification(Path(temporary))
+            receipt = json.loads(qualification.read_text(encoding="utf-8"))
+            receipt["acceptance_policy"]["maximum_target_shortfall_fraction"] = 0.5
+            _write_json(qualification, receipt)
+            _write_sidecar(qualification)
+            with self.assertRaisesRegex(authority.RunAuthorityError, "too loose"):
+                authority.inspect_corpus_qualification(qualification)
+
+            receipt["acceptance_policy"]["maximum_target_shortfall_fraction"] = 1e-3
+            receipt["validator"]["sources"]["qualification"]["sha256"] = "f" * 64
+            _write_json(qualification, receipt)
+            _write_sidecar(qualification)
+            with self.assertRaisesRegex(
+                authority.RunAuthorityError, "validator source changed"
+            ):
+                authority.inspect_corpus_qualification(qualification)
 
     def test_cost_cap_is_fail_closed(self) -> None:
         with self.assertRaisesRegex(authority.RunAuthorityError, "exceeds authorized cap"):
@@ -300,36 +760,59 @@ class RunAuthorityMutationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             project = root / "project"
+            corpus_root = root / "corpus"
+            corpus_root.mkdir()
             (project / "scripts").mkdir(parents=True)
             launcher_source = project / "scripts" / "launch_pretraining.py"
             launcher_source.write_text("# fixture\n", encoding="utf-8")
+            qualification_script = project / "scripts" / "qualify_runpod_pod.py"
+            qualification_script.write_text("# fixture qualifier\n", encoding="utf-8")
+            requirements_train = project / "requirements-train.txt"
+            requirements_train.write_text("torch==test\n", encoding="utf-8")
+            requirements_wandb = project / "requirements-wandb.txt"
+            requirements_wandb.write_text("wandb==test\n", encoding="utf-8")
             package_lock = root / "package-lock.json"
             _write_json(package_lock, {"fixture": True})
-            hardware = root / "hardware.json"
-            hardware_payload = {
-                "format": authority.HARDWARE_FORMAT,
-                "format_version": 1,
-                "status": "accepted",
-                "topology": "single-node",
-                "world_size": 6,
-                "gpu_count": 6,
-                "gpu_model": "Fixture GPU",
-                "gpu_memory_bytes": 80 * 1024**3,
-                "compute_capability": [9, 0],
-                "multiprocessor_count": 100,
-                "driver_version": "fixture",
-                "cuda_runtime_version": "fixture",
-                "cudnn_version": "fixture",
-                "nccl_version": "fixture",
+            package_identity = {
+                "lock": authority._artifact(package_lock, label="fixture lock"),
+                "python": {
+                    "implementation": "cpython",
+                    "version": "3.12.11",
+                    "executable": str(Path(sys.executable).resolve()),
+                    "executable_bytes": Path(sys.executable).resolve().stat().st_size,
+                    "executable_sha256": authority.sha256_file(
+                        Path(sys.executable).resolve()
+                    ),
+                },
+                "packages_sha256": "b" * 64,
+                "package_count": 3,
                 "torch_version": "test-torch",
-                "bf16_supported": True,
-                "distributed_strategy": "ddp",
+                "numpy_version": "test-numpy",
             }
+            git_identity = {
+                "project_root": str(project.resolve()),
+                "commit": "c" * 40,
+                "tree": "d" * 40,
+                "head_archive_sha256": "a" * 64,
+                "head_archive_bytes": 10240,
+                "branch": "main",
+                "origin_sha256": None,
+                "clean": True,
+            }
+            hardware = root / "hardware.json"
+            hardware_payload = _qualified_hardware_payload(
+                package_identity=package_identity,
+                git_identity=git_identity,
+                qualification_script=qualification_script,
+                requirements_train=requirements_train,
+                requirements_wandb=requirements_wandb,
+            )
             _write_json(hardware, hardware_payload)
-            train_manifest = root / "train-manifest.json"
-            validation_manifest = root / "validation-manifest.json"
-            train_payload = root / "train-order.bin"
-            validation_payload = root / "validation-order.bin"
+            _write_sidecar(hardware)
+            train_manifest = corpus_root / "train-manifest.json"
+            validation_manifest = corpus_root / "validation-manifest.json"
+            train_payload = corpus_root / "train-order.bin"
+            validation_payload = corpus_root / "validation-order.bin"
             train_payload.write_bytes(b"train-order")
             validation_payload.write_bytes(b"validation-order")
             _write_json(train_manifest, {"split": "train"})
@@ -480,29 +963,20 @@ class RunAuthorityMutationTest(unittest.TestCase):
                     ),
                 }
 
-            package_identity = {
-                "lock": authority._artifact(package_lock, label="fixture lock"),
-                "python": {"fixture": True},
-                "packages_sha256": "b" * 64,
-                "package_count": 3,
-                "torch_version": "test-torch",
-                "numpy_version": "test-numpy",
-            }
-            git_identity = {
-                "project_root": str(project.resolve()),
-                "commit": "c" * 40,
-                "tree": "d" * 40,
-                "head_archive_sha256": "a" * 64,
-                "head_archive_bytes": 10240,
-                "branch": "main",
-                "origin_sha256": None,
-                "clean": True,
-            }
             tokenizer_identity = SimpleNamespace(
                 manifest_path=tokenizer_manifest,
                 manifest_sha256=tokenizer_digest,
                 vocabulary_sha256="e" * 64,
                 vocab_size=49_152,
+            )
+            corpus_qualification = _write_corpus_qualification(
+                root=root,
+                corpus_root=corpus_root,
+                tokenizer_root=tokenizer_root,
+                train_manifest=train_manifest,
+                validation_manifest=validation_manifest,
+                tokenizer_manifest_sha256=tokenizer_digest,
+                vocabulary_sha256="e" * 64,
             )
             patches = (
                 mock.patch.object(authority, "inspect_clean_git", return_value=git_identity),
@@ -523,6 +997,7 @@ class RunAuthorityMutationTest(unittest.TestCase):
                     container_image_digest=f"sha256:{'f' * 64}",
                     hardware_contract=hardware,
                     geometry_receipt=geometry,
+                    corpus_qualification=corpus_qualification,
                     train_order_manifest=train_manifest,
                     validation_order_manifest=validation_manifest,
                     train_certification=train_cert,

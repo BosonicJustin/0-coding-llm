@@ -142,6 +142,20 @@ run-authority builder remains a separate mandatory step: it binds this data to
 the clean Git revision, package lock, container digest, six-GPU hardware
 qualification, training recipe, launcher argv, and cost authority.
 
+Pass the receipt itself to the authority builder:
+
+```bash
+--corpus-qualification \
+  /workspace/dataset-other-code-topup-v2/qualification/corpus-v2/qualification.json
+```
+
+Authority collection and every launch-time authority validation re-authenticate
+the exact receipt pair, re-hash the corpus manifest, provenance, and all split
+order identities, recompute the corpus/tokenizer tree inventories, and re-hash
+the six recorded validator sources. It rejects `status: fail`, a loosened
+production acceptance policy, changed test/document-index bytes, an added file,
+or a tokenizer/model/context/EOS identity that disagrees with the run inputs.
+
 ## Runtime and capacity
 
 The token/start and order scans are sequential and checksum every training

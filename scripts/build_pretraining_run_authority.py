@@ -50,8 +50,19 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="operator-supplied immutable digest in sha256:<64 lowercase hex> form",
     )
-    build.add_argument("--hardware-contract", type=Path, required=True)
+    build.add_argument(
+        "--hardware-contract",
+        type=Path,
+        required=True,
+        help="qualified six-GPU receipt with its exact adjacent .sha256 sidecar",
+    )
     build.add_argument("--geometry-receipt", type=Path, required=True)
+    build.add_argument(
+        "--corpus-qualification",
+        type=Path,
+        required=True,
+        help="passing materialized-corpus qualification JSON with exact adjacent sidecar",
+    )
     build.add_argument("--train-order-manifest", type=Path, required=True)
     build.add_argument("--validation-order-manifest", type=Path, required=True)
     build.add_argument("--train-certification", type=Path, required=True)
@@ -97,6 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 container_image_digest=args.container_image_digest,
                 hardware_contract=args.hardware_contract,
                 geometry_receipt=args.geometry_receipt,
+                corpus_qualification=args.corpus_qualification,
                 train_order_manifest=args.train_order_manifest,
                 validation_order_manifest=args.validation_order_manifest,
                 train_certification=args.train_certification,

@@ -61,16 +61,26 @@ correctness, throughput, or network-volume latency.
 
 ## 2. Prepare the final pod
 
+Use the exact environment, mount, ulimit, NCCL-topology, and immutable hardware
+receipt gate in
+[runpod-six-gpu-pod-qualification.md](runpod-six-gpu-pod-qualification.md).
+Its receipt is the `--hardware-contract` input used later in this checklist.
+
 1. Install the locked environment in the final container.
 2. Expose exactly six homogeneous GPUs; do not rely on an extra visible device.
 3. Copy packed data from the network volume to local NVMe.
 4. Stop all writers and expose that final local copy through a read-only bind
    mount. Ordinary file permissions are insufficient.
 5. Keep checkpoints, W&B offline files, certifications, and authority files on
-   the network volume. Reserve at least two measured mature checkpoint
-   generations plus operational headroom.
+   the network volume. Reserve the atomic-rotation peak of three measured
+   mature checkpoint generations (latest, previous, and the next temporary
+   generation), plus at least `max(1 GiB, 10% of one generation)` headroom.
 6. Certify train and validation with `scripts/certify_pretraining_data.py`.
    Preserve each JSON receipt and exact `.sha256` sidecar.
+7. Run `scripts/qualify_training_corpus.py` against the final read-only local
+   corpus and tokenizer location. Preserve the fresh passing generation. A
+   qualification made before copying from the network volume is not valid for
+   the copied tree because the gate binds filesystem identity as well as bytes.
 
 ## 3. Run the GPU-only gates
 
@@ -150,8 +160,8 @@ but not sufficient; it does not replace the GPU gates above.
 
 ## 5. Authorize and execute exactly once
 
-Create the package lock, hardware contract, accepted-geometry receipt, training
-recipe, and canonical launcher argv as described in
+Create the package lock, hardware contract, final corpus-qualification receipt,
+accepted-geometry receipt, training recipe, and canonical launcher argv as described in
 [pretraining-run-authority.md](../training/pretraining-run-authority.md). The
 canonical argv must:
 

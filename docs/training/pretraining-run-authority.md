@@ -24,6 +24,10 @@ default, or projected cost over the operator cap prevents authorization.
   global microbatch size, accumulation, workers, compile/activation-checkpoint
   decisions, BF16/FP32 policy, six-GPU throughput, memory, checkpoint latency,
   input-wait fraction, scaling efficiency, and soak length;
+- the exact passing final-corpus qualification generation, including its
+  receipt and sidecar, corpus manifest and sidecar, mutation-sensitive corpus
+  and tokenizer tree inventories, production 40/40/20 and token-budget policy,
+  all train/validation/test evidence, and the exact qualifier source/runtime;
 - fully checksummed train and validation order manifests and order payloads;
 - passing full-data certification receipts and sidecars for both splits, bound
   to the current validator sources;
@@ -84,8 +88,12 @@ training dependency floors (`torch>=2.6`, `numpy>=2,<3`, and
 
 ### Six-GPU hardware/runtime contract
 
-This operator-reviewed JSON describes the one allowed topology. Additional
-audit metadata is allowed, but these fields are mandatory:
+This qualified JSON describes the one allowed topology. It is write-once and
+must have an adjacent exact `.sha256` sidecar using the same two-space format
+shown for the accepted-geometry receipt below. The RunPod pod qualifier
+publishes both files and the authority builder rejects a missing, stale, or
+malformed sidecar. Additional audit metadata is allowed, but these fields are
+mandatory:
 
 ```json
 {
@@ -112,6 +120,25 @@ audit metadata is allowed, but these fields are mandatory:
 The exact values must come from the rented pod; the example GPU details are
 illustrative, not defaults.
 
+### Final corpus qualification
+
+Pass the exact `qualification.json` produced by
+`scripts/qualify_training_corpus.py`; do not copy fields into a new JSON. Its
+generation directory must contain exactly `qualification.json` and
+`qualification.json.sha256`, and the receipt must have `status: pass`. The
+builder re-hashes the pair, corpus manifest and sidecar, every provenance
+artifact, all three order manifests, and the six qualifier implementation
+files. It also recomputes the qualifier's mutation-sensitive inventory for the
+complete corpus and tokenizer trees, then joins the qualified train/validation
+orders, tokenizer identity, model shape, EOS, vocabulary, and context length to
+the other run-authority inputs.
+
+The accepted policy permits at most the production defaults of 0.1% token
+shortfall and `1e-6` absolute mixture error, requires at least eight sampled
+rows per split/domain, and requires every full checksum, semantic, uniqueness,
+document-index, and exact split-identity scan. A moved or copied corpus has new
+filesystem identity and must be qualified at its final training location.
+
 ### Accepted geometry receipt
 
 The full six-GPU qualification job must publish a write-once receipt and an
@@ -133,7 +160,7 @@ Minimum receipt schema:
   "validation_order_manifest_sha256": "<validation manifest SHA-256>",
   "accepted": {
     "global_microbatch_rows": 6,
-    "gradient_accumulation_steps": 32,
+    "gradient_accumulation_steps": 2,
     "workers": 4,
     "overfit_batch_rows": 6,
     "compile_model": false,
@@ -142,20 +169,40 @@ Minimum receipt schema:
     "parameter_dtype": "float32"
   },
   "measurements": {
-    "aggregate_input_tokens_per_second": "<measured decimal>",
+    "aggregate_input_tokens_per_second": "1000",
     "peak_memory_allocated_bytes_per_gpu": 1,
     "peak_memory_reserved_bytes_per_gpu": 1,
     "minimum_free_memory_bytes_per_gpu": 1,
     "checkpoint_seconds": "<measured decimal>",
     "data_wait_fraction": "<0..1>",
     "scaling_efficiency": "<0..1>",
-    "soak_steps": 100
+    "soak_steps": 100,
+    "throughput_measurement": {
+      "scope": "end-to-end-including-validation-checkpoint-wandb-and-resume",
+      "timer": "time.monotonic_ns",
+      "counter": "trainer.consumed_input_tokens",
+      "start_consumed_input_tokens": 0,
+      "end_consumed_input_tokens": 4915200,
+      "elapsed_wall_time_ns": 4915200000000,
+      "validation_events": 1,
+      "checkpoint_events": 1,
+      "wandb_log_events": 1,
+      "resume_verified": true
+    }
   }
 }
 ```
 
 Replace every illustrative value with a measured value. Global microbatch rows
-must be divisible by six and must exactly match the frozen training order.
+must be divisible by six and must exactly match the frozen training order. The
+external monotonic interval must include validation, checkpoint publication,
+offline-W&B logging, and a verified six-rank resume. Require at least 100
+optimizer updates; at least one validation, checkpoint, and W&B event; a token
+delta exactly equal to `soak_steps * global_microbatch_rows *
+gradient_accumulation_steps * sequence_length`; and reported throughput within
+one part per million of token delta divided by elapsed wall time. Scaling
+efficiency must be at least `0.70`, data-wait fraction at most `0.05`, and free
+memory on every GPU at least `max(8 GiB, 10% of physical memory)`.
 
 ### Training recipe
 
@@ -259,11 +306,12 @@ python scripts/build_pretraining_run_authority.py build \
   --container-image-digest sha256:<64-lowercase-hex> \
   --hardware-contract /network-volume/run-evidence/hardware.json \
   --geometry-receipt /network-volume/run-evidence/accepted-geometry.json \
-  --train-order-manifest /network-volume/packed/train/order/manifest.json \
-  --validation-order-manifest /network-volume/packed/validation/order/manifest.json \
+  --corpus-qualification /local-data/qualification/corpus-v2/qualification.json \
+  --train-order-manifest /local-data/corpus/orders/train/manifest.json \
+  --validation-order-manifest /local-data/corpus/orders/validation/manifest.json \
   --train-certification /network-volume/run-evidence/train-certification.json \
   --validation-certification /network-volume/run-evidence/validation-certification.json \
-  --tokenizer-root /network-volume/tokenizer \
+  --tokenizer-root /local-data/tokenizer \
   --training-recipe /network-volume/run-evidence/training-recipe.json \
   --launcher-argv-json /network-volume/run-evidence/launcher-argv.json \
   --measured-input-tokens-per-second <exact-receipt-value> \
@@ -292,8 +340,9 @@ canonical argv digest is the authorized digest before starting torchrun.
 2. Build succeeds only from the exact clean commit intended for the run.
 3. Validation succeeds on the untouched authority in the final container.
 4. On disposable copies, changing one byte in each of the recipe, argv, order,
-   certification, geometry, hardware, tokenizer, or package-lock inputs causes
-   validation to fail.
+   corpus qualification, corpus document index, certification, geometry,
+   hardware, tokenizer, or package-lock inputs causes validation to fail;
+   adding a file anywhere under the qualified corpus also fails.
 5. Adding an untracked file or changing `HEAD` causes validation to fail.
 6. Changing `--nproc-per-node`, a recipe value, an evidence path, or an explicit
    activation/fused flag in argv causes build to fail.

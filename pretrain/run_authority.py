@@ -38,12 +38,44 @@ AUTHORITY_FORMAT = "immutable-pretraining-run-authority"
 AUTHORITY_VERSION = 1
 PACKAGE_LOCK_FORMAT = "pretraining-python-package-lock"
 HARDWARE_FORMAT = "pretraining-six-gpu-hardware-runtime"
+POD_QUALIFICATION_FORMAT = "runpod-six-gpu-pod-qualification"
+POD_QUALIFICATION_VERSION = 1
+CORPUS_QUALIFICATION_FORMAT = "materialized-pretraining-corpus-qualification"
+CORPUS_QUALIFICATION_VERSION = 1
 GEOMETRY_FORMAT = "pretraining-accepted-geometry"
 RECIPE_FORMAT = "pretraining-training-recipe"
 CERTIFICATION_FORMAT = "production-pretraining-full-data-validation"
 WORLD_SIZE = 6
 MODEL_SIZE = "1.3b"
 EXPECTED_PARAMETER_COUNT = 1_283_557_376
+EXPECTED_INPUT_TOKEN_TARGETS = {
+    "train": 52_580_000_000,
+    "validation": 500_000_000,
+    "test": 500_000_000,
+}
+EXPECTED_INPUT_TOKEN_WEIGHTS = {"python": 0.4, "other_code": 0.4, "english": 0.2}
+MAXIMUM_TARGET_SHORTFALL_FRACTION = Decimal("0.001")
+MAXIMUM_MIXTURE_ABSOLUTE_TOLERANCE = Decimal("0.000001")
+MINIMUM_SAMPLE_ROWS_PER_DOMAIN = 8
+CORPUS_QUALIFICATION_CHECKS = frozenset(
+    {
+        "authenticated_corpus_manifest_and_sidecar",
+        "authenticated_provenance",
+        "tokenizer_model_and_corpus_compatible",
+        "all_splits_and_domains_present",
+        "orders_checksum_unique_and_in_range",
+        "packed_shards_sizes_checksums_and_token_ranges",
+        "boundary_bits_and_loss_masks_consistent",
+        "no_padded_or_partial_training_rows",
+        "exact_token_budgets_within_tolerance",
+        "realized_mixture_within_tolerance",
+        "document_offsets_and_totals_consistent",
+        "source_and_group_identities_disjoint_across_splits",
+        "deterministic_random_reads",
+        "sufficient_rows_for_six_rank_ddp",
+        "stable_corpus_identity_during_qualification",
+    }
+)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _PACKAGE_NORMALIZER = re.compile(r"[-_.]+")
@@ -355,8 +387,303 @@ def inspect_package_lock(path: str | Path) -> dict[str, Any]:
     }
 
 
+def _recorded_artifact(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"path", "bytes", "sha256"}:
+        raise RunAuthorityError(
+            f"{label} must contain exactly path, bytes, and sha256"
+        )
+    path = value["path"]
+    if not isinstance(path, str) or not path or not Path(path).is_absolute():
+        raise RunAuthorityError(f"{label} path must be absolute")
+    if not _plain_int(value["bytes"], minimum=1):
+        raise RunAuthorityError(f"{label} bytes must be positive")
+    _require_sha256(value["sha256"], field=f"{label} sha256")
+    return dict(value)
+
+
+def _validate_qualification_git(value: Any) -> dict[str, Any]:
+    required = {
+        "project_root",
+        "commit",
+        "tree",
+        "head_archive_sha256",
+        "head_archive_bytes",
+        "branch",
+        "origin_sha256",
+        "clean",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise RunAuthorityError("Pod qualification lacks an exact clean-Git identity")
+    if value["clean"] is not True:
+        raise RunAuthorityError("Pod qualification source tree was not clean")
+    if not isinstance(value["project_root"], str) or not Path(
+        value["project_root"]
+    ).is_absolute():
+        raise RunAuthorityError("Pod qualification Git root must be absolute")
+    for field in ("commit", "tree"):
+        if not isinstance(value[field], str) or _GIT_OBJECT.fullmatch(value[field]) is None:
+            raise RunAuthorityError(f"Pod qualification Git {field} is invalid")
+    _require_sha256(
+        value["head_archive_sha256"], field="pod qualification Git archive sha256"
+    )
+    if not _plain_int(value["head_archive_bytes"], minimum=1):
+        raise RunAuthorityError("Pod qualification Git archive bytes must be positive")
+    if value["branch"] is not None and not isinstance(value["branch"], str):
+        raise RunAuthorityError("Pod qualification Git branch is invalid")
+    if value["origin_sha256"] is not None:
+        _require_sha256(
+            value["origin_sha256"], field="pod qualification Git origin sha256"
+        )
+    return dict(value)
+
+
+def _validate_pod_qualification(contract: Mapping[str, Any]) -> dict[str, Any]:
+    qualification = contract.get("qualification")
+    required_qualification = {
+        "format",
+        "format_version",
+        "status",
+        "nvlink_policy",
+        "gpu",
+        "host",
+        "source",
+    }
+    if not isinstance(qualification, dict) or set(qualification) != required_qualification:
+        raise RunAuthorityError(
+            "Hardware contract must contain the exact RunPod qualification evidence"
+        )
+    if (
+        qualification["format"] != POD_QUALIFICATION_FORMAT
+        or qualification["format_version"] != POD_QUALIFICATION_VERSION
+        or qualification["status"] != "pass"
+    ):
+        raise RunAuthorityError("RunPod six-GPU qualification did not pass")
+    if qualification["nvlink_policy"] not in (
+        "observe",
+        "require-any",
+        "require-all",
+    ):
+        raise RunAuthorityError("RunPod qualification has an invalid NVLink policy")
+
+    gpu = qualification["gpu"]
+    host = qualification["host"]
+    source = qualification["source"]
+    if not isinstance(gpu, dict) or not isinstance(host, dict) or not isinstance(source, dict):
+        raise RunAuthorityError("RunPod qualification evidence objects are incomplete")
+    devices = gpu.get("devices")
+    if not isinstance(devices, list) or len(devices) != WORLD_SIZE:
+        raise RunAuthorityError("RunPod qualification must contain exactly six GPU records")
+    expected_uuids: list[str] = []
+    for index, device in enumerate(devices):
+        if not isinstance(device, dict) or device.get("visible_index") != index:
+            raise RunAuthorityError("RunPod qualification GPU order is invalid")
+        uuid = device.get("uuid")
+        if not isinstance(uuid, str) or not uuid.startswith("GPU-"):
+            raise RunAuthorityError("RunPod qualification GPU UUID is invalid")
+        expected_uuids.append(uuid)
+        if device.get("bf16_supported") is not True:
+            raise RunAuthorityError("RunPod qualification includes a non-BF16 GPU")
+        expected_device_fields = {
+            "name": contract["gpu_model"],
+            "total_memory_bytes": contract["gpu_memory_bytes"],
+            "compute_capability": contract["compute_capability"],
+            "multiprocessor_count": contract["multiprocessor_count"],
+        }
+        if any(device.get(field) != expected for field, expected in expected_device_fields.items()):
+            raise RunAuthorityError(
+                "RunPod qualification GPU evidence disagrees with the hardware contract"
+            )
+    if len(set(expected_uuids)) != WORLD_SIZE:
+        raise RunAuthorityError("RunPod qualification GPU UUIDs are not unique")
+    for nested, top_level in (
+        ("driver_version", "driver_version"),
+        ("cuda_runtime_version", "cuda_runtime_version"),
+        ("cudnn_version", "cudnn_version"),
+        ("nccl_version", "nccl_version"),
+        ("torch_version", "torch_version"),
+    ):
+        if gpu.get(nested) != contract[top_level]:
+            raise RunAuthorityError(
+                f"RunPod qualification {nested} disagrees with the hardware contract"
+            )
+    smoke = gpu.get("nccl_smoke")
+    if not isinstance(smoke, dict) or (
+        smoke.get("status") != "pass"
+        or smoke.get("backend") != "nccl"
+        or smoke.get("world_size") != WORLD_SIZE
+        or smoke.get("completed_ranks") != WORLD_SIZE
+        or smoke.get("all_reduce_sum") != sum(range(1, WORLD_SIZE + 1))
+        or smoke.get("all_reduce_dtype") != "bfloat16"
+        or smoke.get("local_ranks") != list(range(WORLD_SIZE))
+        or smoke.get("device_uuids_in_rank_order") != expected_uuids
+    ):
+        raise RunAuthorityError("RunPod qualification lacks a valid six-rank NCCL smoke")
+    _require_sha256(
+        smoke.get("rank_results_sha256"), field="NCCL rank-results sha256"
+    )
+
+    package = host.get("package_lock")
+    required_package = {
+        "lock",
+        "python",
+        "packages_sha256",
+        "package_count",
+        "torch_version",
+        "numpy_version",
+    }
+    if not isinstance(package, dict) or set(package) != required_package:
+        raise RunAuthorityError("RunPod qualification lacks exact package-lock evidence")
+    _recorded_artifact(package["lock"], label="qualified package lock")
+    python_identity = package["python"]
+    if not isinstance(python_identity, dict) or set(python_identity) != {
+        "implementation",
+        "version",
+        "executable",
+        "executable_bytes",
+        "executable_sha256",
+    }:
+        raise RunAuthorityError("RunPod qualification Python identity is incomplete")
+    if not isinstance(python_identity["implementation"], str) or not isinstance(
+        python_identity["version"], str
+    ):
+        raise RunAuthorityError("RunPod qualification Python identity is invalid")
+    if not isinstance(python_identity["executable"], str) or not Path(
+        python_identity["executable"]
+    ).is_absolute():
+        raise RunAuthorityError("RunPod qualification Python executable is invalid")
+    if not _plain_int(python_identity["executable_bytes"], minimum=1):
+        raise RunAuthorityError("RunPod qualification Python executable size is invalid")
+    _require_sha256(
+        python_identity["executable_sha256"],
+        field="RunPod qualification Python executable sha256",
+    )
+    _require_sha256(package["packages_sha256"], field="qualified packages sha256")
+    if not _plain_int(package["package_count"], minimum=1):
+        raise RunAuthorityError("RunPod qualification package count is invalid")
+    if package["torch_version"] != contract["torch_version"]:
+        raise RunAuthorityError("Qualified package-lock Torch differs from hardware runtime")
+    if not isinstance(package["numpy_version"], str) or not package["numpy_version"]:
+        raise RunAuthorityError("RunPod qualification NumPy version is invalid")
+    data_evidence = host.get("data")
+    environment_evidence = host.get("environment")
+    wandb_evidence = host.get("wandb")
+    if not isinstance(data_evidence, dict) or data_evidence.get("status") != "pass":
+        raise RunAuthorityError("RunPod qualification data/path inspection did not pass")
+    if (
+        not isinstance(environment_evidence, dict)
+        or environment_evidence.get("secrets_recorded") is not False
+    ):
+        raise RunAuthorityError("RunPod qualification environment evidence is not secret-safe")
+    if (
+        not isinstance(wandb_evidence, dict)
+        or wandb_evidence.get("credential_value_recorded") is not False
+    ):
+        raise RunAuthorityError("RunPod qualification recorded W&B credential material")
+
+    required_source = {
+        "qualification_script",
+        "requirements_train",
+        "requirements_wandb",
+        "git",
+        "argv",
+    }
+    if set(source) != required_source:
+        raise RunAuthorityError("RunPod qualification source provenance is incomplete")
+    for field in ("qualification_script", "requirements_train", "requirements_wandb"):
+        _recorded_artifact(source[field], label=f"pod qualification {field}")
+    _validate_qualification_git(source["git"])
+    argv = source["argv"]
+    if not isinstance(argv, list) or not argv or any(
+        not isinstance(item, str) or not item or "\x00" in item for item in argv
+    ):
+        raise RunAuthorityError("RunPod qualification argv is invalid")
+    return qualification
+
+
+def _validate_qualification_provenance(
+    *,
+    hardware: Mapping[str, Any],
+    environment: Mapping[str, Any],
+    git: Mapping[str, Any],
+    project_root: Path,
+) -> None:
+    qualification = hardware["expected"]["qualification"]
+    package = qualification["host"]["package_lock"]
+    for field in (
+        "lock",
+        "python",
+        "packages_sha256",
+        "package_count",
+        "torch_version",
+        "numpy_version",
+    ):
+        if package[field] != environment[field]:
+            raise RunAuthorityError(
+                f"Qualified pod {field} differs from the run-authority package lock"
+            )
+
+    source = qualification["source"]
+    if source["git"] != git:
+        raise RunAuthorityError(
+            "Qualified pod source identity differs from the current clean Git tree"
+        )
+    current_sources = {
+        "qualification_script": project_root / "scripts" / "qualify_runpod_pod.py",
+        "requirements_train": project_root / "requirements-train.txt",
+        "requirements_wandb": project_root / "requirements-wandb.txt",
+    }
+    for field, path in current_sources.items():
+        current = _artifact(path, label=f"current {field}")
+        if source[field] != current:
+            raise RunAuthorityError(
+                f"Qualified pod {field} differs from the current clean source"
+            )
+
+    argv = source["argv"]
+    invoked_script = Path(argv[0])
+    if not invoked_script.is_absolute():
+        invoked_script = project_root / invoked_script
+    try:
+        same_script = invoked_script.resolve(strict=True) == current_sources[
+            "qualification_script"
+        ].resolve(strict=True)
+    except OSError:
+        same_script = False
+    if not same_script:
+        raise RunAuthorityError(
+            "Pod qualification argv did not invoke the bound qualification script"
+        )
+
+    package_arguments = [
+        argv[index + 1]
+        for index, token in enumerate(argv[:-1])
+        if token == "--package-lock"
+    ]
+    package_arguments.extend(
+        token.split("=", 1)[1]
+        for token in argv
+        if token.startswith("--package-lock=")
+    )
+    if len(package_arguments) != 1:
+        raise RunAuthorityError(
+            "Pod qualification argv must bind exactly one --package-lock"
+        )
+    try:
+        argv_lock = Path(package_arguments[0]).resolve(strict=True)
+        environment_lock = Path(environment["lock"]["path"]).resolve(strict=True)
+    except (KeyError, OSError, TypeError) as exc:
+        raise RunAuthorityError("Cannot resolve the qualified package-lock path") from exc
+    if argv_lock != environment_lock:
+        raise RunAuthorityError(
+            "Pod qualification argv used another package lock"
+        )
+
+
 def inspect_hardware_contract(path: str | Path) -> dict[str, Any]:
     contract, descriptor = _json_object(path, label="six-GPU hardware contract")
+    bound = _verified_sidecar(path, label="six-GPU hardware contract")
+    if bound["artifact"] != descriptor:
+        raise RunAuthorityError("Hardware contract changed during inspection")
     if contract.get("format") != HARDWARE_FORMAT or contract.get("format_version") != 1:
         raise RunAuthorityError("Unsupported six-GPU hardware contract format")
     required = {
@@ -408,7 +735,614 @@ def inspect_hardware_contract(path: str | Path) -> dict[str, Any]:
     ):
         if not isinstance(contract[field], str) or not contract[field].strip():
             raise RunAuthorityError(f"Hardware {field} must be an exact non-empty string")
-    return {"contract": descriptor, "expected": contract}
+    created_utc = contract.get("created_utc")
+    try:
+        created = datetime.fromisoformat(created_utc)
+    except (TypeError, ValueError) as exc:
+        raise RunAuthorityError("Qualified hardware created_utc must be ISO-8601") from exc
+    if created.tzinfo is None:
+        raise RunAuthorityError("Qualified hardware created_utc must be timezone-aware")
+    _validate_pod_qualification(contract)
+    return {
+        "contract": bound["artifact"],
+        "sidecar": bound["sidecar"],
+        "expected": contract,
+    }
+
+
+def _stable_tree_identity(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"entries", "sha256"}:
+        raise RunAuthorityError(f"{label} stable-tree identity is incomplete")
+    if not _plain_int(value["entries"], minimum=1):
+        raise RunAuthorityError(f"{label} stable-tree entry count must be positive")
+    _require_sha256(value["sha256"], field=f"{label} stable-tree sha256")
+    return dict(value)
+
+
+def _current_tree_identity(root: Path, *, label: str) -> dict[str, Any]:
+    """Recompute the corpus qualifier's mutation-sensitive metadata digest."""
+
+    root = _directory(root, label=f"{label} root")
+    inventory: dict[str, dict[str, Any]] = {}
+
+    def descriptor(path: Path) -> dict[str, Any]:
+        metadata = path.lstat()
+        kind = (
+            "symlink"
+            if path.is_symlink()
+            else "directory"
+            if path.is_dir()
+            else "file"
+        )
+        return {
+            "kind": kind,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "bytes": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+            "ctime_ns": metadata.st_ctime_ns,
+        }
+
+    try:
+        inventory["."] = descriptor(root)
+        paths = sorted(
+            root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+        )
+        for path in paths:
+            inventory[path.relative_to(root).as_posix()] = descriptor(path)
+    except OSError as exc:
+        raise RunAuthorityError(f"Cannot inventory qualified {label} tree: {exc}") from exc
+    return {
+        "entries": len(inventory),
+        "sha256": canonical_sha256(inventory),
+    }
+
+
+def _validate_corpus_validator(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"sources", "runtime"}:
+        raise RunAuthorityError("Corpus qualification validator identity is incomplete")
+    sources = value["sources"]
+    runtime = value["runtime"]
+    expected_source_names = {
+        "qualification",
+        "pretrain_data",
+        "materialize_contract",
+        "tokenizer_identity",
+        "model",
+        "model_config_loader",
+    }
+    if not isinstance(sources, dict) or set(sources) != expected_source_names:
+        raise RunAuthorityError("Corpus qualification validator sources are incomplete")
+    recorded_sources = {
+        name: _recorded_artifact(descriptor, label=f"corpus validator {name}")
+        for name, descriptor in sources.items()
+    }
+    project_root = Path(__file__).resolve().parents[1]
+    current_paths = {
+        "qualification": project_root / "scripts" / "qualify_training_corpus.py",
+        "pretrain_data": project_root / "pretrain" / "data.py",
+        "materialize_contract": project_root / "pretrain" / "materialize.py",
+        "tokenizer_identity": project_root / "pretrain" / "tokenizer_identity.py",
+        "model": project_root / "pretrain" / "model.py",
+        "model_config_loader": project_root / "pretrain" / "hf_export.py",
+    }
+    for name, current_path in current_paths.items():
+        current = _artifact(current_path, label=f"current corpus validator {name}")
+        recorded = recorded_sources[name]
+        if (
+            recorded["bytes"] != current["bytes"]
+            or recorded["sha256"] != current["sha256"]
+        ):
+            raise RunAuthorityError(
+                f"Corpus qualification validator source changed: {name}"
+            )
+    expected_runtime_fields = {
+        "python_executable",
+        "python_version",
+        "numpy_version",
+        "torch_version",
+        "sqlite_version",
+        "tokenizers_version",
+        "zstandard_version",
+        "packed_format_version",
+        "order_format_version",
+    }
+    if not isinstance(runtime, dict) or set(runtime) != expected_runtime_fields:
+        raise RunAuthorityError("Corpus qualification validator runtime is incomplete")
+    for field in expected_runtime_fields - {
+        "packed_format_version",
+        "order_format_version",
+    }:
+        if not isinstance(runtime[field], str) or not runtime[field]:
+            raise RunAuthorityError(
+                f"Corpus qualification validator runtime {field} is invalid"
+            )
+    if runtime["packed_format_version"] != training_data.FORMAT_VERSION:
+        raise RunAuthorityError("Corpus qualification used another packed-data format")
+    if runtime["order_format_version"] != training_data.ORDER_FORMAT_VERSION:
+        raise RunAuthorityError("Corpus qualification used another order format")
+    return value
+
+
+def inspect_corpus_qualification(path: str | Path) -> dict[str, Any]:
+    """Authenticate and validate the final materialized-corpus qualification."""
+
+    receipt, descriptor = _json_object(path, label="training-corpus qualification")
+    bound = _verified_sidecar(path, label="training-corpus qualification")
+    if bound["artifact"] != descriptor:
+        raise RunAuthorityError("Training-corpus qualification changed during inspection")
+    if (
+        receipt.get("format") != CORPUS_QUALIFICATION_FORMAT
+        or receipt.get("format_version") != CORPUS_QUALIFICATION_VERSION
+        or receipt.get("status") != "pass"
+    ):
+        raise RunAuthorityError("Training-corpus qualification is unsupported or did not pass")
+    receipt_path = Path(descriptor["path"])
+    if receipt_path.name != "qualification.json":
+        raise RunAuthorityError("Training-corpus qualification must be qualification.json")
+    try:
+        generation_entries = sorted(entry.name for entry in receipt_path.parent.iterdir())
+    except OSError as exc:
+        raise RunAuthorityError(
+            f"Cannot inventory training-corpus qualification generation: {exc}"
+        ) from exc
+    if generation_entries != ["qualification.json", "qualification.json.sha256"]:
+        raise RunAuthorityError(
+            "Training-corpus qualification generation must contain exactly its receipt pair"
+        )
+    expected_receipt_fields = {
+        "format",
+        "format_version",
+        "status",
+        "started_utc",
+        "completed_utc",
+        "elapsed_seconds",
+        "corpus",
+        "acceptance_policy",
+        "checks",
+        "model",
+        "validator",
+        "tokenizer",
+        "common_data_contract",
+        "provenance",
+        "splits",
+        "document_indexes",
+        "split_identity_audit",
+    }
+    if set(receipt) != expected_receipt_fields:
+        raise RunAuthorityError("Training-corpus qualification receipt schema is not exact")
+    timestamps: dict[str, datetime] = {}
+    for field in ("started_utc", "completed_utc"):
+        try:
+            timestamp = datetime.fromisoformat(receipt[field])
+        except (TypeError, ValueError) as exc:
+            raise RunAuthorityError(
+                f"Training-corpus qualification {field} must be ISO-8601"
+            ) from exc
+        if timestamp.tzinfo is None:
+            raise RunAuthorityError(
+                f"Training-corpus qualification {field} must be timezone-aware"
+            )
+        timestamps[field] = timestamp
+    if timestamps["completed_utc"] < timestamps["started_utc"]:
+        raise RunAuthorityError("Training-corpus qualification timestamps are reversed")
+    elapsed = receipt["elapsed_seconds"]
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+        raise RunAuthorityError("Training-corpus qualification elapsed time is invalid")
+    try:
+        elapsed_decimal = Decimal(str(elapsed))
+    except InvalidOperation as exc:
+        raise RunAuthorityError(
+            "Training-corpus qualification elapsed time is invalid"
+        ) from exc
+    if not elapsed_decimal.is_finite() or elapsed_decimal < 0:
+        raise RunAuthorityError("Training-corpus qualification elapsed time is invalid")
+
+    checks = receipt.get("checks")
+    if (
+        not isinstance(checks, dict)
+        or set(checks) != CORPUS_QUALIFICATION_CHECKS
+        or any(value is not True for value in checks.values())
+    ):
+        raise RunAuthorityError("Training-corpus qualification checks are incomplete")
+    policy = receipt.get("acceptance_policy")
+    expected_policy_fields = {
+        "world_size",
+        "expected_input_tokens",
+        "maximum_target_shortfall_fraction",
+        "expected_input_token_weights",
+        "mixture_absolute_tolerance",
+        "sample_rows_per_domain",
+        "sample_seed",
+        "full_packed_payload_checksums",
+        "full_packed_semantic_scan",
+        "full_order_uniqueness_scan",
+        "full_document_index_scan",
+        "exact_disk_backed_split_identity_scan",
+    }
+    if (
+        not isinstance(policy, dict)
+        or set(policy) != expected_policy_fields
+        or policy.get("world_size") != WORLD_SIZE
+    ):
+        raise RunAuthorityError("Corpus qualification must target exactly six ranks")
+    if policy.get("expected_input_tokens") != EXPECTED_INPUT_TOKEN_TARGETS:
+        raise RunAuthorityError("Corpus qualification token targets differ from production")
+    if policy.get("expected_input_token_weights") != EXPECTED_INPUT_TOKEN_WEIGHTS:
+        raise RunAuthorityError("Corpus qualification mixture differs from 40/40/20")
+    try:
+        shortfall = Decimal(str(policy["maximum_target_shortfall_fraction"]))
+        mixture_tolerance = Decimal(str(policy["mixture_absolute_tolerance"]))
+    except (InvalidOperation, ValueError) as exc:
+        raise RunAuthorityError("Corpus qualification tolerances are invalid") from exc
+    if (
+        not shortfall.is_finite()
+        or shortfall < 0
+        or shortfall > MAXIMUM_TARGET_SHORTFALL_FRACTION
+    ):
+        raise RunAuthorityError("Corpus qualification target-shortfall tolerance is too loose")
+    if (
+        not mixture_tolerance.is_finite()
+        or mixture_tolerance < 0
+        or mixture_tolerance > MAXIMUM_MIXTURE_ABSOLUTE_TOLERANCE
+    ):
+        raise RunAuthorityError("Corpus qualification mixture tolerance is too loose")
+    if not _plain_int(
+        policy["sample_rows_per_domain"], minimum=MINIMUM_SAMPLE_ROWS_PER_DOMAIN
+    ) or not _plain_int(policy["sample_seed"]):
+        raise RunAuthorityError("Corpus qualification sampling policy is insufficient")
+    for field in (
+        "full_packed_payload_checksums",
+        "full_packed_semantic_scan",
+        "full_order_uniqueness_scan",
+        "full_document_index_scan",
+        "exact_disk_backed_split_identity_scan",
+    ):
+        if policy[field] is not True:
+            raise RunAuthorityError(f"Corpus qualification disabled required check: {field}")
+
+    corpus = receipt.get("corpus")
+    if not isinstance(corpus, dict):
+        raise RunAuthorityError("Corpus qualification lacks corpus identity")
+    manifest_path_raw = corpus.get("manifest_path")
+    sidecar_path_raw = corpus.get("sidecar_path")
+    if not isinstance(manifest_path_raw, str) or not Path(manifest_path_raw).is_absolute():
+        raise RunAuthorityError("Qualified corpus manifest path must be absolute")
+    if not isinstance(sidecar_path_raw, str) or not Path(sidecar_path_raw).is_absolute():
+        raise RunAuthorityError("Qualified corpus sidecar path must be absolute")
+    manifest = _artifact(manifest_path_raw, label="qualified corpus manifest")
+    if Path(manifest["path"]).name != "manifest.json":
+        raise RunAuthorityError("Qualified corpus manifest must be named manifest.json")
+    if (
+        manifest["bytes"] != corpus.get("manifest_bytes")
+        or manifest["sha256"] != corpus.get("manifest_sha256")
+    ):
+        raise RunAuthorityError("Qualified corpus manifest identity changed")
+    sidecar = _artifact(sidecar_path_raw, label="qualified corpus manifest sidecar")
+    if sidecar["sha256"] != corpus.get("sidecar_sha256"):
+        raise RunAuthorityError("Qualified corpus manifest sidecar identity changed")
+    manifest_path = Path(manifest["path"])
+    expected_corpus_sidecar = manifest_path.with_name("manifest.sha256")
+    if Path(sidecar["path"]) != expected_corpus_sidecar:
+        raise RunAuthorityError("Qualified corpus sidecar is not adjacent to manifest.json")
+    expected_sidecar_bytes = f"{manifest['sha256']}  manifest.json\n".encode("ascii")
+    if _read_bound_bytes(sidecar, label="qualified corpus manifest sidecar") != expected_sidecar_bytes:
+        raise RunAuthorityError("Qualified corpus manifest sidecar is not exact")
+    recorded_corpus_tree = _stable_tree_identity(
+        corpus.get("stable_tree_inventory"), label="corpus"
+    )
+    current_corpus_tree = _current_tree_identity(manifest_path.parent, label="corpus")
+    if current_corpus_tree != recorded_corpus_tree:
+        raise RunAuthorityError("Qualified corpus tree identity changed")
+
+    tokenizer = receipt.get("tokenizer")
+    if not isinstance(tokenizer, dict):
+        raise RunAuthorityError("Corpus qualification lacks tokenizer identity")
+    tokenizer_root_raw = tokenizer.get("root")
+    tokenizer_manifest_raw = tokenizer.get("manifest_path")
+    if not isinstance(tokenizer_root_raw, str) or not Path(tokenizer_root_raw).is_absolute():
+        raise RunAuthorityError("Qualified tokenizer root must be absolute")
+    if not isinstance(tokenizer_manifest_raw, str) or not Path(
+        tokenizer_manifest_raw
+    ).is_absolute():
+        raise RunAuthorityError("Qualified tokenizer manifest path must be absolute")
+    tokenizer_root = _directory(tokenizer_root_raw, label="qualified tokenizer root")
+    tokenizer_manifest = _artifact(
+        tokenizer_manifest_raw, label="qualified tokenizer manifest"
+    )
+    if Path(tokenizer_manifest["path"]) != tokenizer_root / Path(
+        tokenizer_manifest["path"]
+    ).name:
+        raise RunAuthorityError("Qualified tokenizer manifest is outside its root")
+    if Path(tokenizer_manifest["path"]).name != "TOKENIZER_MANIFEST.json":
+        raise RunAuthorityError(
+            "Qualified tokenizer manifest must be TOKENIZER_MANIFEST.json"
+        )
+    if tokenizer_manifest["sha256"] != tokenizer.get("manifest_sha256"):
+        raise RunAuthorityError("Qualified tokenizer manifest identity changed")
+    _require_sha256(
+        tokenizer.get("vocabulary_sha256"), field="qualified tokenizer vocabulary sha256"
+    )
+    if not _plain_int(tokenizer.get("vocab_size"), minimum=1):
+        raise RunAuthorityError("Qualified tokenizer vocabulary size is invalid")
+    if not _plain_int(tokenizer.get("eos_token_id")) or tokenizer["eos_token_id"] >= tokenizer[
+        "vocab_size"
+    ]:
+        raise RunAuthorityError("Qualified tokenizer EOS token ID is invalid")
+    recorded_tokenizer_tree = _stable_tree_identity(
+        tokenizer.get("stable_tree_inventory"), label="tokenizer"
+    )
+    current_tokenizer_tree = _current_tree_identity(tokenizer_root, label="tokenizer")
+    if current_tokenizer_tree != recorded_tokenizer_tree:
+        raise RunAuthorityError("Qualified tokenizer tree identity changed")
+
+    common = receipt.get("common_data_contract")
+    required_common = {
+        "sequence_length",
+        "vocab_size",
+        "eos_token_id",
+        "tokenizer_manifest_sha256",
+    }
+    if not isinstance(common, dict) or set(common) != required_common:
+        raise RunAuthorityError("Corpus qualification common data contract is incomplete")
+    if (
+        common["vocab_size"] != tokenizer["vocab_size"]
+        or common["eos_token_id"] != tokenizer["eos_token_id"]
+        or common["tokenizer_manifest_sha256"] != tokenizer["manifest_sha256"]
+        or not _plain_int(common["sequence_length"], minimum=1)
+    ):
+        raise RunAuthorityError("Corpus and tokenizer qualification identities disagree")
+
+    model = receipt.get("model")
+    if not isinstance(model, dict) or set(model) != {"source", "sha256", "config"}:
+        raise RunAuthorityError("Corpus qualification model identity is incomplete")
+    if not isinstance(model["config"], dict) or not model["config"]:
+        raise RunAuthorityError("Corpus qualification model config is invalid")
+    if model["sha256"] is None:
+        if model["source"] != "pretrain.model.ModelConfig defaults":
+            raise RunAuthorityError("Unhashed qualified model source is unsupported")
+    else:
+        if not isinstance(model["source"], str) or not Path(model["source"]).is_absolute():
+            raise RunAuthorityError("Qualified model config path must be absolute")
+        _require_sha256(model["sha256"], field="qualified model config sha256")
+        model_artifact = _artifact(model["source"], label="qualified model config")
+        if model_artifact["sha256"] != model["sha256"]:
+            raise RunAuthorityError("Qualified model config identity changed")
+    _validate_corpus_validator(receipt.get("validator"))
+
+    provenance = receipt.get("provenance")
+    required_provenance = {"source", "policy", "tokenizer", "fingerprints", "bindings"}
+    if not isinstance(provenance, dict) or not required_provenance.issubset(provenance):
+        raise RunAuthorityError("Corpus qualification provenance evidence is incomplete")
+    provenance_paths: set[Path] = set()
+    for name, evidence in provenance.items():
+        if name == "bindings":
+            continue
+        if not isinstance(evidence, dict) or set(evidence) != {"path", "bytes", "sha256"}:
+            raise RunAuthorityError(f"Corpus qualification {name} provenance is invalid")
+        relative = evidence["path"]
+        if (
+            not isinstance(relative, str)
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+            or not _plain_int(evidence["bytes"], minimum=1)
+        ):
+            raise RunAuthorityError(f"Corpus qualification {name} provenance is invalid")
+        _require_sha256(evidence["sha256"], field=f"qualified {name} provenance sha256")
+        current = _artifact(
+            manifest_path.parent / relative,
+            label=f"qualified {name} provenance",
+        )
+        current_path = Path(current["path"])
+        if not current_path.is_relative_to(manifest_path.parent):
+            raise RunAuthorityError(
+                f"Qualified {name} provenance escapes the corpus root"
+            )
+        if current_path in provenance_paths:
+            raise RunAuthorityError("Corpus qualification repeats a provenance artifact")
+        provenance_paths.add(current_path)
+        if current["bytes"] != evidence["bytes"] or current["sha256"] != evidence["sha256"]:
+            raise RunAuthorityError(f"Qualified {name} provenance identity changed")
+    bindings = provenance["bindings"]
+    required_bindings = {
+        "selection_manifest_sha256",
+        "tokenizer_manifest_sha256",
+        "materialization_curation_policy_sha256",
+        "source_curation_policy_sha256",
+        "split_authority",
+        "authenticated_leakage_audit",
+        "raw_archive_count",
+        "raw_archive_inventory_sha256",
+    }
+    if not isinstance(bindings, dict) or set(bindings) != required_bindings:
+        raise RunAuthorityError("Corpus qualification provenance bindings are incomplete")
+    for field in (
+        "selection_manifest_sha256",
+        "tokenizer_manifest_sha256",
+        "materialization_curation_policy_sha256",
+        "source_curation_policy_sha256",
+        "raw_archive_inventory_sha256",
+    ):
+        _require_sha256(bindings[field], field=f"qualified provenance {field}")
+    if bindings["tokenizer_manifest_sha256"] != tokenizer["manifest_sha256"]:
+        raise RunAuthorityError("Corpus provenance is bound to another tokenizer")
+    if bindings["split_authority"] not in (
+        "frozen_leakage_safe_source_groups",
+        "completed-curation-decision-shards",
+    ) or not _plain_int(bindings["raw_archive_count"], minimum=1):
+        raise RunAuthorityError("Corpus qualification provenance authority is invalid")
+    leakage = bindings["authenticated_leakage_audit"]
+    required_zero = {
+        "content_hashes_in_multiple_splits",
+        "canonical_clusters_in_multiple_splits",
+        "source_groups_in_multiple_splits",
+        "cross_bucket_code_repo_groups_in_multiple_splits",
+    }
+    if not isinstance(leakage, dict) or not required_zero.issubset(leakage) or any(
+        leakage[field] != 0 for field in required_zero
+    ):
+        raise RunAuthorityError("Corpus qualification provenance leakage audit failed")
+    if leakage.get("normalized_hashes_in_multiple_splits", 0) != 0:
+        raise RunAuthorityError("Corpus qualification normalized-hash leakage audit failed")
+
+    splits = receipt.get("splits")
+    if not isinstance(splits, dict) or set(splits) != {"train", "validation", "test"}:
+        raise RunAuthorityError("Corpus qualification must cover train/validation/test")
+    corpus_root = manifest_path.parent
+    order_paths: set[Path] = set()
+    for split, summary in splits.items():
+        if not isinstance(summary, dict) or set(summary) != {
+            "order",
+            "packed",
+            "deterministic_samples",
+        }:
+            raise RunAuthorityError(f"Corpus qualification {split} evidence is incomplete")
+        for field in ("packed", "deterministic_samples"):
+            if not isinstance(summary[field], dict) or set(summary[field]) != set(
+                training_data.DOMAIN_ORDER
+            ):
+                raise RunAuthorityError(
+                    f"Corpus qualification {split} {field} evidence is incomplete"
+                )
+        order = summary.get("order") if isinstance(summary, dict) else None
+        if not isinstance(order, dict):
+            raise RunAuthorityError(f"Corpus qualification lacks {split} order identity")
+        order_relative = order.get("manifest")
+        order_sha = order.get("manifest_sha256")
+        if (
+            not isinstance(order_relative, str)
+            or Path(order_relative).is_absolute()
+            or ".." in Path(order_relative).parts
+        ):
+            raise RunAuthorityError(f"Qualified {split} order path is invalid")
+        _require_sha256(order_sha, field=f"qualified {split} order sha256")
+        order_artifact = _artifact(
+            corpus_root / order_relative, label=f"qualified {split} order manifest"
+        )
+        order_path = Path(order_artifact["path"])
+        if not order_path.is_relative_to(corpus_root):
+            raise RunAuthorityError(f"Qualified {split} order escapes the corpus root")
+        if order_path in order_paths:
+            raise RunAuthorityError("Corpus qualification repeats a split order")
+        order_paths.add(order_path)
+        if order_artifact["sha256"] != order_sha:
+            raise RunAuthorityError(f"Qualified {split} order identity changed")
+    document_indexes = receipt.get("document_indexes")
+    if not isinstance(document_indexes, dict) or set(document_indexes) != set(splits):
+        raise RunAuthorityError("Corpus qualification document-index evidence is incomplete")
+    for split, indexes in document_indexes.items():
+        if not isinstance(indexes, dict) or set(indexes) != set(training_data.DOMAIN_ORDER):
+            raise RunAuthorityError(
+                f"Corpus qualification {split} document-index evidence is incomplete"
+            )
+        if any(not isinstance(index, dict) or not index for index in indexes.values()):
+            raise RunAuthorityError(
+                f"Corpus qualification {split} document-index evidence is invalid"
+            )
+    split_audit = receipt.get("split_identity_audit")
+    expected_split_audit_fields = {
+        "method",
+        "identity_kinds",
+        "identity_occurrences",
+        "unique_identities",
+        "cross_split_collisions",
+        "collision_examples",
+        "scratch_database_bytes",
+    }
+    if not isinstance(split_audit, dict) or set(split_audit) != expected_split_audit_fields:
+        raise RunAuthorityError("Corpus qualification split-identity audit is incomplete")
+    if (
+        split_audit["method"]
+        != "exact-sqlite-without-rowid-split-bitmask-union"
+        or split_audit["identity_kinds"] != ["source", "split_group"]
+        or not _plain_int(split_audit["scratch_database_bytes"])
+    ):
+        raise RunAuthorityError("Corpus qualification split-identity audit is invalid")
+    collisions = (
+        split_audit.get("cross_split_collisions")
+        if isinstance(split_audit, dict)
+        else None
+    )
+    identity_kinds = {"source", "split_group"}
+    if not isinstance(collisions, dict) or set(collisions) != identity_kinds or any(
+        value != 0 for value in collisions.values()
+    ):
+        raise RunAuthorityError("Corpus qualification split-identity audit did not pass")
+    examples = split_audit["collision_examples"]
+    if (
+        not isinstance(examples, dict)
+        or set(examples) != identity_kinds
+        or any(examples[kind] != [] for kind in identity_kinds)
+    ):
+        raise RunAuthorityError("Corpus qualification collision examples are inconsistent")
+    occurrences = split_audit.get("identity_occurrences")
+    unique = split_audit.get("unique_identities")
+    if (
+        not isinstance(occurrences, dict)
+        or not isinstance(unique, dict)
+        or set(occurrences) != identity_kinds
+        or set(unique) != identity_kinds
+        or any(not _plain_int(occurrences[kind], minimum=1) for kind in identity_kinds)
+        or any(occurrences[kind] != unique[kind] for kind in identity_kinds)
+    ):
+        raise RunAuthorityError("Corpus qualification contains duplicate source/group identities")
+    return {
+        **bound,
+        "receipt": receipt,
+        "corpus_manifest": manifest,
+        "corpus_sidecar": sidecar,
+    }
+
+
+def _validate_corpus_qualification_bindings(
+    *,
+    qualification: Mapping[str, Any],
+    train: Mapping[str, Any],
+    validation: Mapping[str, Any],
+    tokenizer: Mapping[str, Any],
+    model: Mapping[str, Any],
+) -> None:
+    receipt = qualification["receipt"]
+    corpus_root = Path(qualification["corpus_manifest"]["path"]).parent
+    for split, order in (("train", train), ("validation", validation)):
+        recorded = receipt["splits"][split]["order"]
+        qualified_path = (corpus_root / recorded["manifest"]).resolve(strict=True)
+        if qualified_path != Path(order["manifest"]["path"]):
+            raise RunAuthorityError(
+                f"Run authority {split} order is outside the qualified corpus"
+            )
+        if recorded["manifest_sha256"] != order["manifest"]["sha256"]:
+            raise RunAuthorityError(
+                f"Run authority {split} order differs from corpus qualification"
+            )
+    recorded_tokenizer = receipt["tokenizer"]
+    tokenizer_fields = {
+        "root": tokenizer["root"],
+        "manifest_path": tokenizer["manifest"]["path"],
+        "manifest_sha256": tokenizer["manifest_sha256"],
+        "vocabulary_sha256": tokenizer["vocabulary_sha256"],
+        "vocab_size": tokenizer["vocab_size"],
+        "eos_token_id": tokenizer["eos_token_id"],
+    }
+    if any(recorded_tokenizer[field] != expected for field, expected in tokenizer_fields.items()):
+        raise RunAuthorityError("Run-authority tokenizer differs from corpus qualification")
+    common = receipt["common_data_contract"]
+    expected_common = {
+        "sequence_length": train["sequence_length"],
+        "vocab_size": train["vocab_size"],
+        "eos_token_id": train["eos_token_id"],
+        "tokenizer_manifest_sha256": train["tokenizer_manifest_sha256"],
+    }
+    if common != expected_common:
+        raise RunAuthorityError("Run-authority data contract differs from corpus qualification")
+    qualified_model = dict(receipt["model"]["config"])
+    authority_model = dict(model["config"])
+    # Activation checkpointing is a runtime memory decision bound by recipe and
+    # geometry; it does not change corpus/model shape compatibility.
+    qualified_model.pop("activation_checkpointing", None)
+    authority_model.pop("activation_checkpointing", None)
+    if qualified_model != authority_model:
+        raise RunAuthorityError("Run-authority model differs from corpus qualification")
 
 
 def _decimal(value: Any, *, field: str, positive: bool = True) -> Decimal:
@@ -989,6 +1923,7 @@ def collect_run_authority(
     container_image_digest: str,
     hardware_contract: str | Path,
     geometry_receipt: str | Path,
+    corpus_qualification: str | Path,
     train_order_manifest: str | Path,
     validation_order_manifest: str | Path,
     train_certification: str | Path,
@@ -1011,6 +1946,12 @@ def collect_run_authority(
     environment = inspect_package_lock(package_lock)
     environment["container_image_digest"] = container_image_digest
     hardware = inspect_hardware_contract(hardware_contract)
+    _validate_qualification_provenance(
+        hardware=hardware,
+        environment=environment,
+        git=git,
+        project_root=root,
+    )
     if hardware["expected"]["torch_version"] != environment["torch_version"]:
         raise RunAuthorityError(
             "Hardware contract torch_version differs from the locked installed package"
@@ -1022,6 +1963,7 @@ def collect_run_authority(
     )
     train = inspect_order(train_order_manifest, expected_split="train")
     validation = inspect_order(validation_order_manifest, expected_split="validation")
+    corpus_gate = inspect_corpus_qualification(corpus_qualification)
     if Path(train["manifest"]["path"]) == Path(validation["manifest"]["path"]):
         raise RunAuthorityError("Training and validation orders must be distinct")
     for field in ("sequence_length", "vocab_size", "eos_token_id", "tokenizer_manifest_sha256"):
@@ -1070,6 +2012,7 @@ def collect_run_authority(
         "manifest_sha256": tokenizer.manifest_sha256,
         "vocabulary_sha256": tokenizer.vocabulary_sha256,
         "vocab_size": tokenizer.vocab_size,
+        "eos_token_id": train["eos_token_id"],
     }
     if tokenizer_payload["manifest"]["sha256"] != tokenizer.manifest_sha256:
         raise RunAuthorityError("Tokenizer manifest changed during identity verification")
@@ -1094,6 +2037,13 @@ def collect_run_authority(
         vocab_size=train["vocab_size"],
         sequence_length=train["sequence_length"],
         activation_checkpointing=recipe_payload["activation_checkpointing"],
+    )
+    _validate_corpus_qualification_bindings(
+        qualification=corpus_gate,
+        train=train,
+        validation=validation,
+        tokenizer=tokenizer_payload,
+        model=model,
     )
     economics = _economics(
         consumed_input_tokens=train_geometry["consumed_input_tokens"],
@@ -1130,6 +2080,7 @@ def collect_run_authority(
         "hardware": hardware,
         "geometry": geometry,
         "data": {
+            "corpus_qualification": corpus_gate,
             "train_order": train,
             "validation_order": validation,
             "train_certification": train_cert,
@@ -1284,6 +2235,9 @@ def validate_run_authority(path: str | Path) -> dict[str, Any]:
             container_image_digest=payload["environment"]["container_image_digest"],
             hardware_contract=payload["hardware"]["contract"]["path"],
             geometry_receipt=payload["geometry"]["artifact"]["path"],
+            corpus_qualification=payload["data"]["corpus_qualification"]["artifact"][
+                "path"
+            ],
             train_order_manifest=payload["data"]["train_order"]["manifest"]["path"],
             validation_order_manifest=payload["data"]["validation_order"]["manifest"]["path"],
             train_certification=payload["data"]["train_certification"]["artifact"]["path"],
