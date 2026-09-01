@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/workspace/coding_model_from_scratch}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
 DATA_ROOT="${DATA_ROOT:-/workspace/dataset}"
 PYTHON_BIN="${PYTHON_BIN:-/opt/coding-model-venv/bin/python}"
+QUOTA_CONFIG="${QUOTA_CONFIG:-$PROJECT_ROOT/configs/data_quotas.json}"
 LOG_DIR="$DATA_ROOT/logs"
-LOG_FILE="$LOG_DIR/preprocess.log"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/preprocess.log}"
 RUN_FINGERPRINT_AUDIT_INDEX="${RUN_FINGERPRINT_AUDIT_INDEX:-0}"
 PREPROCESS_MAX_DOCUMENT_BYTES="${PREPROCESS_MAX_DOCUMENT_BYTES:-16777216}"
 PREPROCESS_MAX_BATCH_BYTES="${PREPROCESS_MAX_BATCH_BYTES:-67108864}"
@@ -20,6 +22,10 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "Missing Python environment: $PYTHON_BIN" >&2
   exit 1
 fi
+if [[ ! -f "$QUOTA_CONFIG" ]]; then
+  echo "Missing quota configuration: $QUOTA_CONFIG" >&2
+  exit 1
+fi
 
 if [[ "$RUN_FINGERPRINT_AUDIT_INDEX" != "0" && "$RUN_FINGERPRINT_AUDIT_INDEX" != "1" ]]; then
   echo "RUN_FINGERPRINT_AUDIT_INDEX must be 0 or 1" >&2
@@ -28,7 +34,7 @@ fi
 
 export PYTHONUNBUFFERED=1
 
-echo "[$(date --iso-8601=seconds)] Starting/resuming streaming preprocessing" | tee -a "$LOG_FILE"
+echo "[$(date --iso-8601=seconds)] Starting/resuming streaming preprocessing with quotas $QUOTA_CONFIG" | tee -a "$LOG_FILE"
 
 # The final curation plan trusts Stack v3 Train's upstream code near-deduplication.
 # Fail closed on every launch if this volume is not the exact reviewed release.
@@ -38,6 +44,7 @@ echo "[$(date --iso-8601=seconds)] Starting/resuming streaming preprocessing" | 
 set +e
 nice -n 5 "$PYTHON_BIN" "$PROJECT_ROOT/scripts/preprocess_raw_stream.py" \
   --root "$DATA_ROOT" \
+  --quotas "$QUOTA_CONFIG" \
   --workers 24 \
   --analysis-batch-size 64 \
   --max-document-bytes "$PREPROCESS_MAX_DOCUMENT_BYTES" \
@@ -69,6 +76,7 @@ fi
 set +e
 "$PYTHON_BIN" "$PROJECT_ROOT/scripts/preprocess_raw_stream.py" \
   --root "$DATA_ROOT" \
+  --quotas "$QUOTA_CONFIG" \
   --scratch-root /tmp/coding-model-preprocess \
   --status --require-complete --require-closed-collection --skip-dedup-status \
   2>&1 | tee -a "$LOG_FILE"
@@ -93,6 +101,7 @@ echo "[$(date --iso-8601=seconds)] Starting/resuming batched fingerprint indexin
 set +e
 nice -n 10 "$PYTHON_BIN" "$PROJECT_ROOT/scripts/preprocess_raw_stream.py" \
   --root "$DATA_ROOT" \
+  --quotas "$QUOTA_CONFIG" \
   --scratch-root /tmp/coding-model-preprocess \
   --scratch-min-free-gb "$PREPROCESS_SCRATCH_MIN_FREE_GB" \
   --index-mode only \

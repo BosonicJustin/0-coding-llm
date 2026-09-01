@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "description": "Versioned collection authority for the post-audit other-code top-up. The 35B raw other-code target provides a 27.9% margin over the measured amount needed to recover the 52.58B-token 40/40/20 train mixture after curation. Python and English collection targets and all reference final budgets are unchanged.",
+  "estimation": {
+    "bytes_per_token": {
+      "python": 3.87,
+      "other_code": 4.0,
+      "english": 4.2
+    }
+  },
+  "quotas": [
+    {
+      "name": "collection/python",
+      "phase": "collection",
+      "category": "python",
+      "token_field": "exact_tokens",
+      "target": 25718400000
+    },
+    {
+      "name": "collection/other_code",
+      "phase": "collection",
+      "category": "other_code",
+      "token_field": "exact_tokens",
+      "target": 35000000000
+    },
+    {
+      "name": "collection/english",
+      "phase": "collection",
+      "category": "english",
+      "token_field": "exact_tokens",
+      "target": 12859200000
+    },
+    {
+      "name": "collection/english/fineweb_edu",
+      "phase": "collection",
+      "category": "english",
+      "language_group": "fineweb_edu",
+      "token_field": "exact_tokens",
+      "target": 10287360000
+    },
+    {
+      "name": "collection/english/wikipedia",
+      "phase": "collection",
+      "category": "english",
+      "language_group": "wikipedia",
+      "token_field": "exact_tokens",
+      "target": 2571840000
+    },
+    {
+      "name": "final/train/python",
+      "phase": "final",
+      "split": "train",
+      "category": "python",
+      "token_field": "exact_tokens",
+      "target": 21032000000
+    },
+    {
+      "name": "final/train/other_code",
+      "phase": "final",
+      "split": "train",
+      "category": "other_code",
+      "token_field": "exact_tokens",
+      "target": 21032000000
+    },
+    {
+      "name": "final/train/english",
+      "phase": "final",
+      "split": "train",
+      "category": "english",
+      "token_field": "exact_tokens",
+      "target": 10516000000
+    },
+    {
+      "name": "final/validation/python",
+      "phase": "final",
+      "split": "validation",
+      "category": "python",
+      "token_field": "exact_tokens",
+      "target": 200000000
+    },
+    {
+      "name": "final/validation/other_code",
+      "phase": "final",
+      "split": "validation",
+      "category": "other_code",
+      "token_field": "exact_tokens",
+      "target": 200000000
+    },
+    {
+      "name": "final/validation/english",
+      "phase": "final",
+      "split": "validation",
+      "category": "english",
+      "token_field": "exact_tokens",
+      "target": 100000000
+    },
+    {
+      "name": "final/test/python",
+      "phase": "final",
+      "split": "test",
+      "category": "python",
+      "token_field": "exact_tokens",
+      "target": 200000000
+    },
+    {
+      "name": "final/test/other_code",
+      "phase": "final",
+      "split": "test",
+      "category": "other_code",
+      "token_field": "exact_tokens",
+      "target": 200000000
+    },
+    {
+      "name": "final/test/english",
+      "phase": "final",
+      "split": "test",
+      "category": "english",
+      "token_field": "exact_tokens",
+      "target": 100000000
+    }
+  ]
+}

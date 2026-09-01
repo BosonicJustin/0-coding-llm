@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -38,6 +39,47 @@ def add_test_document(writer: legacy.RawArchiveWriter, marker: str) -> None:
 
 
 class ParallelCollectorTest(unittest.TestCase):
+    def test_other_code_topup_profile_changes_only_collection_target(self) -> None:
+        base = json.loads(
+            (PROJECT_ROOT / "configs" / "data_quotas.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        topup = json.loads(
+            (
+                PROJECT_ROOT
+                / "configs"
+                / "data_quotas_other_code_topup_v2.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        def targets(config: dict) -> dict[str, int]:
+            return {row["name"]: int(row["target"]) for row in config["quotas"]}
+
+        base_targets = targets(base)
+        topup_targets = targets(topup)
+        self.assertEqual(base_targets.keys(), topup_targets.keys())
+        changed = {
+            name
+            for name in base_targets
+            if base_targets[name] != topup_targets[name]
+        }
+        self.assertEqual(changed, {"collection/other_code"})
+        self.assertEqual(topup_targets["collection/other_code"], 35_000_000_000)
+
+    def test_download_launcher_forwards_versioned_quota_config(self) -> None:
+        launcher = (PROJECT_ROOT / "scripts" / "run_download.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('QUOTA_CONFIG="${QUOTA_CONFIG:-', launcher)
+        self.assertIn('--quota-config "$QUOTA_CONFIG"', launcher)
+
+        preprocessor = (PROJECT_ROOT / "scripts" / "run_preprocess.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('QUOTA_CONFIG="${QUOTA_CONFIG:-', preprocessor)
+        self.assertEqual(preprocessor.count('--quotas "$QUOTA_CONFIG"'), 3)
+
     def test_assignments_and_archive_indices_do_not_overlap(self) -> None:
         plan = {
             "frontier_source_shard_index": 41,
