@@ -793,6 +793,16 @@ export CANDIDATE_GRADIENT_ACCUMULATION_STEPS="${CANDIDATE_GRADIENT_ACCUMULATION_
 export SMOKE_OPTIMIZER_UPDATES="${SMOKE_OPTIMIZER_UPDATES:?set bounded update count}"
 export SMOKE_WORKERS="${SMOKE_WORKERS:?set loader worker candidate}"
 export CANDIDATE_ID="${CANDIDATE_ID:?set a unique candidate ID}"
+export CANDIDATE_COMPILE="${CANDIDATE_COMPILE:?set exactly true or false}"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTHONHASHSEED=0
+
+TRAINER_COMPILE_ARGS=()
+case "$CANDIDATE_COMPILE" in
+  true) TRAINER_COMPILE_ARGS+=(--compile) ;;
+  false) ;;
+  *) echo "CANDIDATE_COMPILE must be exactly true or false" >&2; exit 2 ;;
+esac
 
 test $((CANDIDATE_GLOBAL_MICROBATCH_ROWS % GPU_COUNT)) -eq 0
 SEQUENCE_LENGTH="$(jq -er '.sequence_length' \
@@ -822,18 +832,23 @@ test "$(jq -er '.training_consumption.optimizer_updates' \
   "$SMOKE_ORDER/manifest.json")" -ge "$SMOKE_OPTIMIZER_UPDATES"
 
 cd "$PROJECT_ROOT"
-torchrun --standalone --nproc-per-node="$GPU_COUNT" -m pretrain.train \
+"$PYTHON_BIN" -m torch.distributed.run \
+  --standalone --nproc-per-node="$GPU_COUNT" -m pretrain.train \
   --order-manifest "$SMOKE_ORDER/manifest.json" \
   --tokenizer "$DATA_ROOT/tokenizer/starcoder2" \
   --model-size 1.3b \
   --device cuda \
   --precision bfloat16 \
+  --deterministic \
+  --activation-checkpointing \
+  --fused-adamw \
   --workers "$SMOKE_WORKERS" \
   --warmup-steps 0 \
   --checkpoint "$DATA_ROOT/checkpoints/geometry-$RUN_ID-$CANDIDATE_ID/last.pt" \
   --checkpoint-every "$SMOKE_OPTIMIZER_UPDATES" \
   --wandb-mode offline \
-  --wandb-run-name "geometry-$RUN_ID-$CANDIDATE_ID"
+  --wandb-run-name "geometry-$RUN_ID-$CANDIDATE_ID" \
+  "${TRAINER_COMPILE_ARGS[@]}"
 ```
 
 The diagnostic validator may skip the already completed full payload hash; the
@@ -843,17 +858,19 @@ data-wait time, GPU utilization, compilation behavior, and network checkpoint
 latency. Accumulation changes effective optimizer batch but does not solve a
 per-forward memory failure.
 
-Publish a checksummed geometry JSON in `$DATA_ROOT/audits/$RUN_ID/` containing
+Publish a checksummed **candidate** geometry JSON in `$DATA_ROOT/audits/$RUN_ID/` containing
 the exact GPU topology/runtime, candidate order hashes, measurements, and the
 accepted `global_microbatch_rows`, `gradient_accumulation_steps`, worker count,
-fixed-batch overfit rows, and compile decision. Call it
-`accepted-geometry.json`; never edit it in place:
+fixed-batch overfit rows, and compile decision. This pre-order artifact selects
+materialization geometry; it is not the final accepted-geometry receipt used by
+the run authority because the final train/validation order hashes do not exist
+yet. Call it `candidate-geometry.json`; never edit it in place:
 
 ```bash
-GEOMETRY_RECORD="$DATA_ROOT/audits/$RUN_ID/accepted-geometry.json"
-test -f "$GEOMETRY_RECORD"
-sha256sum "$GEOMETRY_RECORD" > "$GEOMETRY_RECORD.sha256"
-sha256sum -c "$GEOMETRY_RECORD.sha256"
+CANDIDATE_GEOMETRY_RECORD="$DATA_ROOT/audits/$RUN_ID/candidate-geometry.json"
+test -f "$CANDIDATE_GEOMETRY_RECORD"
+sha256sum "$CANDIDATE_GEOMETRY_RECORD" > "$CANDIDATE_GEOMETRY_RECORD.sha256"
+sha256sum -c "$CANDIDATE_GEOMETRY_RECORD.sha256"
 ```
 
 **GO only if:** global rows divide world size; BF16 forward/backward and the
@@ -870,9 +887,9 @@ Read, do not retype, the accepted geometry. Resume the same production output
 without `--stop-after-packing`:
 
 ```bash
-GEOMETRY_RECORD="$DATA_ROOT/audits/$RUN_ID/accepted-geometry.json"
-GLOBAL_MICROBATCH_ROWS="$(jq -er '.accepted.global_microbatch_rows' "$GEOMETRY_RECORD")"
-GRADIENT_ACCUMULATION_STEPS="$(jq -er '.accepted.gradient_accumulation_steps' "$GEOMETRY_RECORD")"
+CANDIDATE_GEOMETRY_RECORD="$DATA_ROOT/audits/$RUN_ID/candidate-geometry.json"
+GLOBAL_MICROBATCH_ROWS="$(jq -er '.accepted.global_microbatch_rows' "$CANDIDATE_GEOMETRY_RECORD")"
+GRADIENT_ACCUMULATION_STEPS="$(jq -er '.accepted.gradient_accumulation_steps' "$CANDIDATE_GEOMETRY_RECORD")"
 
 "$PYTHON_BIN" "$PROJECT_ROOT/scripts/materialize_training_corpus.py" \
   --root "$DATA_ROOT" \
@@ -985,6 +1002,19 @@ using the accepted geometry exactly. Keep it outside the immutable hot copy:
 ```bash
 export DDP_DIAGNOSTIC_UPDATES="${DDP_DIAGNOSTIC_UPDATES:?set bounded update count}"
 export DIAGNOSTIC_CHECKPOINT_EVERY="${DIAGNOSTIC_CHECKPOINT_EVERY:?set measured cadence}"
+export DIAGNOSTIC_EVAL_EVERY="${DIAGNOSTIC_EVAL_EVERY:?set measured cadence}"
+export DIAGNOSTIC_EVAL_BATCHES="${DIAGNOSTIC_EVAL_BATCHES:?set bounded validation batches}"
+export DIAGNOSTIC_LOG_EVERY="${DIAGNOSTIC_LOG_EVERY:?set intended log cadence}"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTHONHASHSEED=0
+CANDIDATE_GEOMETRY_RECORD="$DATA_ROOT/audits/$RUN_ID/candidate-geometry.json"
+CANDIDATE_COMPILE="$(jq -er '.accepted.compile_model' "$CANDIDATE_GEOMETRY_RECORD")"
+DDP_COMPILE_ARGS=()
+case "$CANDIDATE_COMPILE" in
+  true) DDP_COMPILE_ARGS+=(--compile) ;;
+  false) ;;
+  *) echo "candidate compile decision must be boolean" >&2; exit 2 ;;
+esac
 LOCAL_SEQUENCE_LENGTH="$(jq -er '.sequence_length' \
   "$GPU_PACKED/packed/train/python/manifest.json")"
 LOCAL_DIAGNOSTIC_TOKENS=$((
@@ -1038,17 +1068,27 @@ supervisor kills the complete child process group to avoid orphaned ranks and
 checkpoint leases.
 
 ```bash
-torchrun --standalone --nproc-per-node="$GPU_COUNT" -m pretrain.train \
+"$PYTHON_BIN" -m torch.distributed.run \
+  --standalone --nproc-per-node="$GPU_COUNT" -m pretrain.train \
   --order-manifest "$LOCAL_DIAGNOSTIC_ORDER/manifest.json" \
   --tokenizer "$DATA_ROOT/tokenizer/starcoder2" \
+  --validation-order-manifest "$GPU_PACKED/orders/validation/manifest.json" \
   --model-size 1.3b \
   --device cuda \
   --precision bfloat16 \
-  --workers "$(jq -er '.accepted.workers' "$GEOMETRY_RECORD")" \
+  --deterministic \
+  --activation-checkpointing \
+  --fused-adamw \
+  --workers "$(jq -er '.accepted.workers' "$CANDIDATE_GEOMETRY_RECORD")" \
   --checkpoint "$DATA_ROOT/checkpoints/ddp-gate-$RUN_ID/last.pt" \
   --checkpoint-every "$DIAGNOSTIC_CHECKPOINT_EVERY" \
+  --eval-every "$DIAGNOSTIC_EVAL_EVERY" \
+  --eval-batches "$DIAGNOSTIC_EVAL_BATCHES" \
+  --eval-at-start \
+  --log-every "$DIAGNOSTIC_LOG_EVERY" \
   --wandb-mode offline \
-  --wandb-run-name "ddp-gate-$RUN_ID"
+  --wandb-run-name "ddp-gate-$RUN_ID" \
+  "${DDP_COMPILE_ARGS[@]}"
 
 # Resume uses the same arguments and adds:
 # --resume "$DATA_ROOT/checkpoints/ddp-gate-$RUN_ID/last.pt"
@@ -1060,12 +1100,54 @@ ownership is disjoint; uninterrupted versus resumed model/optimizer/cursor/RNG
 states match under the documented deterministic gate; checkpoint rollback from
 a deliberately interrupted write works; and measured data/communication/
 checkpoint performance is acceptable. One mature replicated 1.284B FP32 AdamW
-checkpoint is about 15.4 GB; reserve at least two durable generations (about
-31 GB plus overhead) per active gate/run. Each DDP replica also holds FP32
+checkpoint is about 15.4 GB. Atomic rotation retains latest and previous while
+writing the next temporary generation, so a fresh lineage must have room for
+three mature generations (about 46.2 GB), plus at least the launcher's explicit
+`max(1 GiB, 10% of one generation)` headroom. Each DDP replica also holds FP32
 parameters, gradients, and two Adam moments: 20,536,918,016 persistent bytes
 per GPU before activations and workspaces. The launcher rejects the 1.3B path
 below 32 GiB/device and heterogeneous visible GPUs; still require the measured
 full-topology memory smoke because 32 GiB is only an admission floor.
+
+After the final train and validation orders exist, run a separate bounded soak
+against those exact manifests with the accepted geometry and production flags.
+Time it with an external monotonic wall clock after compiler warm-up; record the
+starting and ending authoritative consumed-input-token counters and include at
+least one validation, mature checkpoint, offline-W&B log interval, graceful
+stop, and exact six-rank resume. The accepted receipt's throughput must be the
+counter delta divided by this end-to-end elapsed time—not the trainer's
+per-step `perf/input_tokens_per_second`, which intentionally excludes
+validation and checkpoint pauses. Publish the fresh write-once receipt as
+`$DATA_ROOT/audits/$RUN_ID/accepted-geometry.json`, bound to the final train and
+validation manifest SHA-256 values. Never relabel or copy the earlier candidate
+record: the immutable run-authority builder rejects different order hashes.
+
+The final receipt must contain this exact object under
+`measurements.throughput_measurement` (the integers shown are a coherent
+6-row, accumulation-2, 4096-token, 100-update example):
+
+```json
+{
+  "scope": "end-to-end-including-validation-checkpoint-wandb-and-resume",
+  "timer": "time.monotonic_ns",
+  "counter": "trainer.consumed_input_tokens",
+  "start_consumed_input_tokens": 0,
+  "end_consumed_input_tokens": 4915200,
+  "elapsed_wall_time_ns": 4915200000000,
+  "validation_events": 1,
+  "checkpoint_events": 1,
+  "wandb_log_events": 1,
+  "resume_verified": true
+}
+```
+
+The launcher independently re-hashes that receipt and rejects execute unless
+the soak is at least 100 optimizer updates, the counter delta equals
+`soak_steps * global_microbatch_rows * gradient_accumulation_steps *
+sequence_length`, and reported tokens/s matches delta divided by elapsed wall
+time within one part per million. It also requires scaling efficiency at least
+0.70, data-wait fraction at most 0.05, and minimum free memory per GPU of at
+least `max(8 GiB, 10% of physical memory)`.
 
 ## 10. Final launch record and launch — GO/NO-GO 10
 
@@ -1112,10 +1194,24 @@ export TRAIN_WARMUP_STEPS="${TRAIN_WARMUP_STEPS:?read from the frozen run manife
 export TRAIN_WEIGHT_DECAY="${TRAIN_WEIGHT_DECAY:?read from the frozen run manifest}"
 export TRAIN_MAX_GRAD_NORM="${TRAIN_MAX_GRAD_NORM:?read from the frozen run manifest}"
 export TRAIN_SEED="${TRAIN_SEED:?read from the frozen run manifest}"
-export TRAIN_WORKERS="$(jq -er '.accepted.workers' "$GEOMETRY_RECORD")"
+export ACCEPTED_GEOMETRY_RECORD="$DATA_ROOT/audits/$RUN_ID/accepted-geometry.json"
+test -f "$ACCEPTED_GEOMETRY_RECORD"
+(
+  cd "$(dirname "$ACCEPTED_GEOMETRY_RECORD")"
+  sha256sum -c "$(basename "$ACCEPTED_GEOMETRY_RECORD").sha256"
+)
+export TRAIN_WORKERS="$(jq -er '.accepted.workers' "$ACCEPTED_GEOMETRY_RECORD")"
+ACCEPTED_COMPILE="$(jq -er '.accepted.compile_model' "$ACCEPTED_GEOMETRY_RECORD")"
+PRODUCTION_COMPILE_ARGS=()
+case "$ACCEPTED_COMPILE" in
+  true) PRODUCTION_COMPILE_ARGS+=(--compile) ;;
+  false) ;;
+  *) echo "accepted compile decision must be boolean" >&2; exit 2 ;;
+esac
 export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:?read from measured network checkpoint policy}"
 export EVAL_EVERY="${EVAL_EVERY:?read from the frozen run manifest}"
 export EVAL_BATCHES="${EVAL_BATCHES:?read from the frozen run manifest}"
+export TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:?read from the frozen run manifest}"
 export CHECKPOINT_GENERATION_BYTES="${CHECKPOINT_GENERATION_BYTES:?measured conservative mature-generation bound}"
 
 GPU_PACKED_SOURCE="$GPU_PACKED"
@@ -1179,7 +1275,10 @@ LAUNCH_COMMON=(
   --warmup-steps "$TRAIN_WARMUP_STEPS" \
   --weight-decay "$TRAIN_WEIGHT_DECAY" \
   --max-grad-norm "$TRAIN_MAX_GRAD_NORM" \
-  --seed "$TRAIN_SEED"
+  --seed "$TRAIN_SEED" \
+  --log-every "$TRAIN_LOG_EVERY" \
+  --fused-adamw \
+  "${PRODUCTION_COMPILE_ARGS[@]}"
 
 # Review the dry run. Then construct the exact execute argv and its self-bound
 # immutable --run-authority using the linked authority procedure; invoke that

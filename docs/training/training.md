@@ -244,8 +244,8 @@ are proven:
   for this path and forbids a passthrough that disables it because this memory
   model depends on it;
 - the checkpoint is under an explicit durable root on a different filesystem
-  device from the local packed copy, and at least twice the measured checkpoint
-  generation upper bound is free;
+  device from the local packed copy, with enough free space to reach the
+  three-generation atomic-rotation peak plus the launcher's explicit headroom;
 - the checkpoint directory actually supports the trainer's required file
   `fsync`, directory `fsync`, nonblocking `flock`, hard-link, and atomic-replace
   operations; and
@@ -451,7 +451,9 @@ For the 1.284B FP32-parameter AdamW run, one mature checkpoint is approximately
 15.4 GB (about 5.1 GB of weights plus 10.3 GB of moments, before container
 overhead). The CLI default is therefore 1,000 optimizer steps, not 100. Benchmark
 checkpoint time on the real network volume, choose a cadence from measured
-recovery cost, and budget roughly two full generations for `last` + `previous`.
+recovery cost, and budget three full generations for `last`, `previous`, and
+the next temporary generation at the atomic-write peak, plus at least
+`max(1 GiB, 10% of one measured mature generation)` free headroom.
 
 ## Required GPU gates before the long run
 

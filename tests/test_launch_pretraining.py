@@ -258,7 +258,7 @@ class StorageAndResumeTest(unittest.TestCase):
             self.assertTrue(evidence.mount_read_only)
             self.assertEqual(evidence.classification, "local-or-block")
 
-    def test_new_lineage_requires_two_generation_free_space(self) -> None:
+    def test_new_lineage_requires_three_generation_peak_plus_headroom(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             local = root / "local"
@@ -277,17 +277,74 @@ class StorageAndResumeTest(unittest.TestCase):
                     )
                 return self._mount(path, device=actual_device, classification="network")
 
-            usage = lambda _path: SimpleNamespace(free=199)
-            with self.assertRaisesRegex(launch.PreflightError, "two generations"):
+            generation_bytes = 20 * 1024**3
+            expected_headroom = 2 * 1024**3
+            required = 3 * generation_bytes + expected_headroom
+            usage = lambda _path: SimpleNamespace(free=required - 1)
+            with self.assertRaisesRegex(
+                launch.PreflightError, "3-generation rotation peak"
+            ):
                 launch.inspect_storage_and_checkpoint(
                     local_data_root=local,
                     durable_checkpoint_root=durable,
                     checkpoint=checkpoints / "last.pt",
                     resume_generation="none",
-                    checkpoint_generation_bytes=100,
+                    checkpoint_generation_bytes=generation_bytes,
                     disk_usage=usage,
                     mount_inspector=mounts,
                 )
+
+            _, _, result = launch.inspect_storage_and_checkpoint(
+                local_data_root=local,
+                durable_checkpoint_root=durable,
+                checkpoint=checkpoints / "last.pt",
+                resume_generation="none",
+                checkpoint_generation_bytes=generation_bytes,
+                disk_usage=lambda _path: SimpleNamespace(free=required),
+                mount_inspector=mounts,
+            )
+            self.assertEqual(result.existing_distinct_generations, 0)
+            self.assertEqual(result.additional_generation_slots_required, 3)
+            self.assertEqual(result.peak_generation_count, 3)
+            self.assertEqual(result.headroom_bytes, expected_headroom)
+            self.assertEqual(result.required_free_bytes, required)
+
+    def test_hard_linked_existing_names_count_as_one_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local = root / "local"
+            durable = root / "durable"
+            checkpoints = durable / "checkpoints"
+            local.mkdir()
+            checkpoints.mkdir(parents=True)
+            checkpoint = checkpoints / "last.pt"
+            checkpoint.write_bytes(b"one-generation")
+            previous = checkpoints / "last.previous.pt"
+            previous.hardlink_to(checkpoint)
+            actual_device = durable.stat().st_dev
+
+            def mounts(path: Path) -> launch.MountEvidence:
+                if path.resolve() == local.resolve():
+                    return self._mount(
+                        path,
+                        device=actual_device + 1,
+                        classification="local-or-block",
+                    )
+                return self._mount(path, device=actual_device, classification="network")
+
+            headroom = launch._CHECKPOINT_HEADROOM_MINIMUM_BYTES
+            _, _, result = launch.inspect_storage_and_checkpoint(
+                local_data_root=local,
+                durable_checkpoint_root=durable,
+                checkpoint=checkpoint,
+                resume_generation="latest",
+                checkpoint_generation_bytes=100,
+                disk_usage=lambda _path: SimpleNamespace(free=2 * 100 + headroom),
+                mount_inspector=mounts,
+            )
+            self.assertEqual(result.existing_distinct_generations, 1)
+            self.assertEqual(result.additional_generation_slots_required, 2)
+            self.assertEqual(result.required_free_bytes, 2 * 100 + headroom)
 
     def test_previous_generation_is_selected_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -318,7 +375,9 @@ class StorageAndResumeTest(unittest.TestCase):
                 checkpoint=checkpoint,
                 resume_generation="previous",
                 checkpoint_generation_bytes=100,
-                disk_usage=lambda _path: SimpleNamespace(free=1_000),
+                disk_usage=lambda _path: SimpleNamespace(
+                    free=100 + launch._CHECKPOINT_HEADROOM_MINIMUM_BYTES
+                ),
                 mount_inspector=mounts,
             )
             self.assertEqual(result.resume_path, str(previous.resolve()))
@@ -487,18 +546,32 @@ class RuntimeAndCommandTest(unittest.TestCase):
         digest = launch.canonical_sha256(invocation)
         validated = {
             "status": "valid",
+            "sha256": "a" * 64,
             "launcher_argv_sha256": digest,
             "authorization_sha256": "a" * 64,
         }
-        with mock.patch.object(
-            launch, "validate_run_authority", return_value=validated
-        ) as validator:
+        strict_evidence = {"status": "pass", "soak_steps": 100}
+        with (
+            mock.patch.object(
+                launch, "validate_run_authority", return_value=validated
+            ) as validator,
+            mock.patch.object(
+                launch,
+                "_load_strict_geometry_evidence",
+                return_value=strict_evidence,
+            ) as strict_validator,
+        ):
             result = launch.validate_launch_authority(
                 Path("/durable/authority.json"),
                 invocation_argv=invocation,
             )
         validator.assert_called_once_with(Path("/durable/authority.json"))
+        strict_validator.assert_called_once_with(
+            Path("/durable/authority.json"),
+            expected_authority_sha256="a" * 64,
+        )
         self.assertEqual(result["current_launcher_argv_sha256"], digest)
+        self.assertEqual(result["geometry_soak"], strict_evidence)
 
         changed = [*invocation[:-1], "--dry-run"]
         with (
@@ -653,6 +726,11 @@ class RuntimeAndCommandTest(unittest.TestCase):
             latest_bytes=None,
             previous_exists=False,
             previous_bytes=None,
+            checkpoint_generation_bytes=100,
+            existing_distinct_generations=0,
+            additional_generation_slots_required=3,
+            peak_generation_count=3,
+            headroom_bytes=10,
             free_bytes=1_000,
             required_free_bytes=200,
             filesystem_capabilities={"atomic_replace": True},
@@ -976,6 +1054,11 @@ class RuntimeAndCommandTest(unittest.TestCase):
             latest_bytes=100,
             previous_exists=True,
             previous_bytes=100,
+            checkpoint_generation_bytes=100,
+            existing_distinct_generations=2,
+            additional_generation_slots_required=1,
+            peak_generation_count=3,
+            headroom_bytes=10,
             free_bytes=1_000,
             required_free_bytes=200,
             filesystem_capabilities={"atomic_replace": True},

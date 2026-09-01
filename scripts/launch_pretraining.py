@@ -46,6 +46,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from pretrain.model import ModelConfig  # noqa: E402
 from pretrain import data as training_data  # noqa: E402
+from pretrain.geometry_evidence import (  # noqa: E402
+    GeometryEvidenceError,
+    validate_authority_geometry_soak,
+)
 from pretrain.run_authority import (  # noqa: E402
     RunAuthorityError,
     canonical_sha256,
@@ -86,6 +90,10 @@ _CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 _PYTHON_HASH_SEED = "0"
 _FP32_BYTES = 4
 _MINIMUM_1P3B_DDP_DEVICE_BYTES = 32 * 1024**3
+_CHECKPOINT_ROTATION_PEAK_GENERATIONS = 3
+_CHECKPOINT_HEADROOM_MINIMUM_BYTES = 1 * 1024**3
+_CHECKPOINT_HEADROOM_NUMERATOR = 1
+_CHECKPOINT_HEADROOM_DENOMINATOR = 10
 _DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 30 * 60
 _STOP_REQUEST_ENVIRONMENT_VARIABLE = "PRETRAIN_STOP_REQUEST_FILE"
 _INTERNAL_SUPERVISOR_FLAG = "--internal-supervise-torchrun"
@@ -169,6 +177,11 @@ class CheckpointInspection:
     latest_bytes: int | None
     previous_exists: bool
     previous_bytes: int | None
+    checkpoint_generation_bytes: int
+    existing_distinct_generations: int
+    additional_generation_slots_required: int
+    peak_generation_count: int
+    headroom_bytes: int
     free_bytes: int
     required_free_bytes: int
     filesystem_capabilities: dict[str, bool]
@@ -890,12 +903,47 @@ def inspect_storage_and_checkpoint(
             f"Checkpoint generation estimate {checkpoint_generation_bytes} bytes is lower "
             f"than existing generation size {max(existing_sizes)} bytes"
         )
-    required_free = 2 * checkpoint_generation_bytes
+    # At steady state the atomic rotation retains ``last`` and ``previous``
+    # while writing the next complete temporary generation.  A fresh lineage
+    # therefore reaches a three-generation allocation peak on its third save.
+    # Count distinct inodes so an accidental hard-linked latest/previous pair
+    # cannot make the admission check under-reserve one generation.
+    existing_identities = {
+        (metadata.st_dev, metadata.st_ino)
+        for candidate, size in (
+            (checkpoint_path, latest_bytes),
+            (previous, previous_bytes),
+        )
+        if size is not None
+        for metadata in (candidate.stat(),)
+    }
+    existing_distinct_generations = len(existing_identities)
+    additional_generation_slots = max(
+        1,
+        _CHECKPOINT_ROTATION_PEAK_GENERATIONS - existing_distinct_generations,
+    )
+    proportional_headroom = (
+        checkpoint_generation_bytes * _CHECKPOINT_HEADROOM_NUMERATOR
+        + _CHECKPOINT_HEADROOM_DENOMINATOR
+        - 1
+    ) // _CHECKPOINT_HEADROOM_DENOMINATOR
+    headroom_bytes = max(
+        _CHECKPOINT_HEADROOM_MINIMUM_BYTES,
+        proportional_headroom,
+    )
+    required_free = (
+        additional_generation_slots * checkpoint_generation_bytes
+        + headroom_bytes
+    )
     free_bytes = int(disk_usage(checkpoint_parent).free)
     if free_bytes < required_free:
         raise PreflightError(
             f"Insufficient durable checkpoint free space: found {free_bytes} bytes, "
-            f"require at least {required_free} bytes for two generations"
+            f"require at least {required_free} bytes for "
+            f"{additional_generation_slots} additional checkpoint generation "
+            f"slot(s) needed to reach the "
+            f"{_CHECKPOINT_ROTATION_PEAK_GENERATIONS}-generation rotation peak plus "
+            f"{headroom_bytes} bytes explicit headroom"
         )
     inspection = CheckpointInspection(
         checkpoint=str(checkpoint_path),
@@ -906,6 +954,11 @@ def inspect_storage_and_checkpoint(
         latest_bytes=latest_bytes,
         previous_exists=previous_bytes is not None,
         previous_bytes=previous_bytes,
+        checkpoint_generation_bytes=checkpoint_generation_bytes,
+        existing_distinct_generations=existing_distinct_generations,
+        additional_generation_slots_required=additional_generation_slots,
+        peak_generation_count=_CHECKPOINT_ROTATION_PEAK_GENERATIONS,
+        headroom_bytes=headroom_bytes,
         free_bytes=free_bytes,
         required_free_bytes=required_free,
         filesystem_capabilities=filesystem_capabilities,
@@ -1442,7 +1495,57 @@ def validate_launch_authority(
         raise PreflightError(
             "Current launcher argv differs from the exact command authorized for this run"
         )
-    return {**result, "current_launcher_argv_sha256": actual}
+    geometry_soak = _load_strict_geometry_evidence(
+        path,
+        expected_authority_sha256=result.get("sha256"),
+    )
+    return {
+        **result,
+        "current_launcher_argv_sha256": actual,
+        "geometry_soak": geometry_soak,
+    }
+
+
+def _load_strict_geometry_evidence(
+    path: Path,
+    *,
+    expected_authority_sha256: Any,
+) -> dict[str, Any]:
+    """Re-read the authenticated authority and enforce complete-soak evidence.
+
+    ``validate_run_authority`` deliberately returns a compact summary.  The
+    launch gate needs the embedded geometry receipt as well, so it re-reads the
+    exact authority bytes and binds them to the digest that the core validator
+    just authenticated.  This keeps the stricter performance policy outside
+    the authority module while that schema remains independently maintained.
+    """
+
+    if (
+        not isinstance(expected_authority_sha256, str)
+        or _LOWERCASE_SHA256.fullmatch(expected_authority_sha256) is None
+    ):
+        raise PreflightError("Run-authority validation returned an invalid artifact digest")
+    candidate = Path(path)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise PreflightError(
+            f"Run authority is not a regular non-symlink file: {candidate}"
+        )
+    try:
+        payload_bytes = candidate.read_bytes()
+    except OSError as exc:
+        raise PreflightError(f"Cannot re-read run authority: {exc}") from exc
+    if hashlib.sha256(payload_bytes).hexdigest() != expected_authority_sha256:
+        raise PreflightError("Run authority changed after core validation")
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise PreflightError(f"Run authority is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise PreflightError("Run-authority root must be an object")
+    try:
+        return validate_authority_geometry_soak(payload)
+    except (GeometryEvidenceError, OSError, ValueError) as exc:
+        raise PreflightError(f"Strict geometry-soak validation failed: {exc}") from exc
 
 
 def render_torchrun_command(
@@ -1761,7 +1864,10 @@ def _parser() -> argparse.ArgumentParser:
         "--checkpoint-generation-bytes",
         type=int,
         required=True,
-        help="measured upper bound for one mature checkpoint; free-space gate uses 2x",
+        help=(
+            "measured upper bound for one mature checkpoint; free-space gate "
+            "reserves the three-generation rotation peak plus explicit headroom"
+        ),
     )
     parser.add_argument(
         "--resume-generation",
