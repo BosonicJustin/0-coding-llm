@@ -395,6 +395,28 @@ class PostCurationOrchestratorTests(unittest.TestCase):
             self.assertFalse(_existing_lock_is_held(lock, label="test lock"))
             self.assertFalse(lock.exists())
 
+    def test_existing_lock_probe_uses_shared_lock_on_read_only_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock = Path(temporary) / "idle.lock"
+            lock.write_bytes(b"unchanged")
+            operations: list[int] = []
+
+            def portable_flock(_descriptor: int, operation: int) -> None:
+                operations.append(operation)
+                if operation & fcntl.LOCK_EX:
+                    raise OSError(9, "exclusive lock requires write access")
+
+            with mock.patch(
+                "pretrain.postcuration_orchestrator.fcntl.flock",
+                side_effect=portable_flock,
+            ):
+                self.assertFalse(_existing_lock_is_held(lock, label="test lock"))
+
+            self.assertEqual(
+                operations, [fcntl.LOCK_SH | fcntl.LOCK_NB, fcntl.LOCK_UN]
+            )
+            self.assertEqual(lock.read_bytes(), b"unchanged")
+
     def test_existing_lock_probe_detects_held_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             lock = Path(temporary) / "held.lock"

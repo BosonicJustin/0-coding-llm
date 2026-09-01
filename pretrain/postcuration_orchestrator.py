@@ -278,8 +278,11 @@ def _existing_lock_is_held(path: Path, *, label: str) -> bool:
             raise PostCurationOrchestrationError(
                 f"{label} changed identity while being opened: {path}"
             )
+        # Every writer uses an exclusive lock.  Probe it with a shared lock so
+        # the read-only descriptor remains portable to flock implementations
+        # that reject LOCK_EX unless the file was opened for writing.
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             return True
         except OSError as exc:
