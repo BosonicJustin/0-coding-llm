@@ -32,6 +32,7 @@ the production runbook for ordered execution.
 - [Packed training data and loader](training/training-data.md)
 - [Training harness](training/training.md)
 - [Immutable pre-training run authority](training/pretraining-run-authority.md)
+- [One-chunk overfit and exact-resume qualification](operations/one-chunk-overfit-qualification.md)
 - [Six-GPU launch qualification](operations/six-gpu-launch-qualification.md)
 
 ## Post-training

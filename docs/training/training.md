@@ -111,7 +111,8 @@ checkpoints use pickle and are not safe when obtained from an untrusted source.
 
 The default command is entirely local, creates a disposable synthetic corpus,
 loads one batch through the real shard/order/mmap/collator path, freezes that
-batch by content hash, and asserts that its loss falls by at least 50%:
+global batch by content hash, verifies that it contains real in-row document
+boundaries, and requires both a 10x loss reduction and final loss at most 0.5:
 
 ```bash
 python scripts/overfit_single_chunk.py
@@ -120,48 +121,26 @@ python scripts/overfit_single_chunk.py
 Artifacts are written to `runs/overfit-single-chunk/`:
 
 - `checkpoint.pt`: a resumable full-state checkpoint;
+- `checkpoint.previous.pt`: the prior complete atomic generation after rotation;
 - `result.json`: initial/final loss, ratio, model configuration, batch hash,
-  parameter count, and data identity.
+  boundary evidence, parameter count, data identity, and optional exact-resume
+  component digests.
 
 `result.json` is replaced with `status: running` before optimization begins, so
 an interrupted rerun cannot leave an older passing artifact behind. A completed
 acceptance failure is persisted with `status: failed` and explicit failure
 codes, and the command exits nonzero. Only `status: passed` is acceptable
-evidence for the production gate.
-
-Exercise one fixed batch from the real packed corpus on a GPU with the small
-debug architecture first:
-
-```bash
-python scripts/overfit_single_chunk.py \
-  --order-manifest /local-nvme/train/order-seed-1234/manifest.json \
-  --tokenizer /workspace/dataset/tokenizer/starcoder2 \
-  --model-size tiny \
-  --device cuda \
-  --precision bfloat16 \
-  --steps 100
-```
-
-Then run the same gate with the exact architecture:
-
-```bash
-python scripts/overfit_single_chunk.py \
-  --order-manifest /local-nvme/train/order-seed-1234/manifest.json \
-  --tokenizer /workspace/dataset/tokenizer/starcoder2 \
-  --model-size 1.3b \
-  --device cuda \
-  --parameter-dtype float32 \
-  --precision bfloat16 \
-  --batch-size 1 \
-  --steps 100
-```
+evidence for the production gate. Follow the exact single-GPU and six-GPU
+uninterrupted/partial/resume commands in the
+[one-chunk qualification runbook](../operations/one-chunk-overfit-qualification.md).
 
 The script reuses the same loaded tensors at every step; it does not repeatedly
 ask the sampler for the next row. Its checksum-verified diagnostic prefix loader
 may select a smaller batch than the order's frozen global microbatch without
 creating a training cursor or weakening the production sampler contract. The
-fixed-batch SHA-256 is stored in the
-checkpoint, so resume fails if even one tensor value or shape changes.
+global fixed-batch SHA-256 and world size are stored in the checkpoint, so
+resume fails if the packed tensors, rank topology, tokenizer, model, optimizer
+trajectory, or implementation identity changes.
 
 ## Pre-training entry point
 

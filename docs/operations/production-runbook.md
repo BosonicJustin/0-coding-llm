@@ -970,51 +970,14 @@ assuming network-volume throughput.
 
 ## 9. Overfit, resume, and DDP gates — GO/NO-GO 9
 
-Use the finalized local train order. Select the fixed diagnostic batch size
-from the accepted geometry record rather than assuming a value:
-
-```bash
-TRAIN_ORDER="$GPU_PACKED/orders/train/manifest.json"
-OVERFIT_BATCH_ROWS="$(jq -er '.accepted.overfit_batch_rows' "$GEOMETRY_RECORD")"
-
-cd "$PROJECT_ROOT"
-"$PYTHON_BIN" scripts/overfit_single_chunk.py \
-  --order-manifest "$TRAIN_ORDER" \
-  --tokenizer "$DATA_ROOT/tokenizer/starcoder2" \
-  --model-size tiny \
-  --device cuda \
-  --precision bfloat16 \
-  --batch-size "$OVERFIT_BATCH_ROWS" \
-  --steps 100 \
-  --output-dir "$DATA_ROOT/audits/$RUN_ID/overfit-tiny"
-
-"$PYTHON_BIN" scripts/overfit_single_chunk.py \
-  --order-manifest "$TRAIN_ORDER" \
-  --tokenizer "$DATA_ROOT/tokenizer/starcoder2" \
-  --model-size 1.3b \
-  --device cuda \
-  --parameter-dtype float32 \
-  --precision bfloat16 \
-  --batch-size "$OVERFIT_BATCH_ROWS" \
-  --steps 100 \
-  --checkpoint-every 10 \
-  --output-dir "$DATA_ROOT/audits/$RUN_ID/overfit-1.3b"
-
-jq -e '.status == "passed" and .loss_ratio <= .required_loss_ratio' \
-  "$DATA_ROOT/audits/$RUN_ID/overfit-1.3b/result.json" >/dev/null
-```
-
-For the forced-stop overfit test, start the same 1.3B command in a dedicated
-output directory, wait until a scheduled `checkpoint.pt` has closed, interrupt
-the process, then rerun the **identical trajectory command** with:
-
-```bash
---resume "$DATA_ROOT/audits/$RUN_ID/overfit-resume/checkpoint.pt"
-```
-
-Do not change `--steps`, batch, seed, precision, model, or optimizer settings;
-they are checkpoint identity. Compare its final model and optimizer tensors to
-an uninterrupted control from the same initial seed and fixed-batch hash.
+Use the finalized local train order and execute the exact three-phase
+single-GPU and six-GPU procedure in the
+[one-chunk overfit and exact-resume runbook](one-chunk-overfit-qualification.md).
+GO requires a boundary-bearing packed batch, final loss at most 0.5, at least a
+10x loss reduction, and exact semantic equality of the resumed final model,
+optimizer, counters, all rank RNG states, trajectory, data/tokenizer identities,
+and world size against an uninterrupted reference. A CPU pass qualifies only
+the harness, not CUDA.
 
 Next build a new bounded diagnostic order from the GPU-local packed manifests,
 using the accepted geometry exactly. Keep it outside the immutable hot copy:

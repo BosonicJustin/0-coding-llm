@@ -89,7 +89,7 @@ profile; explicit exits and finalization can still force a recovery snapshot.
 The guarded launcher is the production entrypoint: it proves closed collection
 and final preprocess coverage, takes nonblocking launcher and preprocess locks,
 checks the measured storage-v3 admission, and freezes the exact source/path/code
-identity before it invokes the curator. Run its read-only data preflight first.
+identity before it invokes the curator. Run its non-launching preflight first.
 
 ```bash
 PROJECT_ROOT=/workspace/0-coding-llm

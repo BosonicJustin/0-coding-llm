@@ -599,16 +599,27 @@ class GracefulStopController:
 class FixedBatchStream(Iterable[Mapping[str, torch.Tensor]]):
     """Yield one immutable diagnostic chunk forever."""
 
-    def __init__(self, batch: Mapping[str, torch.Tensor]) -> None:
+    def __init__(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        *,
+        identity: str | None = None,
+    ) -> None:
         missing = set(_REQUIRED_BATCH_KEYS).difference(batch)
         if missing:
             raise ValueError(f"Fixed batch is missing keys: {sorted(missing)}")
+        if identity is not None and (
+            not isinstance(identity, str) or not identity.strip()
+        ):
+            raise ValueError("Fixed-batch identity must be a non-empty string")
         self.batch = {
             key: value.detach().cpu().clone().contiguous()
             for key, value in batch.items()
             if isinstance(value, torch.Tensor)
         }
-        self.identity = f"fixed-batch-sha256:{batch_fingerprint(self.batch)}"
+        self.identity = identity or (
+            f"fixed-batch-sha256:{batch_fingerprint(self.batch)}"
+        )
 
     def __iter__(self) -> Iterator[Mapping[str, torch.Tensor]]:
         while True:

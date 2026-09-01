@@ -79,9 +79,11 @@ Run these in order and stop on the first failure:
 1. `scripts/qualify_cuda_model.py` on the production CUDA build. It compares
    FlexAttention with dense SDPA, tests document/row isolation, performs BF16
    backward, and takes one AdamW step.
-2. `scripts/overfit_single_chunk.py` with a real packed order, the 1.3B model,
-   4,096-token context, and the intended precision. Require a material loss
-   reduction and finite gradients.
+2. Complete the separate
+   [one-chunk overfit and exact-resume qualification](one-chunk-overfit-qualification.md)
+   with a real packed order, the 1.3B model, 4,096-token context, and all six
+   ranks. Require both frozen memorization thresholds and a bit-exact resumed
+   trajectory.
 3. A six-rank full-topology smoke using the intended global microbatch,
    accumulation, worker count, activation-checkpointing, compile, and fused
    optimizer decisions. Measure every GPU's allocated/reserved peak, aggregate

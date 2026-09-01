@@ -1192,6 +1192,19 @@ class TrainingHarnessTest(unittest.TestCase):
                 validation_sampler.close()
                 validation_loader.dataset.close()
 
+    def test_fixed_batch_stream_accepts_authenticated_shared_identity(self) -> None:
+        batch = make_batch()
+        stream = FixedBatchStream(
+            batch,
+            identity="fixed-global-batch-sha256:" + "a" * 64,
+        )
+        self.assertEqual(
+            stream.identity,
+            "fixed-global-batch-sha256:" + "a" * 64,
+        )
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            FixedBatchStream(batch, identity="")
+
     def test_graceful_stop_checkpoints_clean_boundary_and_resumes_exactly(self) -> None:
         stream = FixedBatchStream(make_batch(masked_targets=2))
         config = self.train_config(max_steps=4, accumulation=2)

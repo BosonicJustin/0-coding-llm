@@ -43,7 +43,8 @@ navigation index, not an alternative procedure.
 ## Pre-training
 
 - `qualify_cuda_model.py` — CUDA FlexAttention correctness gate.
-- `overfit_single_chunk.py` — fixed-batch loss-reduction gate.
+- `overfit_single_chunk.py` — packed-boundary memorization and exact-resume gate,
+  supporting one process or production-style DDP under torchrun.
 - `benchmark_training_loader.py` — loader and host-to-device calibration.
 - `launch_pretraining.py` — production preflight, signal supervisor, and
   six-rank launcher.

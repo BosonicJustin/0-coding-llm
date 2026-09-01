@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OVERFIT_SCRIPT = PROJECT_ROOT / "scripts" / "overfit_single_chunk.py"
@@ -20,6 +22,107 @@ OVERFIT_SPEC.loader.exec_module(OVERFIT_MODULE)
 
 
 class OverfitGateArtifactTest(unittest.TestCase):
+    def test_fixture_exercises_real_packed_boundary_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            order = OVERFIT_MODULE.build_synthetic_order(
+                Path(temporary),
+                sequence_length=16,
+                vocab_size=64,
+            )
+            batch = OVERFIT_MODULE.load_one_packed_batch(order, batch_size=2)
+            diagnostics = OVERFIT_MODULE.packed_boundary_diagnostics(batch)
+            self.assertGreater(diagnostics["in_row_document_boundaries"], 0)
+            self.assertEqual(
+                diagnostics["in_row_document_boundaries"],
+                diagnostics["masked_boundary_targets"],
+            )
+
+            transitions = (
+                batch["document_ids"][:, 1:]
+                != batch["document_ids"][:, :-1]
+            )
+            row, column = torch.nonzero(transitions, as_tuple=False)[0].tolist()
+            batch["labels"][row, column] = 1
+            with self.assertRaisesRegex(ValueError, "mask exactly"):
+                OVERFIT_MODULE.packed_boundary_diagnostics(batch)
+
+    def test_production_trainer_partial_resume_matches_reference_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            order = OVERFIT_MODULE.build_synthetic_order(
+                root / "fixture",
+                sequence_length=16,
+                vocab_size=64,
+            )
+            tokenizer_manifest, tokenizer_vocabulary = (
+                OVERFIT_MODULE.synthetic_tokenizer_identities(64)
+            )
+            common = dict(
+                order_manifest=order,
+                model_config=OVERFIT_MODULE.tiny_model_config(
+                    vocab_size=64,
+                    max_seq_len=16,
+                ),
+                device=torch.device("cpu"),
+                parameter_dtype=torch.float32,
+                precision="float32",
+                steps=30,
+                checkpoint_every=10,
+                batch_size=2,
+                learning_rate=3e-3,
+                required_loss_ratio=0.9,
+                required_final_loss=10.0,
+                seed=1234,
+                logger=OVERFIT_MODULE.NullLogger(),
+                compile_model=False,
+                tokenizer_manifest_sha256=tokenizer_manifest,
+                tokenizer_vocabulary_sha256=tokenizer_vocabulary,
+            )
+            control_checkpoint = root / "control" / "checkpoint.pt"
+            control = OVERFIT_MODULE.run_overfit(
+                **common,
+                checkpoint_path=control_checkpoint,
+                resume_path=None,
+            )
+            self.assertEqual(control["status"], "passed")
+            self.assertTrue(
+                control_checkpoint.with_name("checkpoint.previous.pt").is_file()
+            )
+
+            resumed_checkpoint = root / "resumed" / "checkpoint.pt"
+            partial = OVERFIT_MODULE.run_overfit(
+                **common,
+                checkpoint_path=resumed_checkpoint,
+                resume_path=None,
+                until_step=15,
+            )
+            self.assertEqual(partial["status"], "checkpointed")
+            resumed = OVERFIT_MODULE.run_overfit(
+                **common,
+                checkpoint_path=resumed_checkpoint,
+                resume_path=resumed_checkpoint,
+                exact_reference_checkpoint=control_checkpoint,
+            )
+            self.assertEqual(resumed["status"], "passed")
+            self.assertTrue(resumed["exact_resume"]["exact_match"])
+            self.assertEqual(resumed["exact_resume"]["mismatches"], [])
+
+            tampered_checkpoint = root / "tampered.pt"
+            tampered = torch.load(
+                control_checkpoint,
+                map_location="cpu",
+                weights_only=False,
+            )
+            parameter_name = next(iter(tampered["model"]))
+            tampered["model"][parameter_name].reshape(-1)[0].add_(1)
+            torch.save(tampered, tampered_checkpoint)
+            comparison = OVERFIT_MODULE.compare_checkpoint_trajectories(
+                resumed_checkpoint,
+                tampered_checkpoint,
+            )
+            self.assertFalse(comparison["exact_match"])
+            self.assertIn("model", comparison["mismatches"])
+
     def test_acceptance_failure_is_persisted_and_returns_nonzero(self) -> None:
         failure = {
             "status": "failed",

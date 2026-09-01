@@ -247,6 +247,33 @@ class FastCurationLauncherTest(unittest.TestCase):
             self.assertIn('"child_returncode":7', log)
             self.assertIn('{"failed":true}', log)
 
+    def test_authorized_resume_rejects_any_path_identity_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture, config = self.fixture(Path(temporary))
+
+            def factory(*_args: object, **_kwargs: object) -> FakeProcess:
+                return FakeProcess(b'{"failed":true}\n', 1)
+
+            with self.production_probes(config):
+                code, _report = launcher.launch(config, popen_factory=factory)
+            self.assertEqual(code, 1)
+            drifted = launcher.resolve_config(
+                generation_root=fixture.root,
+                local_work_root=config.local_work_root,
+                quotas=fixture.quota_path,
+                policy=FAST_CANONICAL_POLICY,
+                benchmark_denylist=(
+                    PROJECT_ROOT / "configs" / "mbpp_denylist.json"
+                ),
+                log_path=fixture.root / "logs" / "different.log",
+                result_path=fixture.root / "logs" / "different.result.json",
+            )
+            with self.production_probes(drifted), self.assertRaisesRegex(
+                launcher.FastCurationLaunchError,
+                "belongs to another input/path/code identity",
+            ):
+                launcher.preflight_only(drifted)
+
     def test_success_publishes_receipt_and_identical_rerun_is_noop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _fixture, config = self.fixture(Path(temporary))
