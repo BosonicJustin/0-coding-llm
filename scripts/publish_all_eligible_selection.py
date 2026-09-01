@@ -268,6 +268,25 @@ def _is_primary_documents_scan(detail: str) -> bool:
     return detail in ("SCAN d", "SCAN TABLE documents AS d")
 
 
+def _is_archive_documents_search(detail: str) -> bool:
+    """Accept exact modern and legacy SQLite EQP wording for the archive lookup."""
+
+    return detail in (
+        f"SEARCH d USING COVERING INDEX {DOCUMENTS_ARCHIVE_INDEX} (archive=?)",
+        "SEARCH TABLE documents AS d USING COVERING INDEX "
+        f"{DOCUMENTS_ARCHIVE_INDEX} (archive=?)",
+    )
+
+
+def _is_rejection_documents_lookup(detail: str) -> bool:
+    """Accept exact modern and legacy SQLite EQP wording for the doc-id lookup."""
+
+    return detail in (
+        "SEARCH d USING PRIMARY KEY (doc_id=?) LEFT-JOIN",
+        "SEARCH TABLE documents AS d USING PRIMARY KEY (doc_id=?)",
+    )
+
+
 def build_all_eligible_keep_bitmap(
     records: int, rejected_manifest_indices: Sequence[int] | set[int]
 ) -> tuple[bytes, int]:
@@ -975,10 +994,10 @@ class AllEligiblePublisher:
         document_searches = [
             detail
             for detail in plan
-            if "SEARCH d USING COVERING INDEX " + DOCUMENTS_ARCHIVE_INDEX in detail
+            if _is_archive_documents_search(detail)
         ]
         if len(document_searches) != 1 or any(
-            detail.startswith("SCAN d")
+            detail.startswith(("SCAN d", "SCAN TABLE documents AS d"))
             for detail in plan
         ):
             raise AllEligiblePublicationError(
@@ -1016,7 +1035,7 @@ class AllEligiblePublisher:
         document_lookups = [
             detail
             for detail in plan
-            if "SEARCH d USING PRIMARY KEY" in detail and "doc_id" in detail
+            if _is_rejection_documents_lookup(detail)
         ]
         if len(reason_scans) != 1 or len(document_lookups) != 1:
             raise AllEligiblePublicationError(

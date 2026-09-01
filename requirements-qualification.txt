@@ -5,3 +5,6 @@
 numpy>=2.0,<3
 tokenizers>=0.21,<0.24
 zstandard>=0.23,<1
+# The post-curation orchestrator authenticates the curation publisher modules,
+# whose preprocessing boundary uses xxhash for frozen content identities.
+xxhash>=3.5,<4

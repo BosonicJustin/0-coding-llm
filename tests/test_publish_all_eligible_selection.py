@@ -29,6 +29,8 @@ from pretrain.selection_contract import (
 from publish_all_eligible_selection import (
     AllEligiblePublicationError,
     AllEligiblePublisher,
+    _is_archive_documents_search,
+    _is_rejection_documents_lookup,
 )
 from test_curate_corpus import CorpusFixture
 
@@ -587,6 +589,54 @@ class AllEligiblePublisherTest(unittest.TestCase):
                         for detail in publisher.rejection_inventory_query_plan
                     )
                 )
+
+    def test_archive_lookup_plan_accepts_legacy_sqlite_wording_only(self) -> None:
+        self.assertTrue(
+            _is_archive_documents_search(
+                "SEARCH d USING COVERING INDEX "
+                "sqlite_autoindex_documents_2 (archive=?)"
+            )
+        )
+        self.assertTrue(
+            _is_archive_documents_search(
+                "SEARCH TABLE documents AS d USING COVERING INDEX "
+                "sqlite_autoindex_documents_2 (archive=?)"
+            )
+        )
+        self.assertFalse(
+            _is_archive_documents_search(
+                "SEARCH TABLE documents AS d USING COVERING INDEX "
+                "sqlite_autoindex_documents_3 (archive=?)"
+            )
+        )
+        self.assertFalse(
+            _is_archive_documents_search(
+                "SEARCH TABLE documents AS d USING INDEX "
+                "sqlite_autoindex_documents_2 (archive=?)"
+            )
+        )
+
+    def test_rejection_lookup_plan_accepts_legacy_sqlite_wording_only(self) -> None:
+        self.assertTrue(
+            _is_rejection_documents_lookup(
+                "SEARCH d USING PRIMARY KEY (doc_id=?) LEFT-JOIN"
+            )
+        )
+        self.assertTrue(
+            _is_rejection_documents_lookup(
+                "SEARCH TABLE documents AS d USING PRIMARY KEY (doc_id=?)"
+            )
+        )
+        self.assertFalse(
+            _is_rejection_documents_lookup(
+                "SEARCH TABLE documents AS d USING PRIMARY KEY (archive=?)"
+            )
+        )
+        self.assertFalse(
+            _is_rejection_documents_lookup(
+                "SEARCH TABLE other_documents AS d USING PRIMARY KEY (doc_id=?)"
+            )
+        )
 
     def test_production_constructor_requires_snapshot_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
