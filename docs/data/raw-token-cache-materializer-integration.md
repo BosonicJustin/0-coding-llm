@@ -1,11 +1,11 @@
 # Raw-token-cache materializer integration contract
 
-This specification describes a future optimization to
+This specification defines the implemented opt-in optimization in
 `pretrain/materialize.py`: replace repeated StarCoder2 tokenization of v7
 all-eligible documents with authenticated reads from the curation-independent
 raw token cache. It does **not** authorize using a cache as packed training
-data. The current raw-reader path remains authoritative until this integration
-is implemented, reviewed, benchmarked, and certified.
+data. The raw-reader/tokenizer path remains the default fallback when the two
+cache arguments are omitted.
 
 The read-only API is implemented in `pretrain/raw_token_cache_reader.py`. It
 maps one archive's `manifest_index` to that complete document's content token
@@ -14,9 +14,11 @@ attention.
 
 ## Required cache-generation authority
 
-Materialization must not learn trust identities from the cache directories it
+Materialization does not learn trust identities from the cache directories it
 is about to consume. Before enabling the adapter, publish a closed-world,
-canonical cache inventory with its own SHA-256 sidecar. The inventory must be
+canonical cache inventory with `scripts/publish_raw_token_cache_inventory.py`.
+The format and builder live in `pretrain/raw_token_cache_inventory.py`; its
+canonical manifest has an exact SHA-256 sidecar. The inventory is bound to:
 bound to:
 
 - the exact v7 selection-manifest SHA-256;
@@ -35,10 +37,10 @@ ordered cache archive. The cache-inventory manifest SHA-256 must become part of
 the materialization journal, final packed manifest, certification report, and
 resume identity. Changing it requires a new materialization generation.
 
-For each archive, construct `RawTokenCacheAuthority` from the certified cache
-inventory and the selection's independently validated source/tokenizer
-descriptors. Never construct it by reading the local cache manifest and then
-trusting the values just read.
+For each archive, `CorpusMaterializer` constructs `RawTokenCacheAuthority` from
+the certified inventory and independently compares it with the already
+validated selection/report/tokenizer descriptors. It never constructs source
+authority by reading and trusting the local per-archive cache manifest.
 
 ## Exact v7 join
 
@@ -130,6 +132,22 @@ Consequently, replacing tokenization with cache lookup must produce identical
 packed payload bytes, boundary arrays, document-index shards, per-split/domain
 totals, and order-v4 output for the same selection and construction settings.
 
+## Implemented invocation
+
+Both arguments are required together and become part of the durable journal,
+resume identity, final manifest, and `provenance/raw_token_cache.json`:
+
+```text
+--raw-token-cache-root CACHE_ROOT
+--raw-token-cache-inventory-root INVENTORY_ROOT
+```
+
+The cached and raw routes share every downstream writer, EOS, packing, order,
+and provenance authority. The adapter has a four-archive byte-identity oracle,
+payload-corruption-before-checkpoint test, inventory order-corruption test, and
+mid-archive crash/resume oracle in
+`tests/test_materialize_raw_token_cache.py`.
+
 ## Qualification gates
 
 Before production use, require all of the following:
@@ -149,6 +167,6 @@ Before production use, require all of the following:
    materially faster than pinned tokenizer replay after accounting for the
    one-time full integrity pass.
 
-If any gate fails, use the existing immutable raw-reader/tokenizer route. A
-cache is a replaceable acceleration artifact, never the source-of-truth corpus.
-
+If any gate fails, omit both cache arguments and use the existing immutable
+raw-reader/tokenizer route. A cache is a replaceable acceleration artifact,
+never the source-of-truth corpus.

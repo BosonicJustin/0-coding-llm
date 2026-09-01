@@ -8,9 +8,10 @@ independent immutable unit.
 
 This cache is intentionally **not directly trainable**. It has no curation
 decision, split, mixture, shuffle order, EOS boundary, packing, padding, or
-attention-mask authority. A future materializer may consume it only after it
-joins each document ordinal to an authenticated curation publication and then
-performs those missing steps.
+attention-mask authority. The v7 materializer adapter may consume it only
+through a separately published closed-world inventory; it then joins each
+document ordinal to the authenticated curation bitmap/fingerprint and performs
+all of those missing steps itself.
 
 ## Per-archive schema
 
@@ -109,3 +110,37 @@ default rerun deliberately rehashes completed caches rather than trusting file
 names. Use a new cache root if the raw source or tokenizer generation changes;
 the builder refuses to overwrite an existing cache bound to another identity.
 
+After preprocessing, cache construction, and the production v7 selection are
+all complete, certify the exact cache generation against that selection:
+
+```bash
+venv/bin/python scripts/publish_raw_token_cache_inventory.py \
+  --root /workspace/dataset \
+  --preprocess-root /workspace/dataset/staging/preprocess \
+  --selection-root /workspace/dataset/curated/selection-v7 \
+  --tokenizer-root /workspace/dataset/tokenizer/starcoder2 \
+  --cache-root /workspace/dataset/token-cache/raw-all-v1 \
+  --output /workspace/dataset/token-cache/inventories/selection-v7
+```
+
+Publication fully authenticates every cache and source, requires exact
+selection archive order, and rejects missing, duplicate, pending, symlinked,
+or extra cache archive directories. The output is immutable canonical
+`manifest.json` plus `manifest.sha256`; materialization pins both identities in
+its journal and final provenance:
+
+```bash
+venv/bin/python scripts/materialize_training_corpus.py \
+  --root /workspace/dataset \
+  --selection-root /workspace/dataset/curated/selection-v7 \
+  --raw-token-cache-root /workspace/dataset/token-cache/raw-all-v1 \
+  --raw-token-cache-inventory-root \
+    /workspace/dataset/token-cache/inventories/selection-v7 \
+  --output /local/packed-v1 \
+  --global-microbatch-rows <FROM_GPU_SMOKE> \
+  --gradient-accumulation-steps <FROM_GPU_SMOKE>
+```
+
+Omitting both cache arguments preserves the raw archive/tokenizer fallback.
+Supplying only one cache argument, a non-v7 selection, or an inventory bound to
+another source/tokenizer/selection generation fails closed.

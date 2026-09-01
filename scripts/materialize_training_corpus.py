@@ -38,6 +38,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="default: ROOT/tokenizer/starcoder2",
     )
     parser.add_argument(
+        "--raw-token-cache-root",
+        type=Path,
+        help=(
+            "optional immutable raw-token-cache root; requires the separately "
+            "published --raw-token-cache-inventory-root and selection v7"
+        ),
+    )
+    parser.add_argument(
+        "--raw-token-cache-inventory-root",
+        type=Path,
+        help="closed-world cache inventory containing manifest.json + manifest.sha256",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="default: ROOT/final/packed-v1",
@@ -181,6 +194,10 @@ def main() -> int:
             tokenizer_batch_documents=args.tokenizer_batch_documents,
             tokenizer_batch_bytes=args.tokenizer_batch_bytes,
             tokenizer_max_document_bytes=args.tokenizer_max_document_bytes,
+            raw_token_cache_root=args.raw_token_cache_root,
+            raw_token_cache_inventory_root=(
+                args.raw_token_cache_inventory_root
+            ),
         )
         result = materializer.run(
             max_archives=args.max_archives,

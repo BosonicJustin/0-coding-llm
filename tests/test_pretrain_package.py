@@ -74,6 +74,41 @@ class PretrainPackageImportTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("raw-document token caches", result.stdout)
 
+    def test_cache_inventory_module_and_cli_help_do_not_import_torch(self) -> None:
+        result = self._run(
+            """
+            import importlib.abc
+            import runpy
+            import sys
+
+            class RejectTorch(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "torch" or fullname.startswith("torch."):
+                        raise RuntimeError(f"forbidden torch import: {fullname}")
+                    return None
+
+            sys.meta_path.insert(0, RejectTorch())
+            import pretrain.raw_token_cache_inventory
+
+            assert "pretrain.data" not in sys.modules
+            assert "torch" not in sys.modules
+            sys.argv = ["publish_raw_token_cache_inventory.py", "--help"]
+            try:
+                runpy.run_path(
+                    "scripts/publish_raw_token_cache_inventory.py",
+                    run_name="__main__",
+                )
+            except SystemExit as error:
+                assert error.code == 0
+            else:
+                raise AssertionError("inventory CLI --help did not exit")
+            assert "pretrain.data" not in sys.modules
+            assert "torch" not in sys.modules
+            """
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Certify a complete raw-token cache", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

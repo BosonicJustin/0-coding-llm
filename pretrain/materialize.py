@@ -60,6 +60,26 @@ from pretrain.selection_contract import (
     validate_all_eligible_bitmap_payload,
     validate_all_eligible_selection_profile,
 )
+from pretrain.raw_token_cache_inventory import (
+    LoadedRawTokenCacheInventory,
+    RawTokenCacheInventoryError,
+    load_raw_token_cache_inventory,
+)
+from pretrain.raw_token_cache import (
+    MANIFEST_FILE as RAW_TOKEN_CACHE_MANIFEST_FILE,
+    OFFSET_FILE as RAW_TOKEN_CACHE_OFFSET_FILE,
+    SIDECAR_FILE as RAW_TOKEN_CACHE_SIDECAR_FILE,
+    TOKEN_FILE as RAW_TOKEN_CACHE_TOKEN_FILE,
+)
+from pretrain.raw_token_cache_reader import (
+    ArchiveAuthority as RawTokenArchiveAuthority,
+    FileAuthority as RawTokenFileAuthority,
+    RawTokenCacheAuthority,
+    RawTokenCacheReadError,
+    RawTokenCacheReader,
+    TokenizerAuthority as RawTokenTokenizerAuthority,
+)
+from pretrain.tokenizer_identity import vocabulary_sha256
 
 
 FORMAT = "curated-packed-corpus"
@@ -324,6 +344,23 @@ def _safe_file(root: Path, relative: Any, field: str) -> Path:
     if candidate.is_symlink() or not stat.S_ISREG(resolved.stat().st_mode):
         raise MaterializationError(f"{field} must be a regular non-symlink file: {candidate}")
     return resolved
+
+
+def _regular_file_state(path: Path, field: str) -> tuple[int, int, int, int, int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise MaterializationError(f"Cannot inspect {field}: {path}") from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise MaterializationError(f"{field} is not a regular non-symlink file: {path}")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _provenance_from_raw_manifest(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -709,6 +746,8 @@ class CorpusMaterializer:
         tokenizer_batch_documents: int = 256,
         tokenizer_batch_bytes: int = 64 * 1024 * 1024,
         tokenizer_max_document_bytes: int | None = None,
+        raw_token_cache_root: str | Path | None = None,
+        raw_token_cache_inventory_root: str | Path | None = None,
         fault_injector: FaultInjector | None = None,
     ) -> None:
         if ORDER_FORMAT_VERSION != 4:
@@ -723,6 +762,20 @@ class CorpusMaterializer:
         self.quota_path = Path(quota_path)
         self.benchmark_denylist_path = Path(benchmark_denylist_path)
         self.output_root = Path(output_root)
+        if (raw_token_cache_root is None) != (
+            raw_token_cache_inventory_root is None
+        ):
+            raise MaterializationError(
+                "raw-token-cache root and inventory root must be supplied together"
+            )
+        self.raw_token_cache_root = (
+            Path(raw_token_cache_root) if raw_token_cache_root is not None else None
+        )
+        self.raw_token_cache_inventory_root = (
+            Path(raw_token_cache_inventory_root)
+            if raw_token_cache_inventory_root is not None
+            else None
+        )
         self.config = config or MaterializationConfig()
         self.config.validate()
         if tokenizer_max_document_bytes is None:
@@ -768,6 +821,10 @@ class CorpusMaterializer:
         self.archive_inventory_sha256 = canonical_sha256(
             [archive.identity() for archive in self.archives]
         )
+        self.raw_token_cache_inventory: LoadedRawTokenCacheInventory | None = None
+        self.raw_token_cache_authorities: dict[int, RawTokenCacheAuthority] = {}
+        if self.raw_token_cache_root is not None:
+            self._load_raw_token_cache_inventory()
         self.identity = {
             "format": FORMAT,
             "format_version": FORMAT_VERSION,
@@ -793,6 +850,10 @@ class CorpusMaterializer:
             # later by a GPU memory/throughput smoke and is pinned by order v4.
             "packing_configuration": self.config.packing_identity(),
         }
+        if self.raw_token_cache_inventory is not None:
+            self.identity["raw_token_cache"] = (
+                self.raw_token_cache_inventory.provenance_descriptor()
+            )
         self.journal_path = self.output_root / JOURNAL_NAME
         self.destinations: dict[tuple[str, str], _DestinationState] = {}
 
@@ -3496,6 +3557,96 @@ class CorpusMaterializer:
             raise MaterializationError("Loaded tokenizer EOS differs from its manifest")
         return tokenizer, manifest
 
+    def _load_raw_token_cache_inventory(self) -> None:
+        """Bind one closed-world cache generation to the authenticated v7 inputs."""
+
+        if (
+            self.selection_manifest["identity"]["format_version"]
+            != ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+        ):
+            raise MaterializationError(
+                "Raw-token-cache materialization is supported only for selection v7"
+            )
+        assert self.raw_token_cache_root is not None
+        assert self.raw_token_cache_inventory_root is not None
+        try:
+            inventory = load_raw_token_cache_inventory(
+                inventory_root=self.raw_token_cache_inventory_root,
+                cache_root=self.raw_token_cache_root,
+            )
+            validation = self.tokenizer_manifest["validation"]
+            expected_tokenizer = RawTokenTokenizerAuthority(
+                repo_id=self.tokenizer_manifest.get("repo_id"),
+                resolved_revision=self.tokenizer_manifest.get("resolved_revision"),
+                manifest_sha256=file_sha256(
+                    self.tokenizer_root / "TOKENIZER_MANIFEST.json"
+                ),
+                vocabulary_sha256=vocabulary_sha256(
+                    self.tokenizer.get_vocab(with_added_tokens=True)
+                ),
+                vocab_size=self.config.expected_vocab_size,
+                eos_token=validation.get("eos_token"),
+                eos_token_id=self.config.expected_eos_token_id,
+            )
+        except (
+            OSError,
+            RawTokenCacheInventoryError,
+            RawTokenCacheReadError,
+            ValueError,
+        ) as error:
+            raise MaterializationError(
+                f"Cannot authenticate raw-token-cache inventory: {error}"
+            ) from error
+        if inventory.selection_manifest_sha256 != self.selection_manifest_sha256:
+            raise MaterializationError(
+                "Raw-token-cache inventory selection-manifest identity mismatch"
+            )
+        if inventory.tokenizer != expected_tokenizer:
+            raise MaterializationError(
+                "Raw-token-cache inventory tokenizer identity mismatch"
+            )
+        if len(inventory.entries) != len(self.archives):
+            raise MaterializationError(
+                "Raw-token-cache inventory does not cover every source archive"
+            )
+        authorities: dict[int, RawTokenCacheAuthority] = {}
+        for archive, entry in zip(self.archives, inventory.entries, strict=True):
+            expected_archive = RawTokenArchiveAuthority(
+                path=archive.archive,
+                bucket=archive.bucket,
+                index=archive.archive_index,
+                bytes=archive.raw_path.stat().st_size,
+                sha256=archive.raw_sha256,
+            )
+            expected_report = RawTokenFileAuthority(
+                path=archive.report_relative,
+                bytes=archive.report_path.stat().st_size,
+                sha256=archive.report_sha256,
+            )
+            expected_fingerprint = RawTokenFileAuthority(
+                path=archive.fingerprint_relative,
+                bytes=archive.fingerprint_path.stat().st_size,
+                sha256=archive.fingerprint_sha256,
+            )
+            authority = entry.authority
+            if (
+                entry.ordinal != archive.ordinal
+                or authority.archive != expected_archive
+                or authority.preprocess_report != expected_report
+                or authority.fingerprint != expected_fingerprint
+                or authority.tokenizer != expected_tokenizer
+                or authority.records != archive.documents
+                or authority.clean_bytes != archive.clean_bytes
+                or authority.content_tokens != archive.content_tokens
+            ):
+                raise MaterializationError(
+                    "Raw-token-cache inventory archive authority differs from "
+                    f"selection/report authority at ordinal {archive.ordinal}"
+                )
+            authorities[archive.ordinal] = authority
+        self.raw_token_cache_inventory = inventory
+        self.raw_token_cache_authorities = authorities
+
     def _build_archive_inventory(self) -> list[ArchiveSpec]:
         input_reports = self.selection_manifest["input_reports"]
         decision_shards = self.selection_manifest["decision_shards"]
@@ -4171,6 +4322,284 @@ class CorpusMaterializer:
                 "All-eligible fingerprint/bitmap record totals differ"
             )
 
+    def _process_archive_from_raw_token_cache(
+        self, archive: ArchiveSpec, bitmap: bytes
+    ) -> dict[str, int]:
+        """Join v7 bitmap/fingerprint ordinals to authenticated cached spans.
+
+        This transaction is intentionally separate from the legacy raw-stream
+        implementation below.  Opting into the accelerator therefore cannot
+        silently alter v5/v6 validation, batching, prefix, or replay behavior;
+        byte-identity tests keep their shared writer/provenance contract fixed.
+        """
+
+        if (
+            self.raw_token_cache_inventory is None
+            or self.raw_token_cache_root is None
+            or archive.decision_format != ALL_ELIGIBLE_BITMAP_FORMAT
+            or self.selection_manifest["identity"]["format_version"]
+            != ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+        ):
+            raise MaterializationError(
+                "Raw-token-cache adapter requires an authenticated v7 keep bitmap"
+            )
+        authority = self.raw_token_cache_authorities.get(archive.ordinal)
+        if authority is None:
+            raise MaterializationError(
+                f"Missing raw-token-cache authority for archive {archive.ordinal}"
+            )
+        entry = self.raw_token_cache_inventory.entries[archive.ordinal]
+        cache_directory = self.raw_token_cache_root / entry.cache_directory
+        guarded_paths = (
+            archive.raw_path,
+            archive.report_path,
+            archive.fingerprint_path,
+            archive.decision_path,
+            cache_directory / RAW_TOKEN_CACHE_MANIFEST_FILE,
+            cache_directory / RAW_TOKEN_CACHE_SIDECAR_FILE,
+            cache_directory / RAW_TOKEN_CACHE_TOKEN_FILE,
+            cache_directory / RAW_TOKEN_CACHE_OFFSET_FILE,
+            self.tokenizer_root / "TOKENIZER_MANIFEST.json",
+            *(
+                self.tokenizer_root / filename
+                for filename in sorted(self.tokenizer_manifest["files"])
+            ),
+        )
+        guarded_states = {
+            path: _regular_file_state(path, "raw-token-cache bound source")
+            for path in guarded_paths
+        }
+
+        eligible = {
+            key
+            for key, state in self.destinations.items()
+            if state.cursor["next_archive"] == archive.ordinal
+        }
+        if not eligible:
+            raise MaterializationError("No lagging writer can consume the next archive")
+        if any(
+            state.cursor["next_archive"] not in (archive.ordinal, archive.ordinal + 1)
+            for state in self.destinations.values()
+        ):
+            raise MaterializationError("Writer cursor vector is not recoverable")
+        deltas = {
+            key: {
+                "selected_documents": 0,
+                "selected_content_tokens": 0,
+                "terminal_prefix_documents": 0,
+            }
+            for key in eligible
+        }
+        logical_positions = {
+            key: (
+                self.destinations[key].cursor["selected_content_tokens"]
+                + self.destinations[key].cursor["selected_documents"]
+            )
+            for key in eligible
+        }
+        index_writers: dict[tuple[str, str], _DocumentIndexShardWriter] = {}
+        index_descriptors: dict[tuple[str, str], dict[str, Any] | None] = {}
+        documents = 0
+        clean_bytes = 0
+        content_tokens = 0
+
+        try:
+            # Reader.open completes every cache/source/tokenizer/payload and
+            # manifest-index alignment check before a writer receives tokens.
+            try:
+                reader_context = RawTokenCacheReader.open(
+                    cache_directory,
+                    authority,
+                    dataset_root=self.raw_root,
+                    preprocess_root=self.preprocess_root,
+                    tokenizer_root=self.tokenizer_root,
+                )
+            except RawTokenCacheReadError as error:
+                raise MaterializationError(
+                    f"Raw-token-cache authentication failed for {archive.archive}: {error}"
+                ) from error
+            with reader_context as reader:
+                try:
+                    for index, decision in enumerate(
+                        self._iter_all_eligible_decisions(archive, bitmap)
+                    ):
+                        if decision["manifest_index"] != index:
+                            raise MaterializationError(
+                                "Raw-token-cache join left manifest-index order"
+                            )
+                        source_tokens = int(decision["source_tokens"])
+                        documents += 1
+                        clean_bytes += int(decision["_fingerprint_size_bytes"])
+                        content_tokens += source_tokens
+                        destination = (
+                            (str(decision["split"]), archive.domain)
+                            if decision["decision"] == "keep"
+                            else None
+                        )
+                        if destination is None or destination not in eligible:
+                            continue
+                        span = reader.document(index)
+                        selected = int(decision["selected_tokens"])
+                        if (
+                            len(span) != source_tokens
+                            or selected != source_tokens
+                            or decision["token_prefix"] != [0, source_tokens]
+                            or decision["terminal_quota_prefix"] is not False
+                        ):
+                            raise MaterializationError(
+                                "Cached v7 document is not an exact full-document join: "
+                                f"{archive.archive}:{index}"
+                            )
+                        start = logical_positions[destination]
+                        logical_positions[destination] += selected + 1
+                        self.destinations[destination].writer.add_document(
+                            span.to_list()
+                        )
+                        language = decision["provenance"].get("language")
+                        if not isinstance(language, str) or not language.strip():
+                            raise MaterializationError(
+                                f"Selected document has no language: {archive.archive}:"
+                                f"{decision['member_path']}"
+                            )
+                        index_writer = index_writers.get(destination)
+                        if index_writer is None:
+                            index_writer = _DocumentIndexShardWriter(
+                                self.output_root,
+                                archive_ordinal=archive.ordinal,
+                                split=destination[0],
+                                domain=destination[1],
+                            )
+                            index_writers[destination] = index_writer
+                        index_writer.write(
+                            {
+                                "record_version": DOCUMENT_INDEX_VERSION,
+                                "doc_id": decision["doc_id"],
+                                "canonical_doc_id": decision["canonical_doc_id"],
+                                "split_group_id": decision["split_group_id"],
+                                "split": destination[0],
+                                "domain": destination[1],
+                                "bucket": archive.bucket,
+                                "language": language,
+                                "source_archive": archive.archive,
+                                "source_archive_ordinal": archive.ordinal,
+                                "source_manifest_index": index,
+                                "source_member": decision["member_path"],
+                                "source_tokens": source_tokens,
+                                "selected_content_tokens": selected,
+                                "terminal_quota_prefix": False,
+                                "logical_stream_start": start,
+                                "logical_content_end_exclusive": start + selected,
+                                "logical_eos_position": start + selected,
+                            }
+                        )
+                        delta = deltas[destination]
+                        delta["selected_documents"] += 1
+                        delta["selected_content_tokens"] += selected
+                        self._fault(
+                            "document_added",
+                            archive=archive.ordinal,
+                            split=destination[0],
+                            domain=destination[1],
+                            document=index,
+                        )
+                    if (
+                        documents != archive.documents
+                        or clean_bytes != archive.clean_bytes
+                        or content_tokens != archive.content_tokens
+                    ):
+                        raise MaterializationError(
+                            "Raw-token-cache/fingerprint aggregate totals mismatch: "
+                            f"{archive.archive}"
+                        )
+                    reader.verify_unchanged()
+                except RawTokenCacheReadError as error:
+                    raise MaterializationError(
+                        f"Raw-token-cache read failed for {archive.archive}: {error}"
+                    ) from error
+
+            # Recheck every bound path identity immediately before the archive
+            # transaction is committed. The reader has already fully hashed
+            # the raw archive and both mmap payloads for this generation; the
+            # stat guard also detects rename/replace after those reads.
+            if (
+                any(
+                    _regular_file_state(path, "raw-token-cache bound source")
+                    != before
+                    for path, before in guarded_states.items()
+                )
+                or file_sha256(archive.report_path) != archive.report_sha256
+                or file_sha256(archive.fingerprint_path)
+                != archive.fingerprint_sha256
+                or file_sha256(archive.decision_path) != archive.decision_sha256
+                or file_sha256(cache_directory / RAW_TOKEN_CACHE_MANIFEST_FILE)
+                != entry.cache_manifest.sha256
+                or file_sha256(cache_directory / RAW_TOKEN_CACHE_SIDECAR_FILE)
+                != entry.cache_sidecar.sha256
+            ):
+                raise MaterializationError(
+                    f"Raw-token-cache/source authority changed before checkpoint: {archive.archive}"
+                )
+            for key in sorted(eligible):
+                index_writer = index_writers.get(key)
+                if index_writer is None:
+                    unexpected = (
+                        self.output_root
+                        / "provenance"
+                        / "documents"
+                        / key[0]
+                        / key[1]
+                        / f"archive-{archive.ordinal:06d}.jsonl.zst"
+                    )
+                    if unexpected.exists():
+                        raise MaterializationError(
+                            f"Unexpected document-index shard on replay: {unexpected}"
+                        )
+                    index_descriptors[key] = None
+                else:
+                    index_descriptors[key] = index_writer.finish(
+                        archive_ordinal=archive.ordinal
+                    )
+        except BaseException:
+            for writer in index_writers.values():
+                writer.abort()
+            raise
+
+        for key in sorted(eligible):
+            state = self.destinations[key]
+            delta = deltas[key]
+            cursor = dict(state.cursor)
+            cursor["next_archive"] = archive.ordinal + 1
+            for counter, value in delta.items():
+                cursor[counter] += value
+            cursor["document_index_shards"] = list(
+                cursor["document_index_shards"]
+            )
+            descriptor = index_descriptors[key]
+            if descriptor is not None:
+                cursor["document_index_shards"].append(descriptor)
+            state.writer.checkpoint(cursor)
+            state.cursor = cursor
+            self._fault(
+                "writer_checkpoint",
+                archive=archive.ordinal,
+                split=state.split,
+                domain=state.domain,
+            )
+        self._write_journal("packing")
+        self._fault("archive_checkpoint", archive=archive.ordinal)
+        return {
+            "archives": 1,
+            "documents": documents,
+            "source_content_tokens": content_tokens,
+            "selected_documents": sum(
+                delta["selected_documents"] for delta in deltas.values()
+            ),
+            "selected_content_tokens": sum(
+                delta["selected_content_tokens"] for delta in deltas.values()
+            ),
+            "raw_compressed_bytes": archive.raw_path.stat().st_size,
+        }
+
     def _process_archive(self, archive: ArchiveSpec) -> dict[str, int]:
         if file_sha256(archive.report_path) != archive.report_sha256:
             raise MaterializationError(f"Preprocess report changed: {archive.report_path}")
@@ -4183,6 +4612,12 @@ class CorpusMaterializer:
             if archive.decision_format == ALL_ELIGIBLE_BITMAP_FORMAT
             else None
         )
+        if self.raw_token_cache_inventory is not None:
+            if bitmap is None:
+                raise MaterializationError(
+                    "Raw-token-cache adapter cannot consume legacy decision shards"
+                )
+            return self._process_archive_from_raw_token_cache(archive, bitmap)
 
         def decision_rows() -> Iterator[dict[str, Any]]:
             if bitmap is None:
@@ -5112,6 +5547,21 @@ class CorpusMaterializer:
                     ],
                 }
             )
+        if self.raw_token_cache_inventory is not None:
+            payloads["raw_token_cache.json"] = {
+                "format_version": 1,
+                "acceleration_only": True,
+                "training_ready": False,
+                "inventory": (
+                    self.raw_token_cache_inventory.provenance_descriptor()
+                ),
+                "cache_contract": self.raw_token_cache_inventory.manifest["cache"],
+                "tokenizer": self.raw_token_cache_inventory.manifest["tokenizer"],
+                "archives": self.raw_token_cache_inventory.manifest["archives"],
+                "non_authorities": self.raw_token_cache_inventory.manifest[
+                    "non_authorities"
+                ],
+            }
         return payloads
 
     def _write_provenance(self) -> dict[str, dict[str, Any]]:

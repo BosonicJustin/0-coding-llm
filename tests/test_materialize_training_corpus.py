@@ -80,7 +80,13 @@ class MaterializationFixture:
     REVISION = "1" * 40
     VOCAB_SIZE = 32
 
-    def __init__(self, root: Path, *, malformed_prefix: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        malformed_prefix: bool = False,
+        tokenizer_repo_id: str = "fixture/tokenizer",
+    ) -> None:
         self.root = root
         self.preprocess = root / "staging" / "preprocess"
         self.selection = root / "curated" / "selection-v1"
@@ -89,6 +95,7 @@ class MaterializationFixture:
         self.quota_path = root / "quotas.json"
         self.denylist_path = root / "denylist.json"
         self.malformed_prefix = malformed_prefix
+        self.tokenizer_repo_id = tokenizer_repo_id
         self._split_identity_cache: dict[tuple[str, str], str] = {}
         self._write_tokenizer()
         self._write_supporting_identities()
@@ -124,6 +131,8 @@ class MaterializationFixture:
         tokenizer_batch_documents: int = 256,
         tokenizer_batch_bytes: int = 64 * 1024 * 1024,
         tokenizer_max_document_bytes: int | None = None,
+        raw_token_cache_root: Path | None = None,
+        raw_token_cache_inventory_root: Path | None = None,
         fault_injector: Any | None = None,
     ) -> CorpusMaterializer:
         return CorpusMaterializer(
@@ -139,6 +148,8 @@ class MaterializationFixture:
             tokenizer_batch_documents=tokenizer_batch_documents,
             tokenizer_batch_bytes=tokenizer_batch_bytes,
             tokenizer_max_document_bytes=tokenizer_max_document_bytes,
+            raw_token_cache_root=raw_token_cache_root,
+            raw_token_cache_inventory_root=raw_token_cache_inventory_root,
             fault_injector=fault_injector,
         )
 
@@ -155,7 +166,7 @@ class MaterializationFixture:
         tokenizer.save(str(tokenizer_path))
         manifest = {
             "manifest_version": 1,
-            "repo_id": "fixture/tokenizer",
+            "repo_id": self.tokenizer_repo_id,
             "resolved_revision": self.REVISION,
             "files": {
                 "tokenizer.json": {
@@ -1335,6 +1346,7 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
             )
             report_path = fixture.preprocess / report_descriptor["report"]
             report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["fingerprint_version"] = 1
             report["fingerprint_sha256"] = report_descriptor[
                 "fingerprint_sha256"
             ]

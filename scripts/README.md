@@ -33,6 +33,8 @@ navigation index, not an alternative procedure.
 
 - `cache_raw_tokens.py` — optional, curation-independent, per-archive token
   cache builder and one-archive benchmark; outputs are not directly trainable.
+- `publish_raw_token_cache_inventory.py` — authenticate a complete cache tree
+  against one exact production v7 selection before materializer use.
 - `materialize_training_corpus.py` — curation-to-packed publication bridge.
 - `build_training_order.py` — deterministic order-v4 construction.
 - `validate_training_data.py`, `certify_pretraining_data.py` — semantic and

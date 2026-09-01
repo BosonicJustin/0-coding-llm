@@ -16,13 +16,16 @@ those choices; the bridge validates them,
 re-reads the selected raw text, tokenizes it with the pinned tokenizer, packs
 it, and publishes deterministic order-v4 artifacts.
 
-The v7 branch has the same raw-text verification, pinned tokenizer, packing,
+The v7 branch has the same raw-source verification, pinned tokenizer, packing,
 boundary-isolation, provenance, restart, and checksum obligations. Its
 selection input differs: an archive bitmap says keep/reject for each complete
 source document, `selected_tokens` must equal `source_tokens`, and observed
-nine-cell totals are supply rather than exact quotas. Draft v7 support is not a
-production launch authority until the producer/consumer contract tests and a
-frozen durable v2 snapshot pass.
+nine-cell totals are supply rather than exact quotas. The optional authenticated
+raw-token-cache adapter replaces UTF-8 decode/tokenizer replay, but no selection,
+split, EOS, packing, boundary, order, or provenance authority. Its local
+multi-archive byte-identity and crash/corruption contracts are green; a frozen
+durable v2 selection, cache inventory, and real-archive benchmark are still
+required before production launch.
 
 ## Required completed inputs
 
@@ -84,9 +87,11 @@ evidence therefore fails before a raw archive is opened.
 For every raw archive, in canonical inventory order, the materializer:
 
 1. Verifies the pinned report, fingerprint, decision-shard, and raw-archive
-   identities and streams the `.tar.zst` archive once. Document order, member
-   names, byte counts, content hashes, provenance, the internal raw manifest,
-   and archive totals must agree with the decisions and report.
+   identities. The default route streams the `.tar.zst` archive once. The
+   optional v7 route instead opens one externally authorized per-archive token
+   cache and validates its source/tokenizer bindings, payload hashes/dtypes,
+   offsets, token range, and fingerprint alignment before writing anything.
+   Both routes preserve exact manifest-index order and source totals.
 2. Ignores rejected records. For every `keep` record, it decodes strict UTF-8,
    tokenizes using the pinned tokenizer, requires the recomputed full-document
    token count to equal `source_tokens`, and keeps exactly
@@ -95,6 +100,8 @@ For every raw archive, in canonical inventory order, the materializer:
 
    In the generation-v2 v7 branch, every keep is a complete document and
    `selected_tokens == source_tokens`; quota-ending prefixes are forbidden.
+   The cached route obtains that complete content span by `manifest_index` and
+   feeds it to the same writer used by the raw-tokenizer route.
 3. Sends the selected prefix to one of nine independent writers:
    `{train,validation,test} x {python,other_code,english}`. Each document gets
    one EOS token. A document-start bit marks its first content token, and every
@@ -130,6 +137,7 @@ packed-v1/
     order.bin
     manifest.json
   provenance/{source,policy,tokenizer,fingerprints}.json
+  provenance/raw_token_cache.json  # present only for the cache adapter
   manifest.json
   manifest.sha256
 ```
