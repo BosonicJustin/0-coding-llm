@@ -466,6 +466,7 @@ def _authority_identity(
             },
         },
         "source": {
+            "curation_identity": builder.identity,
             "curation_identity_sha256": canonical_sha256(builder.identity),
             "report_inventory_sha256": builder.inventory_sha,
             "report_count": len(builder.report_inventory),
@@ -705,7 +706,10 @@ def _log_event(descriptor: int, event: str, **fields: Any) -> None:
 
 
 def _validate_result(
-    config: LaunchConfig, raw: bytes
+    config: LaunchConfig,
+    raw: bytes,
+    *,
+    expected_source_identity: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not raw or len(raw) > MAXIMUM_CHILD_STDOUT_BYTES:
         raise FastCurationLaunchError("Curator stdout is empty or exceeds its bound")
@@ -756,8 +760,9 @@ def _validate_result(
         raise FastCurationLaunchError("Curator snapshot manifest sidecar mismatch")
     if (
         manifest.get("generation") != generation
+        or manifest.get("identity") != expected_source_identity
         or manifest.get("identity_sha256")
-        != canonical_sha256(manifest.get("identity"))
+        != canonical_sha256(expected_source_identity)
         or manifest.get("database") != database
         or not isinstance(manifest.get("authority_artifacts"), dict)
         or manifest["authority_artifacts"].get("CHECKPOINT.json") != checkpoint
@@ -850,7 +855,10 @@ def _load_or_publish_completion(
 
 
 def _completed_result_if_any(
-    config: LaunchConfig, *, identity_sha256: str
+    config: LaunchConfig,
+    *,
+    identity_sha256: str,
+    expected_source_identity: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     result_exists = config.result_path.exists() or config.result_path.is_symlink()
     completion_exists = (
@@ -863,7 +871,11 @@ def _completed_result_if_any(
             )
         return None
     raw, _payload = _safe_json_file(config.result_path, label="curation result")
-    result, snapshot = _validate_result(config, raw)
+    result, snapshot = _validate_result(
+        config,
+        raw,
+        expected_source_identity=expected_source_identity,
+    )
     _load_or_publish_completion(
         config,
         identity_sha256=identity_sha256,
@@ -889,7 +901,9 @@ def launch(
                 authority = _publish_authority(config.authority_path, identity)
             identity_sha = str(authority["identity_sha256"])
             complete = _completed_result_if_any(
-                config, identity_sha256=identity_sha
+                config,
+                identity_sha256=identity_sha,
+                expected_source_identity=identity["source"]["curation_identity"],
             )
             if complete is not None:
                 return 0, {
@@ -921,7 +935,12 @@ def launch(
                 previous_handlers: dict[int, Any] = {}
 
                 def forward(signum: int, _frame: Any) -> None:
-                    _log_event(log_descriptor, "signal_forwarded", signal=signum)
+                    try:
+                        _log_event(log_descriptor, "signal_forwarded", signal=signum)
+                    except OSError:
+                        # Signal delivery is more important than telemetry when
+                        # a full/unavailable log volume is itself the failure.
+                        pass
                     process.send_signal(signum)
 
                 handled_signals = (signal.SIGINT, signal.SIGTERM)
@@ -950,7 +969,13 @@ def launch(
                         "preflight": preflight,
                         "log_path": str(config.log_path),
                     }
-                result, snapshot = _validate_result(config, stdout)
+                result, snapshot = _validate_result(
+                    config,
+                    stdout,
+                    expected_source_identity=identity["source"][
+                        "curation_identity"
+                    ],
+                )
                 _atomic_new(config.result_path, stdout)
                 receipt = _load_or_publish_completion(
                     config,

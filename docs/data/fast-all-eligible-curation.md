@@ -86,6 +86,10 @@ pod are gone.
 Use a fresh output and local directory. The snapshot interval is accepted for
 identity compatibility but periodic copies are disabled by the frozen handoff
 profile; explicit exits and finalization can still force a recovery snapshot.
+The guarded launcher is the production entrypoint: it proves closed collection
+and final preprocess coverage, takes nonblocking launcher and preprocess locks,
+checks the measured storage-v3 admission, and freezes the exact source/path/code
+identity before it invokes the curator. Run its read-only data preflight first.
 
 ```bash
 PROJECT_ROOT=/workspace/0-coding-llm
@@ -100,21 +104,34 @@ test ! -e "$OUTPUT"
 test ! -e "$LOCAL_WORK"
 mkdir -p "$DATA_V2/logs" /local/curation
 
+/opt/coding-model-data-venv/bin/python -u \
+  scripts/launch_fast_all_eligible_curation.py \
+  --generation-root "$DATA_V2" \
+  --local-work-root "$LOCAL_WORK" \
+  --policy "$PROJECT_ROOT/configs/curation_policy_fast_exact_normalized.json" \
+  --quotas "$QUOTAS" \
+  --benchmark-denylist "$PROJECT_ROOT/configs/mbpp_denylist.json" \
+  --log-path "$LOG" \
+  --result-path "$RESULT" \
+  --preflight-only
+
 tmux new-session -d -s all-eligible-curation-v2 -c "$PROJECT_ROOT" \
-  "/opt/coding-model-data-venv/bin/python -u scripts/curate_corpus.py \
-    --root '$DATA_V2' \
-    --staging-root '$DATA_V2/staging/preprocess' \
-    --policy configs/curation_policy_fast_exact_normalized.json \
+  "/opt/coding-model-data-venv/bin/python -u \
+    scripts/launch_fast_all_eligible_curation.py \
+    --generation-root '$DATA_V2' \
+    --local-work-root '$LOCAL_WORK' \
+    --policy '$PROJECT_ROOT/configs/curation_policy_fast_exact_normalized.json' \
     --quotas '$QUOTAS' \
-    --output '$OUTPUT' \
-    --sqlite-local-work-root '$LOCAL_WORK' \
-    --sqlite-snapshot-interval-seconds 86400 \
-    --sqlite-snapshot-retention 2 \
-    --defer-raw-archive-integrity-until-finalize \
-    --fast-all-eligible-handoff \
-    --batch-size 100000 \
-    >'$RESULT' 2>'$LOG'"
+    --benchmark-denylist '$PROJECT_ROOT/configs/mbpp_denylist.json' \
+    --log-path '$LOG' \
+    --result-path '$RESULT'"
 ```
+
+The first launch atomically creates
+`FAST_ALL_ELIGIBLE_CURATION_AUTHORITY.json` at the generation root. An exact
+rerun resumes the same curator; changed inputs, paths, code, or flags are
+rejected. Once completion and its receipt are present, an exact rerun validates
+them and exits successfully without spawning another curator or snapshot.
 
 The handoff profile never creates `selection.quota.*` progress, `selected`
 rows, output decision rows, or a legacy selection manifest. During bounded

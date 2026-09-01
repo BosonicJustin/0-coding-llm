@@ -139,7 +139,8 @@ class FastCurationLauncherTest(unittest.TestCase):
             "bytes": checkpoint.stat().st_size,
             "sha256": launcher.file_sha256(checkpoint),
         }
-        identity = {"fixture": True}
+        authority = json.loads(config.authority_path.read_text(encoding="utf-8"))
+        identity = authority["identity"]["source"]["curation_identity"]
         manifest = {
             "generation": 1,
             "identity": identity,
