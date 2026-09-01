@@ -13,7 +13,6 @@ import argparse
 import hashlib
 import json
 import multiprocessing
-import os
 import shutil
 import signal
 import sys
@@ -158,13 +157,7 @@ def recover_worker_checkpoints(
                     f"{checkpoint.get(key)!r} != {value!r}"
                 )
         for archive in checkpoint.get("archives", []):
-            pending = Path(archive["pending_path"])
-            final = Path(archive["final_path"])
-            if not final.exists():
-                if not pending.exists():
-                    raise RuntimeError(f"Checkpoint {path} is missing archive {final}")
-                final.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(pending, final)
+            stack.recover_checkpoint_archive(root, archive, checkpoint_path=path)
             shard_id = (
                 f"stack-v3-{plan['dataset_revision'][:12]}-"
                 f"{archive['category']}-{archive['index']:06d}"

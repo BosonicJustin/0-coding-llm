@@ -327,6 +327,127 @@ def next_archive_indices(root: Path) -> dict[str, int]:
     return result
 
 
+def recover_checkpoint_archive(
+    root: Path,
+    archive: dict[str, Any],
+    *,
+    checkpoint_path: Path,
+) -> Path:
+    """Recover one checkpoint archive into ``root`` without trusting old roots.
+
+    Checkpoints historically stored absolute pending/final paths.  A frozen
+    dataset generation may now be hard-link cloned before collection resumes,
+    so a finalized archive is authoritative at the canonical path derived from
+    the *current* root, category, and index.  Descriptor paths are consulted
+    only when recovering an actually pending same-root archive.
+    """
+
+    if not isinstance(archive, dict):
+        raise RuntimeError(f"Checkpoint {checkpoint_path} has an invalid archive descriptor")
+    category = archive.get("category")
+    index = archive.get("index")
+    if category not in ("python", "other_code"):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} has an invalid archive category: {category!r}"
+        )
+    if (
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or index < 0
+        or index > 999_999
+    ):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} has an invalid archive index: {index!r}"
+        )
+
+    root = root.resolve(strict=True)
+    expected_directory = root / "raw" / category
+    expected_final = expected_directory / f"part-{index:06d}.tar.zst"
+    final_name = expected_final.name
+    pending_pattern = re.compile(rf"\.part-{index:06d}-[0-9a-f]{{32}}\.tar\.zst")
+
+    def descriptor_path(field: str) -> Path:
+        value = archive.get(field)
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} archive has invalid {field}"
+            )
+        candidate = Path(value)
+        if not candidate.is_absolute() or ".." in candidate.parts:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} archive has unsafe {field}: {value!r}"
+            )
+        return candidate
+
+    descriptor_final = descriptor_path("final_path")
+    descriptor_pending = descriptor_path("pending_path")
+    if tuple(descriptor_final.parts[-3:]) != ("raw", category, final_name):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} final_path identity mismatch: "
+            f"{descriptor_final}"
+        )
+    if (
+        tuple(descriptor_pending.parts[-3:-1]) != ("raw", category)
+        or pending_pattern.fullmatch(descriptor_pending.name) is None
+    ):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} pending_path identity mismatch: "
+            f"{descriptor_pending}"
+        )
+
+    def require_finalized(path: Path) -> None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as error:
+            raise RuntimeError(f"Checkpoint {checkpoint_path} is missing archive {path}") from error
+        if path.is_symlink() or not path.is_file() or metadata.st_size <= 0:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} archive is unsafe or empty: {path}"
+            )
+
+    # This is the normal cloned-generation path.  Never dereference an old
+    # absolute descriptor when the current root already owns the final name.
+    if expected_final.exists() or expected_final.is_symlink():
+        require_finalized(expected_final)
+        return expected_final
+
+    # A pending rename is valid only for a checkpoint created in this same
+    # root.  This prevents a cloned checkpoint from reaching back into its
+    # frozen source generation if the clone is incomplete.
+    if (
+        descriptor_final.resolve(strict=False) != expected_final
+        or descriptor_pending.parent.resolve(strict=False) != expected_directory
+    ):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} has no finalized archive in the current root "
+            "and its pending paths belong to a different root"
+        )
+    if expected_directory.is_symlink() or not expected_directory.is_dir():
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} raw archive directory is unsafe: "
+            f"{expected_directory}"
+        )
+    try:
+        pending_metadata = descriptor_pending.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} is missing pending archive "
+            f"{descriptor_pending}"
+        ) from error
+    if (
+        descriptor_pending.is_symlink()
+        or not descriptor_pending.is_file()
+        or pending_metadata.st_size <= 0
+    ):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} pending archive is unsafe or empty: "
+            f"{descriptor_pending}"
+        )
+    os.replace(descriptor_pending, expected_final)
+    require_finalized(expected_final)
+    return expected_final
+
+
 def recover_checkpoints(root: Path, source: str, benchmark_guard_sha256: str) -> dict[str, int]:
     checkpoint_dir = root / "state" / "collector_checkpoints"
     if not checkpoint_dir.exists():
@@ -341,13 +462,7 @@ def recover_checkpoints(root: Path, source: str, benchmark_guard_sha256: str) ->
         if checkpoint.get("benchmark_guard_sha256") != benchmark_guard_sha256:
             raise RuntimeError(f"Benchmark denylist mismatch in {path}")
         for archive in checkpoint.get("archives", []):
-            pending = Path(archive["pending_path"])
-            final = Path(archive["final_path"])
-            if not final.exists():
-                if not pending.exists():
-                    raise RuntimeError(f"Checkpoint {path} is missing archive {final}")
-                final.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(pending, final)
+            recover_checkpoint_archive(root, archive, checkpoint_path=path)
             shard_id = f"stack-v3-{checkpoint['dataset_revision'][:12]}-{archive['category']}-{archive['index']:06d}"
             write_record(
                 root,

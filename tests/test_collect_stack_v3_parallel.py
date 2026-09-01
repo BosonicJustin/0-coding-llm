@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -171,6 +173,115 @@ class ParallelCollectorTest(unittest.TestCase):
             self.assertEqual(len(list(iter_records(root))), 1)
             self.assertEqual(recover_worker_checkpoints(root, plan, worker_id), cursor)
             self.assertEqual(len(list(iter_records(root))), 1)
+
+    def test_cloned_root_resume_does_not_depend_on_absolute_source_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            source_root = parent / "dataset-v1"
+            clone_root = parent / "dataset-v2"
+            plan = {
+                "plan_version": 1,
+                "source": "dataset@" + "c" * 40,
+                "dataset_revision": "c" * 40,
+                "source_shards_sha256": "digest",
+                "source_shard_count": 100,
+                "benchmark_guard_sha256": "guard",
+                "worker_count": 4,
+                "frontier_source_shard_index": 12,
+                "frontier_row_offset": 0,
+                "base_archive_indices": {"python": 5, "other_code": 7},
+                "legacy_cursor": {
+                    "sequence": 0,
+                    "repos_consumed": 0,
+                    "source_shard_index": 12,
+                    "row_offset": 0,
+                },
+            }
+            worker_id = 1
+            index = worker_archive_index(plan, "python", worker_id, 0)
+            writer = legacy.RawArchiveWriter(source_root, "python", index, 1, 1)
+            add_test_document(writer, "clone_resume")
+            commit_worker_checkpoint(
+                source_root,
+                plan,
+                worker_id,
+                {"python": writer},
+                sequence=1,
+                assignment_position=2,
+                row_offset=17,
+                repos_consumed=44,
+                archive_sequences={"python": 1, "other_code": 0},
+            )
+
+            source_archive = (
+                source_root / "raw" / "python" / f"part-{index:06d}.tar.zst"
+            )
+            clone_archive = (
+                clone_root / "raw" / "python" / f"part-{index:06d}.tar.zst"
+            )
+            clone_archive.parent.mkdir(parents=True)
+            os.link(source_archive, clone_archive)
+            shutil.copytree(
+                source_root / "state" / "collector_parallel",
+                clone_root / "state" / "collector_parallel",
+                copy_function=os.link,
+            )
+
+            # Make every absolute descriptor in the copied checkpoint dead.
+            retired_source = parent / "dataset-v1-retired"
+            source_root.rename(retired_source)
+            cursor = recover_worker_checkpoints(clone_root, plan, worker_id)
+            self.assertEqual(cursor["assignment_position"], 2)
+            self.assertEqual(cursor["row_offset"], 17)
+            self.assertTrue(clone_archive.is_file())
+            records = list(iter_records(clone_root))
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["category"], "python")
+
+    def test_missing_cloned_final_never_recovers_pending_from_old_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            old_root = parent / "dataset-v1"
+            clone_root = parent / "dataset-v2"
+            (old_root / "raw/python").mkdir(parents=True)
+            (clone_root / "raw/python").mkdir(parents=True)
+            pending = old_root / "raw/python" / f".part-000000-{'0' * 32}.tar.zst"
+            pending.write_bytes(b"pending")
+            archive = {
+                "category": "python",
+                "index": 0,
+                "pending_path": str(pending),
+                "final_path": str(old_root / "raw/python/part-000000.tar.zst"),
+            }
+            with self.assertRaisesRegex(RuntimeError, "different root"):
+                legacy.recover_checkpoint_archive(
+                    clone_root,
+                    archive,
+                    checkpoint_path=clone_root / "checkpoint.json",
+                )
+            self.assertTrue(pending.is_file())
+            self.assertFalse((clone_root / "raw/python/part-000000.tar.zst").exists())
+
+    def test_checkpoint_archive_descriptor_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "dataset"
+            final = root / "raw/python/part-000000.tar.zst"
+            final.parent.mkdir(parents=True)
+            final.write_bytes(b"final")
+            archive = {
+                "category": "python",
+                "index": 0,
+                "pending_path": str(
+                    root / "raw/python" / f".part-000000-{'0' * 32}.tar.zst"
+                ),
+                "final_path": f"{root}/raw/python/../python/part-000000.tar.zst",
+            }
+            with self.assertRaisesRegex(RuntimeError, "unsafe final_path"):
+                legacy.recover_checkpoint_archive(
+                    root,
+                    archive,
+                    checkpoint_path=root / "checkpoint.json",
+                )
 
 
 if __name__ == "__main__":
