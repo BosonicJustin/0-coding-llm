@@ -2,8 +2,10 @@
 
 This module is the cold-path bridge between the immutable raw/curation
 artifacts and :mod:`pretrain.data`.  It deliberately does not implement any
-quality filtering, deduplication, benchmark filtering, or split assignment:
-the completed curation decision shards are authoritative for those choices.
+quality filtering, deduplication, or benchmark filtering: completed curation
+artifacts are authoritative for those choices.  Identity-v7 inputs carry a
+keep bitmap, so the bridge independently recomputes each kept document's
+frozen leakage-safe source group and split from its signed fingerprint.
 
 Packing checkpoints are committed at raw-archive boundaries.  Every
 split/domain ``PackedShardWriter`` stores the same next-archive cursor.  A
@@ -43,6 +45,21 @@ from pretrain.data import (
     validate_packed_manifest,
     validate_training_order,
 )
+from pretrain.selection_contract import (
+    ALL_ELIGIBLE_BITMAP_DESCRIPTOR_KEYS,
+    ALL_ELIGIBLE_BITMAP_BIT_ORDER,
+    ALL_ELIGIBLE_BITMAP_FORMAT,
+    ALL_ELIGIBLE_BITMAP_FORMAT_VERSION,
+    ALL_ELIGIBLE_BITMAP_HEADER_LENGTH_BYTES,
+    ALL_ELIGIBLE_BITMAP_MAGIC,
+    ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION,
+    ALL_ELIGIBLE_SELECTION_PROFILE,
+    ALL_ELIGIBLE_SELECTION_STRATEGY,
+    all_eligible_bitmap_payload_bytes,
+    validate_all_eligible_bitmap_header,
+    validate_all_eligible_bitmap_payload,
+    validate_all_eligible_selection_profile,
+)
 
 
 FORMAT = "curated-packed-corpus"
@@ -52,6 +69,7 @@ CURSOR_VERSION = 1
 JOURNAL_NAME = ".materialization-journal.json"
 DOCUMENT_INDEX_FORMAT = "packed-document-position-index"
 DOCUMENT_INDEX_VERSION = 1
+FINGERPRINT_VERSION = 1
 SPLITS = ("train", "validation", "test")
 BUCKET_DOMAIN = {
     "python": "python",
@@ -111,6 +129,24 @@ FAST_CURATION_PROFILE = {
     ],
 }
 FAST_ENGLISH_NEAR_STATUS = "disabled_by_fast_profile"
+ALL_ELIGIBLE_PUBLICATION_SCOPE = "production-durable-snapshot"
+ALL_ELIGIBLE_TRAINING_INPUT_BUDGET_AUTHORITY = (
+    "the final packed order v4 manifest; this all-eligible publication "
+    "does not enforce a training mixture or input-token cap"
+)
+RAW_ARCHIVE_INTEGRITY_POLICIES = frozenset(
+    (
+        "deferred-full-sha256-mandatory-before-publication",
+        "eager-full-sha256-at-open-and-before-publication",
+    )
+)
+LOCAL_SQLITE_EXECUTION = {
+    "mode": "local-wal-with-durable-snapshots",
+    "protocol_version": 1,
+    "active_journal_mode": "wal",
+    "wal_autocheckpoint_pages": 32_768,
+    "locking_mode": "exclusive",
+}
 
 
 class MaterializationError(RuntimeError):
@@ -418,9 +454,13 @@ class ArchiveSpec:
     documents: int
     clean_bytes: int
     content_tokens: int
+    decision_format: str | None = None
+    decision_format_version: int | None = None
+    decision_bytes: int | None = None
+    decision_kept_documents: int | None = None
 
     def identity(self) -> dict[str, Any]:
-        return {
+        result = {
             "ordinal": self.ordinal,
             "archive": self.archive,
             "archive_index": self.archive_index,
@@ -437,6 +477,14 @@ class ArchiveSpec:
             "clean_bytes": self.clean_bytes,
             "content_tokens": self.content_tokens,
         }
+        if self.decision_format is not None:
+            result.update(
+                decision_format=self.decision_format,
+                decision_format_version=self.decision_format_version,
+                decision_bytes=self.decision_bytes,
+                decision_kept_documents=self.decision_kept_documents,
+            )
+        return result
 
 
 @dataclass(frozen=True)
@@ -676,6 +724,8 @@ class CorpusMaterializer:
         self.tokenizer_batch_bytes = tokenizer_batch_bytes
         self.tokenizer_max_document_bytes = tokenizer_max_document_bytes
         self.fault_injector = fault_injector
+        self.all_eligible_split_seed: str | None = None
+        self.all_eligible_split_thresholds: tuple[tuple[str, int], ...] = ()
         self.selection_manifest_path = self.selection_root / "manifest.json"
         self.selection_manifest = self._validate_selection_manifest()
         self.selection_manifest_sha256 = file_sha256(self.selection_manifest_path)
@@ -2279,6 +2329,673 @@ class CorpusMaterializer:
                 "English near-dedup manifest audit differs from curation evidence"
             )
 
+    @staticmethod
+    def _require_nonempty_string(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise MaterializationError(f"{field} must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _require_positive_int(value: Any, field: str) -> int:
+        result = _require_nonnegative_int(value, field)
+        if result < 1:
+            raise MaterializationError(f"{field} must be positive")
+        return result
+
+    @staticmethod
+    def _stable_digest(namespace: str, value: str | bytes) -> bytes:
+        raw = value if isinstance(value, bytes) else value.encode("utf-8")
+        return hashlib.sha256(namespace.encode("utf-8") + b"\0" + raw).digest()
+
+    @staticmethod
+    def _english_source_identity(
+        bucket: str, provenance: Mapping[str, Any]
+    ) -> str | None:
+        keys = (
+            ("url", "id")
+            if bucket == "fineweb_edu"
+            else (("id", "url", "title") if bucket == "wikipedia" else ())
+        )
+        for key in keys:
+            value = provenance.get(key)
+            if value is not None and str(value).strip():
+                return f"{bucket}:{key}:{str(value).strip()}"
+        return None
+
+    def _configure_all_eligible_split_authority(
+        self, policy: Mapping[str, Any]
+    ) -> None:
+        if (
+            self.selection_manifest["identity"]["format_version"]
+            != ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+        ):
+            return
+        selection = policy.get("selection")
+        seed = selection.get("seed") if isinstance(selection, dict) else None
+        if not isinstance(seed, str) or not seed:
+            raise MaterializationError(
+                "All-eligible policy has no frozen split seed"
+            )
+        quota_config = _load_json(self.quota_path)
+        rows = quota_config.get("quotas")
+        if quota_config.get("version") != 1 or not isinstance(rows, list):
+            raise MaterializationError("Unsupported all-eligible quota configuration")
+        quotas: dict[tuple[str, str], int] = {}
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise MaterializationError(
+                    f"Invalid all-eligible quota row {index}"
+                )
+            if row.get("phase") != "final":
+                continue
+            split = row.get("split")
+            category = row.get("category")
+            target = row.get("target")
+            key = (str(split), str(category))
+            if (
+                split not in SPLITS
+                or category not in DOMAIN_ORDER
+                or row.get("token_field") != "exact_tokens"
+                or not isinstance(target, int)
+                or isinstance(target, bool)
+                or target < 1
+                or key in quotas
+            ):
+                raise MaterializationError(
+                    f"Invalid all-eligible final quota row {index}"
+                )
+            quotas[key] = target
+        expected = {(split, domain) for split in SPLITS for domain in DOMAIN_ORDER}
+        if set(quotas) != expected:
+            raise MaterializationError(
+                "All-eligible final quotas do not cover every split/domain"
+            )
+        references = {
+            (row["split"], row["category"]): row["reference_target_tokens"]
+            for row in self.selection_manifest["reference_quotas"]
+        }
+        if references != quotas:
+            raise MaterializationError(
+                "All-eligible reference quotas differ from the frozen quota file"
+            )
+        totals = {
+            split: sum(quotas[(split, domain)] for domain in DOMAIN_ORDER)
+            for split in SPLITS
+        }
+        grand = sum(totals.values())
+        maximum = 1 << 64
+        test_end = maximum * totals["test"] // grand
+        validation_end = (
+            test_end + maximum * totals["validation"] // grand
+        )
+        self.all_eligible_split_seed = seed
+        self.all_eligible_split_thresholds = (
+            ("test", test_end),
+            ("validation", validation_end),
+            ("train", maximum),
+        )
+
+    def _derive_all_eligible_group_and_split(
+        self,
+        *,
+        bucket: str,
+        provenance: Mapping[str, Any],
+        doc_id: str,
+    ) -> tuple[str, str]:
+        if bucket in ("python", "other_code"):
+            repo_id = provenance.get("repo_id")
+            source_identity = str(repo_id).strip() if repo_id is not None else ""
+            if not source_identity:
+                raise MaterializationError(
+                    "All-eligible kept code document has no repository identity"
+                )
+            group = self._stable_digest("code-repository", source_identity)
+        else:
+            source_identity = self._english_source_identity(bucket, provenance)
+            if source_identity is None:
+                raise MaterializationError(
+                    "All-eligible kept English document has no source identity"
+                )
+            group = self._stable_digest("english-source", source_identity)
+        if self.all_eligible_split_seed is None or not self.all_eligible_split_thresholds:
+            raise MaterializationError("All-eligible split authority is not configured")
+        value = int.from_bytes(
+            self._stable_digest(
+                f"split:{self.all_eligible_split_seed}", group
+            )[:8],
+            "big",
+        )
+        for split, end in self.all_eligible_split_thresholds:
+            if value < end:
+                return group.hex(), split
+        raise MaterializationError("All-eligible split thresholds are incomplete")
+
+    @classmethod
+    def _validate_all_eligible_totals(
+        cls, manifest: Mapping[str, Any]
+    ) -> dict[tuple[str, str], dict[str, int]]:
+        """Validate the non-quota v7 supply summary and reference-only quotas."""
+
+        if "quotas" in manifest:
+            raise MaterializationError(
+                "All-eligible selection must not carry an authoritative quota summary"
+            )
+        rows = manifest.get("selected_totals")
+        if not isinstance(rows, list):
+            raise MaterializationError("All-eligible selection has no selected totals")
+        expected_order = [
+            (split, domain) for split in SPLITS for domain in DOMAIN_ORDER
+        ]
+        observed_order: list[tuple[str, str]] = []
+        totals: dict[tuple[str, str], dict[str, int]] = {}
+        for index, raw_row in enumerate(rows):
+            row = _require_exact_object_keys(
+                raw_row,
+                {
+                    "split",
+                    "category",
+                    "unit",
+                    "documents",
+                    "selected_tokens",
+                    "terminal_prefix_documents",
+                },
+                f"selection.selected_totals[{index}]",
+            )
+            split = row["split"]
+            category = row["category"]
+            if split not in SPLITS or category not in DOMAIN_ORDER:
+                raise MaterializationError(
+                    f"Invalid all-eligible selected total key: {(split, category)!r}"
+                )
+            key = (str(split), str(category))
+            if key in totals:
+                raise MaterializationError(
+                    f"Duplicate all-eligible selected total: {key}"
+                )
+            observed_order.append(key)
+            if row["unit"] != "pre_packing_starcoder2_content_tokens":
+                raise MaterializationError(
+                    "All-eligible selected total uses an unsafe token unit"
+                )
+            terminal = _require_nonnegative_int(
+                row["terminal_prefix_documents"],
+                f"selection.selected_totals[{index}].terminal_prefix_documents",
+            )
+            if terminal != 0:
+                raise MaterializationError(
+                    "All-eligible selected totals must contain complete documents"
+                )
+            totals[key] = {
+                "selected_documents": cls._require_positive_int(
+                    row["documents"],
+                    f"selection.selected_totals[{index}].documents",
+                ),
+                "selected_content_tokens": cls._require_positive_int(
+                    row["selected_tokens"],
+                    f"selection.selected_totals[{index}].selected_tokens",
+                ),
+                "terminal_prefix_documents": terminal,
+            }
+        if observed_order != expected_order:
+            raise MaterializationError(
+                "All-eligible selected totals do not cover every split/domain "
+                "in canonical order"
+            )
+
+        reference_rows = manifest.get("reference_quotas")
+        if not isinstance(reference_rows, list):
+            raise MaterializationError("All-eligible selection has no reference quotas")
+        reference_order: list[tuple[str, str]] = []
+        for index, raw_row in enumerate(reference_rows):
+            row = _require_exact_object_keys(
+                raw_row,
+                {
+                    "split",
+                    "category",
+                    "unit",
+                    "reference_target_tokens",
+                    "observed_tokens",
+                    "shortfall_tokens",
+                    "surplus_tokens",
+                    "selection_authority",
+                },
+                f"selection.reference_quotas[{index}]",
+            )
+            split = row["split"]
+            category = row["category"]
+            if split not in SPLITS or category not in DOMAIN_ORDER:
+                raise MaterializationError(
+                    f"Invalid all-eligible reference quota key: "
+                    f"{(split, category)!r}"
+                )
+            key = (str(split), str(category))
+            reference_order.append(key)
+            if row["unit"] != "pre_packing_starcoder2_content_tokens":
+                raise MaterializationError(
+                    "All-eligible reference quota uses an unsafe token unit"
+                )
+            target = cls._require_positive_int(
+                row["reference_target_tokens"],
+                f"selection.reference_quotas[{index}].reference_target_tokens",
+            )
+            observed = cls._require_positive_int(
+                row["observed_tokens"],
+                f"selection.reference_quotas[{index}].observed_tokens",
+            )
+            shortfall = _require_nonnegative_int(
+                row["shortfall_tokens"],
+                f"selection.reference_quotas[{index}].shortfall_tokens",
+            )
+            surplus = _require_nonnegative_int(
+                row["surplus_tokens"],
+                f"selection.reference_quotas[{index}].surplus_tokens",
+            )
+            if (
+                key not in totals
+                or observed != totals[key]["selected_content_tokens"]
+                or shortfall != max(0, target - observed)
+                or surplus != max(0, observed - target)
+                or row["selection_authority"] is not False
+            ):
+                raise MaterializationError(
+                    f"All-eligible reference quota is inconsistent for {key}"
+                )
+        if reference_order != expected_order:
+            raise MaterializationError(
+                "All-eligible reference quotas do not cover every split/domain "
+                "in canonical order"
+            )
+
+        documents = _require_exact_object_keys(
+            manifest.get("documents"),
+            {
+                "input",
+                "accepted_canonical_before_selection",
+                "selected",
+                "quota_overflow",
+            },
+            "selection.documents",
+        )
+        input_documents = cls._require_positive_int(
+            documents["input"], "selection.documents.input"
+        )
+        accepted_documents = cls._require_positive_int(
+            documents["accepted_canonical_before_selection"],
+            "selection.documents.accepted_canonical_before_selection",
+        )
+        manifest_selected_documents = cls._require_positive_int(
+            documents["selected"], "selection.documents.selected"
+        )
+        quota_overflow = _require_nonnegative_int(
+            documents["quota_overflow"], "selection.documents.quota_overflow"
+        )
+        selected_documents = sum(
+            row["selected_documents"] for row in totals.values()
+        )
+        if (
+            accepted_documents != selected_documents
+            or manifest_selected_documents != selected_documents
+            or quota_overflow != 0
+            or input_documents < selected_documents
+        ):
+            raise MaterializationError(
+                "All-eligible document totals are internally inconsistent"
+            )
+        return totals
+
+    @classmethod
+    def _validate_all_eligible_source_curation(
+        cls,
+        identity: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+    ) -> None:
+        source = _require_exact_object_keys(
+            identity.get("source_curation"),
+            {
+                "contract_version",
+                "database_version",
+                "identity_format_version",
+                "identity_sha256",
+                "database",
+                "checkpoint",
+                "snapshot",
+                "phase",
+                "read_performance",
+                "eligible_authority_query_plan",
+                "archive_bitmap_query_plan",
+                "rejection_inventory_query_plan",
+                "rejection_reason_associations",
+                "groups_subphase",
+                "ignored_partial_exact_selection",
+            },
+            "selection.identity.source_curation",
+        )
+        if (
+            source["contract_version"] != 1
+            or source["database_version"] != 4
+            or source["identity_format_version"]
+            != FAST_CURATION_IDENTITY_FORMAT_VERSION
+            or source["phase"]
+            not in ("canonicalized", "selected", "emitting", "emitted", "complete")
+        ):
+            raise MaterializationError(
+                "All-eligible source curation contract is unsupported"
+            )
+        source_identity_sha = _require_sha256(
+            source["identity_sha256"],
+            "selection.identity.source_curation.identity_sha256",
+        )
+        source_identity = dict(identity)
+        source_identity.pop("selection_profile", None)
+        source_identity.pop("source_curation", None)
+        source_identity["format_version"] = FAST_CURATION_IDENTITY_FORMAT_VERSION
+        if canonical_sha256(source_identity) != source_identity_sha:
+            raise MaterializationError(
+                "All-eligible publication does not bind its source v6 identity"
+            )
+
+        for name in ("database", "checkpoint"):
+            descriptor = _require_exact_object_keys(
+                source[name],
+                {"path", "bytes", "sha256"},
+                f"selection.identity.source_curation.{name}",
+            )
+            cls._require_nonempty_string(
+                descriptor["path"],
+                f"selection.identity.source_curation.{name}.path",
+            )
+            cls._require_positive_int(
+                descriptor["bytes"],
+                f"selection.identity.source_curation.{name}.bytes",
+            )
+            _require_sha256(
+                descriptor["sha256"],
+                f"selection.identity.source_curation.{name}.sha256",
+            )
+
+        snapshot = _require_exact_object_keys(
+            source["snapshot"],
+            {
+                "manifest_path",
+                "manifest_sha256",
+                "generation",
+                "identity_sha256",
+                "previous_manifest_sha256",
+                "validated_chain",
+                "validation",
+            },
+            "selection.identity.source_curation.snapshot",
+        )
+        cls._require_nonempty_string(
+            snapshot["manifest_path"],
+            "selection.identity.source_curation.snapshot.manifest_path",
+        )
+        _require_sha256(
+            snapshot["manifest_sha256"],
+            "selection.identity.source_curation.snapshot.manifest_sha256",
+        )
+        cls._require_positive_int(
+            snapshot["generation"],
+            "selection.identity.source_curation.snapshot.generation",
+        )
+        if (
+            _require_sha256(
+                snapshot["identity_sha256"],
+                "selection.identity.source_curation.snapshot.identity_sha256",
+            )
+            != source_identity_sha
+        ):
+            raise MaterializationError(
+                "All-eligible durable snapshot does not bind the source identity"
+            )
+        previous = snapshot["previous_manifest_sha256"]
+        if previous is not None:
+            _require_sha256(
+                previous,
+                "selection.identity.source_curation.snapshot.previous_manifest_sha256",
+            )
+        if snapshot["validation"] != (
+            "LocalSQLiteStore-v1-compatible-target-and-chain"
+        ) or not isinstance(snapshot["validated_chain"], list):
+            raise MaterializationError(
+                "All-eligible durable snapshot validation evidence is unsupported"
+            )
+        chain: list[tuple[int, str]] = []
+        for index, raw_row in enumerate(snapshot["validated_chain"]):
+            row = _require_exact_object_keys(
+                raw_row,
+                {"generation", "manifest_sha256"},
+                "selection.identity.source_curation.snapshot."
+                f"validated_chain[{index}]",
+            )
+            chain.append(
+                (
+                    cls._require_positive_int(
+                        row["generation"],
+                        f"source snapshot chain generation {index}",
+                    ),
+                    _require_sha256(
+                        row["manifest_sha256"],
+                        f"source snapshot chain manifest {index}",
+                    ),
+                )
+            )
+        if (
+            not chain
+            or any(
+                left[0] >= right[0]
+                for left, right in zip(chain, chain[1:])
+            )
+            or chain[-1]
+            != (snapshot["generation"], snapshot["manifest_sha256"])
+            or previous != (chain[-2][1] if len(chain) > 1 else None)
+        ):
+            raise MaterializationError(
+                "All-eligible durable snapshot chain evidence is inconsistent"
+            )
+
+        read_performance = _require_exact_object_keys(
+            source["read_performance"],
+            {
+                "temp_store",
+                "cache_size_kib",
+                "mmap_size_bytes",
+                "durability_pragmas_modified",
+            },
+            "selection.identity.source_curation.read_performance",
+        )
+        if (
+            read_performance["temp_store"] != 2
+            or read_performance["cache_size_kib"] != 4_194_304
+            or read_performance["durability_pragmas_modified"] is not False
+        ):
+            raise MaterializationError(
+                "All-eligible source read-performance contract is unsupported"
+            )
+        _require_nonnegative_int(
+            read_performance["mmap_size_bytes"],
+            "selection.identity.source_curation.read_performance.mmap_size_bytes",
+        )
+
+        for name in (
+            "eligible_authority_query_plan",
+            "archive_bitmap_query_plan",
+            "rejection_inventory_query_plan",
+        ):
+            query_plan = source[name]
+            if (
+                not isinstance(query_plan, list)
+                or not query_plan
+                or any(
+                    not isinstance(row, str) or not row.strip()
+                    for row in query_plan
+                )
+            ):
+                raise MaterializationError(
+                    f"All-eligible source {name} evidence is malformed"
+                )
+
+        reason_counts = manifest.get("reason_document_counts")
+        if not isinstance(reason_counts, dict) or any(
+            not isinstance(reason, str)
+            or not reason
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 1
+            for reason, count in reason_counts.items()
+        ):
+            raise MaterializationError(
+                "All-eligible rejection reason accounting is malformed"
+            )
+        rejection_associations = _require_nonnegative_int(
+            source["rejection_reason_associations"],
+            "selection.identity.source_curation.rejection_reason_associations",
+        )
+        if rejection_associations != sum(reason_counts.values()):
+            raise MaterializationError(
+                "All-eligible rejection reason association accounting differs"
+            )
+
+        groups = _require_exact_object_keys(
+            source["groups_subphase"],
+            {
+                "status",
+                "processed_rows",
+                "processed_tokens",
+                "committed_batches",
+                "cursor",
+                "details",
+            },
+            "selection.identity.source_curation.groups_subphase",
+        )
+        if groups["status"] != "complete":
+            raise MaterializationError(
+                "All-eligible source leakage-safe group assignment is incomplete"
+            )
+        cls._require_positive_int(
+            groups["processed_rows"],
+            "selection.identity.source_curation.groups_subphase.processed_rows",
+        )
+        _require_nonnegative_int(
+            groups["processed_tokens"],
+            "selection.identity.source_curation.groups_subphase.processed_tokens",
+        )
+        cls._require_positive_int(
+            groups["committed_batches"],
+            "selection.identity.source_curation.groups_subphase.committed_batches",
+        )
+        if not isinstance(groups["cursor"], dict) or not isinstance(
+            groups["details"], dict
+        ):
+            raise MaterializationError(
+                "All-eligible source group progress evidence is malformed"
+            )
+
+        ignored = _require_exact_object_keys(
+            source["ignored_partial_exact_selection"],
+            {"documents", "tokens", "quota_subphases", "authority"},
+            "selection.identity.source_curation.ignored_partial_exact_selection",
+        )
+        ignored_documents = _require_nonnegative_int(
+            ignored["documents"],
+            "selection.identity.source_curation.ignored_partial_exact_selection.documents",
+        )
+        ignored_tokens = _require_nonnegative_int(
+            ignored["tokens"],
+            "selection.identity.source_curation.ignored_partial_exact_selection.tokens",
+        )
+        if (
+            ignored["authority"] is not False
+            or (ignored_documents == 0) != (ignored_tokens == 0)
+            or not isinstance(ignored["quota_subphases"], list)
+        ):
+            raise MaterializationError(
+                "Ignored exact-quota selection evidence is inconsistent"
+            )
+        quota_names: list[str] = []
+        for index, raw_row in enumerate(ignored["quota_subphases"]):
+            row = _require_exact_object_keys(
+                raw_row,
+                {
+                    "subphase",
+                    "status",
+                    "processed_rows",
+                    "processed_tokens",
+                    "committed_batches",
+                },
+                "selection.identity.source_curation.ignored_partial_exact_selection."
+                f"quota_subphases[{index}]",
+            )
+            subphase = cls._require_nonempty_string(
+                row["subphase"], f"source quota subphase {index}"
+            )
+            quota_names.append(subphase)
+            if not subphase.startswith("selection.quota.") or row["status"] not in (
+                "running",
+                "complete",
+            ):
+                raise MaterializationError("Invalid ignored quota subphase evidence")
+            for field in (
+                "processed_rows",
+                "processed_tokens",
+                "committed_batches",
+            ):
+                _require_nonnegative_int(
+                    row[field], f"source quota subphase {index}.{field}"
+                )
+        if quota_names != sorted(set(quota_names)):
+            raise MaterializationError(
+                "Ignored quota subphase evidence is not unique canonical order"
+            )
+
+    @classmethod
+    def _validate_all_eligible_identity_fields(
+        cls,
+        identity: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+    ) -> None:
+        policy = identity.get("raw_archive_integrity_policy")
+        if policy not in RAW_ARCHIVE_INTEGRITY_POLICIES:
+            raise MaterializationError(
+                "Unsupported source raw-archive integrity policy"
+            )
+        execution = _require_exact_object_keys(
+            identity.get("sqlite_execution"),
+            {
+                "mode",
+                "protocol_version",
+                "active_journal_mode",
+                "canonical_journal_mode",
+                "snapshot_retention",
+                "wal_autocheckpoint_pages",
+                "locking_mode",
+            },
+            "selection.identity.sqlite_execution",
+        )
+        for field, expected in LOCAL_SQLITE_EXECUTION.items():
+            if execution[field] != expected:
+                raise MaterializationError(
+                    f"Source SQLite execution contract mismatch for {field}"
+                )
+        if execution["canonical_journal_mode"] not in ("delete", "wal"):
+            raise MaterializationError(
+                "Source SQLite canonical journal mode is invalid"
+            )
+        cls._require_positive_int(
+            execution["snapshot_retention"],
+            "selection.identity.sqlite_execution.snapshot_retention",
+        )
+        if (
+            identity.get("sqlite_runtime", {})
+            .get("journal_policy", {})
+            .get("selected_mode")
+            != execution["canonical_journal_mode"]
+        ):
+            raise MaterializationError(
+                "Source SQLite execution/canonical runtime identities differ"
+            )
+        cls._validate_all_eligible_source_curation(identity, manifest)
+
     def _validate_selection_manifest(self) -> dict[str, Any]:
         if not self.selection_manifest_path.is_file():
             raise MaterializationError(
@@ -2313,9 +3030,45 @@ class CorpusMaterializer:
         if not isinstance(identity, dict):
             raise MaterializationError("Unsupported curation identity")
         identity_version = identity.get("format_version")
-        if identity_version not in (5, FAST_CURATION_IDENTITY_FORMAT_VERSION):
+        if identity_version not in (
+            5,
+            FAST_CURATION_IDENTITY_FORMAT_VERSION,
+            ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION,
+        ):
             raise MaterializationError("Unsupported curation identity")
-        fast_profile = identity_version == FAST_CURATION_IDENTITY_FORMAT_VERSION
+        fast_profile = identity_version in (
+            FAST_CURATION_IDENTITY_FORMAT_VERSION,
+            ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION,
+        )
+        all_eligible = identity_version == ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+        if all_eligible:
+            try:
+                top_selection_profile = validate_all_eligible_selection_profile(
+                    manifest.get("selection_profile")
+                )
+                identity_selection_profile = validate_all_eligible_selection_profile(
+                    identity.get("selection_profile")
+                )
+            except ValueError as error:
+                raise MaterializationError(
+                    "Unsupported all-eligible selection profile"
+                ) from error
+            if (
+                top_selection_profile != identity_selection_profile
+                or manifest.get("selection_strategy")
+                != ALL_ELIGIBLE_SELECTION_STRATEGY
+                or manifest.get("publication_scope")
+                != ALL_ELIGIBLE_PUBLICATION_SCOPE
+                or manifest.get("training_input_budget_authority")
+                != ALL_ELIGIBLE_TRAINING_INPUT_BUDGET_AUTHORITY
+                or manifest.get("decision_format")
+                != ALL_ELIGIBLE_BITMAP_FORMAT
+                or manifest.get("decision_format_version")
+                != ALL_ELIGIBLE_BITMAP_FORMAT_VERSION
+            ):
+                raise MaterializationError(
+                    "All-eligible publication authority contract mismatch"
+                )
         if fast_profile:
             if manifest.get("english_near_dedup_complete") is not False:
                 raise MaterializationError(
@@ -2369,6 +3122,15 @@ class CorpusMaterializer:
         }
         if fast_profile:
             identity_keys.add("curation_profile")
+        if all_eligible:
+            identity_keys.update(
+                {
+                    "raw_archive_integrity_policy",
+                    "sqlite_execution",
+                    "selection_profile",
+                    "source_curation",
+                }
+            )
         _require_exact_object_keys(
             identity,
             identity_keys,
@@ -2421,6 +3183,13 @@ class CorpusMaterializer:
             ):
                 raise MaterializationError(
                     "Fast curation profile limitations were not preserved verbatim"
+                )
+            if all_eligible and any(
+                item not in limitations
+                for item in ALL_ELIGIBLE_SELECTION_PROFILE["known_limitations"]
+            ):
+                raise MaterializationError(
+                    "All-eligible selection limitations were not preserved verbatim"
                 )
             fast_audit = _require_exact_object_keys(
                 manifest.get("fast_profile_audit"),
@@ -2479,6 +3248,9 @@ class CorpusMaterializer:
             self._validate_english_near_artifact(identity, manifest)
         self._validate_sqlite_runtime(identity)
         self._validate_curation_storage_contract(identity)
+        if all_eligible:
+            self._validate_all_eligible_identity_fields(identity, manifest)
+            self._validate_all_eligible_totals(manifest)
         decisions = manifest.get("decision_shards")
         if not isinstance(decisions, list) or not decisions:
             raise MaterializationError("Curation manifest has no decision shards")
@@ -2493,7 +3265,10 @@ class CorpusMaterializer:
             raise MaterializationError("Curation policy identity mismatch")
         if self.selection_manifest.get("selection_policy") != policy.get("selection"):
             raise MaterializationError("Selection policy was not copied faithfully")
-        if identity["format_version"] == FAST_CURATION_IDENTITY_FORMAT_VERSION:
+        if identity["format_version"] in (
+            FAST_CURATION_IDENTITY_FORMAT_VERSION,
+            ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION,
+        ):
             if (
                 policy.get("policy_version") != 2
                 or policy.get("curation_profile") != FAST_CURATION_PROFILE
@@ -2537,6 +3312,7 @@ class CorpusMaterializer:
         ):
             if not path.is_file() or file_sha256(path) != identity[key]:
                 raise MaterializationError(f"{name} identity mismatch: {path}")
+        self._configure_all_eligible_split_authority(policy)
         source_manifests = identity.get("source_manifests")
         if not isinstance(source_manifests, dict) or not source_manifests:
             raise MaterializationError("Curation identity has no source manifests")
@@ -2634,6 +3410,10 @@ class CorpusMaterializer:
     def _build_archive_inventory(self) -> list[ArchiveSpec]:
         input_reports = self.selection_manifest["input_reports"]
         decision_shards = self.selection_manifest["decision_shards"]
+        all_eligible = (
+            self.selection_manifest["identity"]["format_version"]
+            == ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+        )
         report_by_archive: dict[str, dict[str, Any]] = {}
         for row in input_reports:
             if not isinstance(row, dict) or not isinstance(row.get("archive"), str):
@@ -2685,6 +3465,43 @@ class CorpusMaterializer:
                 raise MaterializationError("Input archives must be non-empty")
             if decision.get("records") != documents:
                 raise MaterializationError("Decision/report document count mismatch")
+            decision_path = _safe_file(
+                self.selection_root, decision.get("path"), "decision shard"
+            )
+            decision_format: str | None = None
+            decision_format_version: int | None = None
+            decision_bytes: int | None = None
+            decision_kept_documents: int | None = None
+            if all_eligible:
+                _require_exact_object_keys(
+                    decision,
+                    set(ALL_ELIGIBLE_BITMAP_DESCRIPTOR_KEYS),
+                    f"selection decision descriptor {archive_name}",
+                )
+                if (
+                    decision.get("format") != ALL_ELIGIBLE_BITMAP_FORMAT
+                    or decision.get("format_version")
+                    != ALL_ELIGIBLE_BITMAP_FORMAT_VERSION
+                ):
+                    raise MaterializationError(
+                        "Unsupported all-eligible decision bitmap format"
+                    )
+                decision_format = ALL_ELIGIBLE_BITMAP_FORMAT
+                decision_format_version = ALL_ELIGIBLE_BITMAP_FORMAT_VERSION
+                decision_bytes = self._require_positive_int(
+                    decision.get("bytes"), "decision bitmap bytes"
+                )
+                decision_kept_documents = _require_nonnegative_int(
+                    decision.get("kept_documents"),
+                    "decision bitmap kept_documents",
+                )
+                if (
+                    decision_kept_documents > documents
+                    or decision_path.stat().st_size != decision_bytes
+                ):
+                    raise MaterializationError(
+                        "All-eligible decision bitmap descriptor is inconsistent"
+                    )
             archives.append(
                 ArchiveSpec(
                     ordinal=ordinal,
@@ -2713,9 +3530,7 @@ class CorpusMaterializer:
                         report_descriptor.get("fingerprint_sha256"),
                         "fingerprint SHA-256",
                     ),
-                    decision_path=_safe_file(
-                        self.selection_root, decision.get("path"), "decision shard"
-                    ),
+                    decision_path=decision_path,
                     decision_relative=str(decision.get("path")),
                     decision_sha256=_require_sha256(
                         decision.get("sha256"), "decision SHA-256"
@@ -2723,6 +3538,10 @@ class CorpusMaterializer:
                     documents=documents,
                     clean_bytes=clean_bytes,
                     content_tokens=content_tokens,
+                    decision_format=decision_format,
+                    decision_format_version=decision_format_version,
+                    decision_bytes=decision_bytes,
+                    decision_kept_documents=decision_kept_documents,
                 )
             )
         return archives
@@ -2745,6 +3564,15 @@ class CorpusMaterializer:
                     f"Archive inventory differs from collection authority for {bucket}: "
                     f"{observed} != {expected}"
                 )
+        if (
+            self.selection_manifest["identity"]["format_version"]
+            == ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+            and sum(item.documents for item in self.archives)
+            != self.selection_manifest["documents"]["input"]
+        ):
+            raise MaterializationError(
+                "All-eligible input document total differs from archive authority"
+            )
 
     def _initial_cursor(self, split: str, domain: str) -> dict[str, Any]:
         return {
@@ -2992,6 +3820,19 @@ class CorpusMaterializer:
         ):
             raise MaterializationError("Decision flags/reasons/provenance are invalid")
         decision = row.get("decision")
+        if (
+            self.selection_manifest["identity"]["format_version"]
+            == ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+            and decision == "keep"
+            and (
+                selected_tokens != source_tokens
+                or row.get("token_prefix") != [0, source_tokens]
+                or row.get("terminal_quota_prefix") is not False
+            )
+        ):
+            raise MaterializationError(
+                "All-eligible kept decisions must preserve complete documents"
+            )
         if decision == "keep":
             if (
                 row.get("split") not in SPLITS
@@ -3042,6 +3883,205 @@ class CorpusMaterializer:
         if not isinstance(size, int) or isinstance(size, bool) or size < 1:
             raise MaterializationError("Raw manifest has an invalid byte count")
 
+    def _load_all_eligible_bitmap(self, archive: ArchiveSpec) -> bytes:
+        if (
+            archive.decision_format != ALL_ELIGIBLE_BITMAP_FORMAT
+            or archive.decision_format_version
+            != ALL_ELIGIBLE_BITMAP_FORMAT_VERSION
+            or archive.decision_bytes is None
+            or archive.decision_kept_documents is None
+        ):
+            raise MaterializationError(
+                "All-eligible archive has no authenticated bitmap descriptor"
+            )
+        try:
+            raw = archive.decision_path.read_bytes()
+        except OSError as error:
+            raise MaterializationError(
+                f"Could not read decision bitmap: {archive.decision_path}"
+            ) from error
+        prefix_bytes = len(ALL_ELIGIBLE_BITMAP_MAGIC) + (
+            ALL_ELIGIBLE_BITMAP_HEADER_LENGTH_BYTES
+        )
+        if len(raw) != archive.decision_bytes or len(raw) < prefix_bytes + 1:
+            raise MaterializationError(
+                "All-eligible decision bitmap file length is inconsistent"
+            )
+        if raw[: len(ALL_ELIGIBLE_BITMAP_MAGIC)] != ALL_ELIGIBLE_BITMAP_MAGIC:
+            raise MaterializationError("All-eligible decision bitmap magic mismatch")
+        length_start = len(ALL_ELIGIBLE_BITMAP_MAGIC)
+        length_end = length_start + ALL_ELIGIBLE_BITMAP_HEADER_LENGTH_BYTES
+        header_bytes_count = int.from_bytes(raw[length_start:length_end], "big")
+        expected_payload_bytes = all_eligible_bitmap_payload_bytes(
+            archive.documents
+        )
+        if (
+            header_bytes_count < 1
+            or length_end + header_bytes_count + expected_payload_bytes != len(raw)
+        ):
+            raise MaterializationError(
+                "All-eligible decision bitmap header length is inconsistent"
+            )
+        header_raw = raw[length_end : length_end + header_bytes_count]
+        payload = raw[length_end + header_bytes_count :]
+        try:
+            header_value = json.loads(header_raw.decode("utf-8", errors="strict"))
+            header = validate_all_eligible_bitmap_header(header_value)
+            validate_all_eligible_bitmap_payload(
+                payload, records=archive.documents
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise MaterializationError(
+                "Invalid all-eligible decision bitmap header/payload"
+            ) from error
+        if canonical_json_bytes(header) != header_raw:
+            raise MaterializationError(
+                "All-eligible decision bitmap header is not canonical JSON"
+            )
+        expected_header = {
+            "format": ALL_ELIGIBLE_BITMAP_FORMAT,
+            "format_version": ALL_ELIGIBLE_BITMAP_FORMAT_VERSION,
+            "archive": archive.archive,
+            "bucket": archive.bucket,
+            "category": archive.domain,
+            "records": archive.documents,
+            "kept_documents": archive.decision_kept_documents,
+            "bit_order": ALL_ELIGIBLE_BITMAP_BIT_ORDER,
+            "payload_bytes": expected_payload_bytes,
+        }
+        if header != expected_header:
+            raise MaterializationError(
+                "All-eligible decision bitmap header differs from its descriptor"
+            )
+        if sum(byte.bit_count() for byte in payload) != (
+            archive.decision_kept_documents
+        ):
+            raise MaterializationError(
+                "All-eligible decision bitmap kept-document count mismatch"
+            )
+        return payload
+
+    def _iter_all_eligible_decisions(
+        self, archive: ArchiveSpec, bitmap: bytes
+    ) -> Iterator[dict[str, Any]]:
+        records = 0
+        kept_documents = 0
+        for index, raw_row in enumerate(iter_jsonl_zst(archive.fingerprint_path)):
+            if index >= archive.documents:
+                raise MaterializationError(
+                    "All-eligible fingerprint has more rows than its bitmap"
+                )
+            if not isinstance(raw_row, dict):
+                raise MaterializationError(
+                    "All-eligible fingerprint row is not an object"
+                )
+            member_path = raw_row.get("member_path")
+            expected_doc_id = (
+                hashlib.sha256(
+                    f"{archive.archive}\0{member_path}".encode("utf-8")
+                ).hexdigest()
+                if isinstance(member_path, str) and member_path
+                else None
+            )
+            expected = {
+                "record_version": 1,
+                "fingerprint_version": FINGERPRINT_VERSION,
+                "doc_id": expected_doc_id,
+                "archive": archive.archive,
+                "bucket": archive.bucket,
+                "archive_index": archive.archive_index,
+                "manifest_index": index,
+            }
+            if any(raw_row.get(key) != value for key, value in expected.items()):
+                raise MaterializationError(
+                    f"All-eligible fingerprint identity mismatch at row {index}"
+                )
+            if member_path == "_manifest.jsonl":
+                raise MaterializationError(
+                    "All-eligible fingerprint has an invalid member path"
+                )
+            source_tokens = self._require_positive_int(
+                raw_row.get("starcoder2_tokens"),
+                f"all-eligible fingerprint row {index} tokens",
+            )
+            size_bytes = self._require_positive_int(
+                raw_row.get("size_bytes"),
+                f"all-eligible fingerprint row {index} bytes",
+            )
+            content_sha = _require_sha256(
+                raw_row.get("content_sha256"),
+                f"all-eligible fingerprint row {index} content_sha256",
+            )
+            normalized_sha = _require_sha256(
+                raw_row.get("normalized_sha256"),
+                f"all-eligible fingerprint row {index} normalized_sha256",
+            )
+            flags = raw_row.get("quality_flags")
+            benchmark_reason = raw_row.get("benchmark_reason")
+            provenance = raw_row.get("provenance")
+            if (
+                not isinstance(flags, list)
+                or flags != sorted(set(flags))
+                or any(not isinstance(flag, str) for flag in flags)
+                or (
+                    benchmark_reason is not None
+                    and (
+                        not isinstance(benchmark_reason, str)
+                        or not benchmark_reason
+                    )
+                )
+                or bool(benchmark_reason)
+                != ("benchmark_contamination" in flags)
+                or not isinstance(provenance, dict)
+            ):
+                raise MaterializationError(
+                    f"All-eligible fingerprint metadata is invalid at row {index}"
+                )
+            keep = bool((bitmap[index // 8] >> (index % 8)) & 1)
+            split_group_id: str | None = None
+            split: str | None = None
+            if keep:
+                assert expected_doc_id is not None
+                split_group_id, split = self._derive_all_eligible_group_and_split(
+                    bucket=archive.bucket,
+                    provenance=provenance,
+                    doc_id=expected_doc_id,
+                )
+                kept_documents += 1
+            records += 1
+            yield {
+                "record_version": 1,
+                "doc_id": expected_doc_id,
+                "bucket": archive.bucket,
+                "category": archive.domain,
+                "archive": archive.archive,
+                "archive_index": archive.archive_index,
+                "manifest_index": index,
+                "member_path": member_path,
+                "decision": "keep" if keep else "reject",
+                "split": split,
+                "assigned_split": split,
+                "source_tokens": source_tokens,
+                "selected_tokens": source_tokens if keep else 0,
+                "token_prefix": [0, source_tokens] if keep else None,
+                "terminal_quota_prefix": False,
+                "canonical_doc_id": expected_doc_id if keep else None,
+                "split_group_id": split_group_id,
+                "reasons": [],
+                "content_sha256": content_sha,
+                "normalized_sha256": normalized_sha,
+                "quality_flags": flags,
+                "benchmark_reason": benchmark_reason,
+                "provenance": provenance,
+                "_fingerprint_size_bytes": size_bytes,
+            }
+        if records != archive.documents or kept_documents != (
+            archive.decision_kept_documents
+        ):
+            raise MaterializationError(
+                "All-eligible fingerprint/bitmap record totals differ"
+            )
+
     def _process_archive(self, archive: ArchiveSpec) -> dict[str, int]:
         if file_sha256(archive.report_path) != archive.report_sha256:
             raise MaterializationError(f"Preprocess report changed: {archive.report_path}")
@@ -3049,6 +4089,16 @@ class CorpusMaterializer:
             raise MaterializationError(f"Fingerprint changed: {archive.fingerprint_path}")
         if file_sha256(archive.decision_path) != archive.decision_sha256:
             raise MaterializationError(f"Decision shard changed: {archive.decision_path}")
+        bitmap = (
+            self._load_all_eligible_bitmap(archive)
+            if archive.decision_format == ALL_ELIGIBLE_BITMAP_FORMAT
+            else None
+        )
+
+        def decision_rows() -> Iterator[dict[str, Any]]:
+            if bitmap is None:
+                return iter_jsonl_zst(archive.decision_path)
+            return self._iter_all_eligible_decisions(archive, bitmap)
 
         eligible = {
             key
@@ -3169,7 +4219,7 @@ class CorpusMaterializer:
         content_tokens = 0
         manifest_seen = False
         member_sizes: list[int] = []
-        decisions = iter(iter_jsonl_zst(archive.decision_path))
+        decisions = iter(decision_rows())
 
         index_descriptors: dict[tuple[str, str], dict[str, Any] | None] = {}
         try:
@@ -3205,9 +4255,7 @@ class CorpusMaterializer:
                                     raise MaterializationError(
                                         "Raw archive has fewer documents than decisions"
                                     )
-                                second_decisions = iter(
-                                    iter_jsonl_zst(archive.decision_path)
-                                )
+                                second_decisions = iter(decision_rows())
                                 for index, raw_line in enumerate(extracted):
                                     try:
                                         line = raw_line.decode(
@@ -3263,7 +4311,10 @@ class CorpusMaterializer:
                                 raise MaterializationError(
                                     "Raw archive has more documents than decisions"
                                 ) from error
-                            self._validate_decision(decision, archive, documents)
+                            if bitmap is None:
+                                self._validate_decision(
+                                    decision, archive, documents
+                                )
                             if member.name != decision["member_path"]:
                                 raise MaterializationError(
                                     f"Raw/decision member mismatch at document {documents}"
@@ -3311,6 +4362,15 @@ class CorpusMaterializer:
                                 raise MaterializationError(
                                     f"Short raw member {member.name}: "
                                     f"{observed_size} != {member.size}"
+                                )
+                            if (
+                                bitmap is not None
+                                and decision.get("_fingerprint_size_bytes")
+                                != member.size
+                            ):
+                                raise MaterializationError(
+                                    "Fingerprint/raw member byte count mismatch: "
+                                    f"{archive.archive}:{member.name}"
                                 )
                             if content_sha != decision["content_sha256"]:
                                 raise MaterializationError(
@@ -3443,6 +4503,30 @@ class CorpusMaterializer:
         }
 
     def _validate_selected_totals(self) -> None:
+        if (
+            self.selection_manifest["identity"]["format_version"]
+            == ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+        ):
+            expected = self._validate_all_eligible_totals(self.selection_manifest)
+            if set(expected) != set(self.destinations):
+                raise MaterializationError(
+                    "All-eligible totals do not cover every split/domain"
+                )
+            for key, state in self.destinations.items():
+                observed = {
+                    counter: state.cursor[counter]
+                    for counter in (
+                        "selected_documents",
+                        "selected_content_tokens",
+                        "terminal_prefix_documents",
+                    )
+                }
+                if observed != expected[key]:
+                    raise MaterializationError(
+                        f"Materialized all-eligible total mismatch for {key}: "
+                        f"{observed} != {expected[key]}"
+                    )
+            return
         expected: dict[tuple[str, str], dict[str, int]] = {}
         quotas = self.selection_manifest.get("quotas")
         if not isinstance(quotas, list):
@@ -3808,7 +4892,7 @@ class CorpusMaterializer:
 
     def _provenance_payloads(self) -> dict[str, dict[str, Any]]:
         identity = self.selection_manifest["identity"]
-        return {
+        payloads = {
             "source.json": {
                 "format_version": 1,
                 "selection_manifest_sha256": self.selection_manifest_sha256,
@@ -3887,11 +4971,56 @@ class CorpusMaterializer:
                         "fingerprint_sha256": item.fingerprint_sha256,
                         "decision": item.decision_relative,
                         "decision_sha256": item.decision_sha256,
+                        **(
+                            {
+                                "decision_format": item.decision_format,
+                                "decision_format_version": (
+                                    item.decision_format_version
+                                ),
+                                "decision_bytes": item.decision_bytes,
+                                "decision_kept_documents": (
+                                    item.decision_kept_documents
+                                ),
+                            }
+                            if item.decision_format is not None
+                            else {}
+                        ),
                     }
                     for item in self.archives
                 ],
             },
         }
+        if identity["format_version"] == ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION:
+            payloads["source.json"].update(
+                {
+                    "publication_scope": self.selection_manifest[
+                        "publication_scope"
+                    ],
+                    "raw_archive_integrity_policy": identity[
+                        "raw_archive_integrity_policy"
+                    ],
+                    "curation_sqlite_execution": identity["sqlite_execution"],
+                    "source_curation": identity["source_curation"],
+                }
+            )
+            payloads["policy.json"].update(
+                {
+                    "selection_strategy": self.selection_manifest[
+                        "selection_strategy"
+                    ],
+                    "selection_profile": self.selection_manifest[
+                        "selection_profile"
+                    ],
+                    "training_input_budget_authority": self.selection_manifest[
+                        "training_input_budget_authority"
+                    ],
+                    "selected_totals": self.selection_manifest["selected_totals"],
+                    "reference_quotas": self.selection_manifest[
+                        "reference_quotas"
+                    ],
+                }
+            )
+        return payloads
 
     def _write_provenance(self) -> dict[str, dict[str, Any]]:
         root = self.output_root / "provenance"
@@ -3972,7 +5101,14 @@ class CorpusMaterializer:
                 "archive_count": len(self.archives),
             },
             "split_isolation": {
-                "authoritative_assignment": "completed-curation-decision-shards",
+                "authoritative_assignment": (
+                    self.selection_manifest["selection_profile"][
+                        "split_authority"
+                    ]
+                    if self.selection_manifest["identity"]["format_version"]
+                    == ALL_ELIGIBLE_IDENTITY_FORMAT_VERSION
+                    else "completed-curation-decision-shards"
+                ),
                 "physical_outputs_separate": True,
                 "curation_leakage_audit": self.selection_manifest["leakage_audit"],
             },

@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import math
+import sqlite3
 import tarfile
 import tempfile
 import unittest
@@ -27,6 +28,22 @@ from pretrain.materialize import (
     canonical_sha256,
     file_sha256,
     iter_jsonl_zst,
+)
+from pretrain.selection_contract import (
+    ALL_ELIGIBLE_BITMAP_BIT_ORDER,
+    ALL_ELIGIBLE_BITMAP_FORMAT,
+    ALL_ELIGIBLE_BITMAP_FORMAT_VERSION,
+    ALL_ELIGIBLE_BITMAP_MAGIC,
+    ALL_ELIGIBLE_SELECTION_PROFILE,
+    ALL_ELIGIBLE_SELECTION_STRATEGY,
+    all_eligible_bitmap_payload_bytes,
+)
+from scripts.publish_all_eligible_selection import (
+    AllEligiblePublisher,
+    FAST_CANONICAL_POLICY,
+    _database_state,
+    assign_group_split,
+    split_thresholds,
 )
 
 
@@ -68,6 +85,7 @@ class MaterializationFixture:
         self.quota_path = root / "quotas.json"
         self.denylist_path = root / "denylist.json"
         self.malformed_prefix = malformed_prefix
+        self._split_identity_cache: dict[tuple[str, str], str] = {}
         self._write_tokenizer()
         self._write_supporting_identities()
         self._write_corpus_and_selection()
@@ -651,6 +669,51 @@ class MaterializationFixture:
             return "raw/english/wikipedia/part-000000.tar.zst", "English"
         return "raw/english/fineweb_edu/part-000000.tar.zst", "English"
 
+    @staticmethod
+    def _fixture_group_digest(namespace: str, value: str) -> bytes:
+        return hashlib.sha256(
+            namespace.encode("utf-8") + b"\0" + value.encode("utf-8")
+        ).digest()
+
+    def _code_repo_for_split(self, split: str) -> str:
+        key = ("code", split)
+        if key not in self._split_identity_cache:
+            quotas = {
+                (candidate_split, domain): 10
+                for candidate_split in ("train", "validation", "test")
+                for domain in ("python", "other_code", "english")
+            }
+            thresholds = split_thresholds(quotas)
+            for number in range(100_000):
+                value = f"fixture-repo-{split}-{number}"
+                group = self._fixture_group_digest("code-repository", value)
+                if assign_group_split("fixture", group, thresholds) == split:
+                    self._split_identity_cache[key] = value
+                    break
+            else:
+                raise AssertionError(f"could not find fixture repo for {split}")
+        return self._split_identity_cache[key]
+
+    def _english_url_for_split(self, bucket: str, split: str) -> str:
+        key = (bucket, split)
+        if key not in self._split_identity_cache:
+            quotas = {
+                (candidate_split, domain): 10
+                for candidate_split in ("train", "validation", "test")
+                for domain in ("python", "other_code", "english")
+            }
+            thresholds = split_thresholds(quotas)
+            for number in range(100_000):
+                value = f"https://example.test/{bucket}/{split}/{number}"
+                identity = f"{bucket}:url:{value}"
+                group = self._fixture_group_digest("english-source", identity)
+                if assign_group_split("fixture", group, thresholds) == split:
+                    self._split_identity_cache[key] = value
+                    break
+            else:
+                raise AssertionError(f"could not find fixture URL for {bucket}/{split}")
+        return self._split_identity_cache[key]
+
     def _document_rows(
         self, bucket: str, archive: str
     ) -> tuple[list[tuple[str, bytes, dict[str, Any]]], list[dict[str, Any]]]:
@@ -675,13 +738,14 @@ class MaterializationFixture:
                 provenance: dict[str, Any]
                 if bucket in ("fineweb_edu", "wikipedia"):
                     provenance = {
-                        "url": f"https://example.test/{split}/{document_in_split}",
+                        "url": self._english_url_for_split(bucket, split),
                         "language": "English",
                     }
                 else:
+                    repo_id = self._code_repo_for_split(split)
                     provenance = {
-                        "repo_id": f"repo-{split}",
-                        "repo_path": f"repo-{split}",
+                        "repo_id": repo_id,
+                        "repo_path": repo_id,
                         "language": "Python" if bucket == "python" else "Rust",
                     }
                 raw_manifest = {
@@ -1042,6 +1106,94 @@ def directory_bytes(root: Path) -> dict[str, bytes]:
 
 class MaterializeTrainingCorpusTest(unittest.TestCase):
     @staticmethod
+    def _fixture_source_group(
+        bucket: str, provenance: dict[str, Any], doc_id: str
+    ) -> bytes:
+        if bucket in ("python", "other_code"):
+            identity = str(provenance["repo_id"]).strip()
+            namespace = "code-repository"
+        else:
+            keys = (
+                ("url", "id")
+                if bucket == "fineweb_edu"
+                else ("id", "url", "title")
+            )
+            identity = next(
+                f"{bucket}:{key}:{str(provenance[key]).strip()}"
+                for key in keys
+                if provenance.get(key) is not None
+                and str(provenance[key]).strip()
+            )
+            namespace = "english-source"
+        return hashlib.sha256(
+            namespace.encode("utf-8") + b"\0" + identity.encode("utf-8")
+        ).digest()
+
+    @staticmethod
+    def _raw_member_sizes(path: Path) -> dict[str, int]:
+        result: dict[str, int] = {}
+        with path.open("rb") as raw:
+            decompressor = zstandard.ZstdDecompressor().stream_reader(
+                raw, read_across_frames=True, closefd=False
+            )
+            try:
+                with tarfile.open(fileobj=decompressor, mode="r|") as archive:
+                    for member in archive:
+                        if member.isfile() and member.name != "_manifest.jsonl":
+                            result[member.name] = member.size
+            finally:
+                decompressor.close()
+        return result
+
+    @staticmethod
+    def _write_keep_bitmap(
+        path: Path,
+        *,
+        archive: str,
+        bucket: str,
+        category: str,
+        keep: list[bool],
+    ) -> dict[str, Any]:
+        payload = bytearray(all_eligible_bitmap_payload_bytes(len(keep)))
+        for index, selected in enumerate(keep):
+            if selected:
+                payload[index // 8] |= 1 << (index % 8)
+        header = {
+            "format": ALL_ELIGIBLE_BITMAP_FORMAT,
+            "format_version": ALL_ELIGIBLE_BITMAP_FORMAT_VERSION,
+            "archive": archive,
+            "bucket": bucket,
+            "category": category,
+            "records": len(keep),
+            "kept_documents": sum(keep),
+            "bit_order": ALL_ELIGIBLE_BITMAP_BIT_ORDER,
+            "payload_bytes": len(payload),
+        }
+        header_raw = json.dumps(
+            header,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(
+            ALL_ELIGIBLE_BITMAP_MAGIC
+            + len(header_raw).to_bytes(4, "big")
+            + header_raw
+            + payload
+        )
+        return {
+            "archive": archive,
+            "path": str(path),
+            "format": ALL_ELIGIBLE_BITMAP_FORMAT,
+            "format_version": ALL_ELIGIBLE_BITMAP_FORMAT_VERSION,
+            "sha256": file_sha256(path),
+            "bytes": path.stat().st_size,
+            "records": len(keep),
+            "kept_documents": sum(keep),
+        }
+
+    @staticmethod
     def _convert_fixture_to_fast_profile(
         fixture: MaterializationFixture,
     ) -> dict[str, Any]:
@@ -1109,6 +1261,701 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
             f"{file_sha256(manifest_path)}  manifest.json\n", encoding="ascii"
         )
         return manifest
+
+    @classmethod
+    def _convert_fixture_to_all_eligible_profile(
+        cls, fixture: MaterializationFixture
+    ) -> dict[str, Any]:
+        manifest = cls._convert_fixture_to_fast_profile(fixture)
+        selected: dict[tuple[str, str], dict[str, int]] = {
+            (split, domain): {"documents": 0, "tokens": 0}
+            for split in ("train", "validation", "test")
+            for domain in ("python", "other_code", "english")
+        }
+        reports_by_archive = {
+            row["archive"]: row for row in manifest["input_reports"]
+        }
+        for descriptor in manifest["decision_shards"]:
+            original_path = fixture.selection / descriptor["path"]
+            rows = list(iter_jsonl_zst(original_path))
+            report_descriptor = reports_by_archive[descriptor["archive"]]
+            sizes = cls._raw_member_sizes(fixture.root / descriptor["archive"])
+            fingerprint_path = (
+                fixture.preprocess / report_descriptor["fingerprint_file"]
+            )
+            write_jsonl_zst(
+                fingerprint_path,
+                [
+                    {
+                        "record_version": 1,
+                        "fingerprint_version": 1,
+                        "doc_id": row["doc_id"],
+                        "archive": row["archive"],
+                        "bucket": row["bucket"],
+                        "archive_index": row["archive_index"],
+                        "manifest_index": row["manifest_index"],
+                        "member_path": row["member_path"],
+                        "size_bytes": sizes[row["member_path"]],
+                        "starcoder2_tokens": row["source_tokens"],
+                        "content_sha256": row["content_sha256"],
+                        "normalized_sha256": row["normalized_sha256"],
+                        "quality_flags": row["quality_flags"],
+                        "benchmark_reason": row["benchmark_reason"],
+                        "provenance": row["provenance"],
+                    }
+                    for row in rows
+                ],
+            )
+            report_descriptor["fingerprint_sha256"] = file_sha256(
+                fingerprint_path
+            )
+            report_path = fixture.preprocess / report_descriptor["report"]
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["fingerprint_sha256"] = report_descriptor[
+                "fingerprint_sha256"
+            ]
+            write_json(report_path, report)
+            report_descriptor["report_sha256"] = file_sha256(report_path)
+            for row in rows:
+                if row["decision"] != "keep":
+                    continue
+                key = (row["split"], row["category"])
+                selected[key]["documents"] += 1
+                selected[key]["tokens"] += row["source_tokens"]
+            bitmap_path = original_path.with_suffix(".keep")
+            bitmap_descriptor = cls._write_keep_bitmap(
+                bitmap_path,
+                archive=descriptor["archive"],
+                bucket=rows[0]["bucket"],
+                category=rows[0]["category"],
+                keep=[row["decision"] == "keep" for row in rows],
+            )
+            bitmap_descriptor["path"] = str(
+                bitmap_path.relative_to(fixture.selection)
+            )
+            descriptor.clear()
+            descriptor.update(bitmap_descriptor)
+        report_projection = [
+            {"path": row["report"], "sha256": row["report_sha256"]}
+            for row in manifest["input_reports"]
+        ]
+        completeness = json.loads(
+            json.dumps(manifest["collection_completeness"])
+        )
+        completeness["reports"]["inventory_sha256"] = canonical_sha256(
+            report_projection
+        )
+        manifest["collection_completeness"] = completeness
+        manifest["identity"]["collection_completeness"] = completeness
+        manifest["identity"]["report_inventory_sha256"] = canonical_sha256(
+            report_projection
+        )
+        manifest["decision_inventory_sha256"] = canonical_sha256(
+            manifest["decision_shards"]
+        )
+
+        target_by_key = {
+            (row["split"], row["category"]): row["target_tokens"]
+            for row in manifest.pop("quotas")
+        }
+        write_json(
+            fixture.quota_path,
+            {
+                "version": 1,
+                "quotas": [
+                    {
+                        "name": f"final/{split}/{domain}",
+                        "phase": "final",
+                        "split": split,
+                        "category": domain,
+                        "token_field": "exact_tokens",
+                        "target": target,
+                    }
+                    for (split, domain), target in sorted(target_by_key.items())
+                ],
+            },
+        )
+        selected_totals = []
+        reference_quotas = []
+        for split in ("train", "validation", "test"):
+            for domain in ("python", "other_code", "english"):
+                key = (split, domain)
+                documents = selected[key]["documents"]
+                observed = selected[key]["tokens"]
+                target = target_by_key[key]
+                selected_totals.append(
+                    {
+                        "split": split,
+                        "category": domain,
+                        "unit": "pre_packing_starcoder2_content_tokens",
+                        "documents": documents,
+                        "selected_tokens": observed,
+                        "terminal_prefix_documents": 0,
+                    }
+                )
+                reference_quotas.append(
+                    {
+                        "split": split,
+                        "category": domain,
+                        "unit": "pre_packing_starcoder2_content_tokens",
+                        "reference_target_tokens": target,
+                        "observed_tokens": observed,
+                        "shortfall_tokens": max(0, target - observed),
+                        "surplus_tokens": max(0, observed - target),
+                        "selection_authority": False,
+                    }
+                )
+
+        source_identity = dict(manifest["identity"])
+        source_identity["quota_config_sha256"] = file_sha256(fixture.quota_path)
+        source_identity["raw_archive_integrity_policy"] = (
+            "deferred-full-sha256-mandatory-before-publication"
+        )
+        source_identity["sqlite_execution"] = {
+            "mode": "local-wal-with-durable-snapshots",
+            "protocol_version": 1,
+            "active_journal_mode": "wal",
+            "canonical_journal_mode": "delete",
+            "snapshot_retention": 3,
+            "wal_autocheckpoint_pages": 32_768,
+            "locking_mode": "exclusive",
+        }
+        source_identity_sha = canonical_sha256(source_identity)
+        source_curation = {
+            "contract_version": 1,
+            "database_version": 4,
+            "identity_format_version": 6,
+            "identity_sha256": source_identity_sha,
+            "database": {
+                "path": "/fixture/snapshots/curation.sqlite3",
+                "bytes": 4096,
+                "sha256": hashlib.sha256(b"fixture-database").hexdigest(),
+            },
+            "checkpoint": {
+                "path": "/fixture/snapshots/CHECKPOINT.json",
+                "bytes": 1024,
+                "sha256": hashlib.sha256(b"fixture-checkpoint").hexdigest(),
+            },
+            "snapshot": {
+                "manifest_path": "/fixture/snapshots/manifest.json",
+                "manifest_sha256": hashlib.sha256(
+                    b"fixture-snapshot-manifest"
+                ).hexdigest(),
+                "generation": 1,
+                "identity_sha256": source_identity_sha,
+                "previous_manifest_sha256": None,
+                "validated_chain": [
+                    {
+                        "generation": 1,
+                        "manifest_sha256": hashlib.sha256(
+                            b"fixture-snapshot-manifest"
+                        ).hexdigest(),
+                    }
+                ],
+                "validation": (
+                    "LocalSQLiteStore-v1-compatible-target-and-chain"
+                ),
+            },
+            "phase": "canonicalized",
+            "read_performance": {
+                "temp_store": 2,
+                "cache_size_kib": 4_194_304,
+                "mmap_size_bytes": 0,
+                "durability_pragmas_modified": False,
+            },
+            "eligible_authority_query_plan": [
+                "SCAN d USING COVERING INDEX fixture_eligible"
+            ],
+            "archive_bitmap_query_plan": [
+                "SEARCH d USING COVERING INDEX fixture_archive"
+            ],
+            "rejection_inventory_query_plan": [
+                "SCAN r USING COVERING INDEX fixture_reasons"
+            ],
+            "rejection_reason_associations": 10,
+            "groups_subphase": {
+                "status": "complete",
+                "processed_rows": 9,
+                "processed_tokens": 0,
+                "committed_batches": 3,
+                "cursor": {"group_id": "fixture-terminal"},
+                "details": {"groups": 9},
+            },
+            "ignored_partial_exact_selection": {
+                "documents": 1,
+                "tokens": 10,
+                "quota_subphases": [
+                    {
+                        "subphase": "selection.quota.train.python",
+                        "status": "complete",
+                        "processed_rows": 1,
+                        "processed_tokens": 10,
+                        "committed_batches": 1,
+                    }
+                ],
+                "authority": False,
+            },
+        }
+        manifest["identity"] = {
+            **source_identity,
+            "format_version": 7,
+            "selection_profile": ALL_ELIGIBLE_SELECTION_PROFILE,
+            "source_curation": source_curation,
+        }
+        manifest.update(
+            selection_profile=ALL_ELIGIBLE_SELECTION_PROFILE,
+            selection_strategy=ALL_ELIGIBLE_SELECTION_STRATEGY,
+            decision_format=ALL_ELIGIBLE_BITMAP_FORMAT,
+            decision_format_version=ALL_ELIGIBLE_BITMAP_FORMAT_VERSION,
+            publication_scope="production-durable-snapshot",
+            training_input_budget_authority=(
+                "the final packed order v4 manifest; this all-eligible publication "
+                "does not enforce a training mixture or input-token cap"
+            ),
+            selected_totals=selected_totals,
+            reference_quotas=reference_quotas,
+            documents={
+                "input": sum(row["records"] for row in manifest["decision_shards"]),
+                "accepted_canonical_before_selection": sum(
+                    row["documents"] for row in selected_totals
+                ),
+                "selected": sum(row["documents"] for row in selected_totals),
+                "quota_overflow": 0,
+            },
+            reason_document_counts={
+                "quality:fixture": 4,
+                "quality:fixture-wikipedia": 6,
+            },
+        )
+        manifest["known_provenance_limitations"] = list(
+            dict.fromkeys(
+                [
+                    *manifest["known_provenance_limitations"],
+                    *ALL_ELIGIBLE_SELECTION_PROFILE["known_limitations"],
+                ]
+            )
+        )
+        manifest_path = fixture.selection / "manifest.json"
+        write_json(manifest_path, manifest)
+        (fixture.selection / "manifest.sha256").write_text(
+            f"{file_sha256(manifest_path)}  manifest.json\n", encoding="ascii"
+        )
+        return manifest
+
+    @classmethod
+    def _publish_fixture_with_production_v7(
+        cls, fixture: MaterializationFixture, work_root: Path
+    ) -> tuple[Path, dict[str, Any]]:
+        """Exercise the real publisher against a tiny v6 SQLite authority."""
+
+        source_manifest = cls._convert_fixture_to_fast_profile(fixture)
+        policy = json.loads(FAST_CANONICAL_POLICY.read_text(encoding="utf-8"))
+        policy["selection"]["seed"] = "fixture"
+        policy_path = work_root / "production-policy.json"
+        write_json(policy_path, policy)
+        fixture.policy_path = policy_path
+        fixture.policy = policy
+        quota_targets = {
+            (split, domain): 10
+            for split in ("train", "validation", "test")
+            for domain in ("python", "other_code", "english")
+        }
+        quota_path = work_root / "production-quotas.json"
+        write_json(
+            quota_path,
+            {
+                "version": 1,
+                "quotas": [
+                    {
+                        "name": f"final/{split}/{domain}",
+                        "phase": "final",
+                        "split": split,
+                        "category": domain,
+                        "token_field": "exact_tokens",
+                        "target": target,
+                    }
+                    for (split, domain), target in sorted(quota_targets.items())
+                ],
+            },
+        )
+        fixture.quota_path = quota_path
+
+        decisions_by_archive: dict[str, list[dict[str, Any]]] = {}
+        for descriptor in source_manifest["decision_shards"]:
+            decisions_by_archive[descriptor["archive"]] = list(
+                iter_jsonl_zst(fixture.selection / descriptor["path"])
+            )
+        reports_by_archive = {
+            row["archive"]: row for row in source_manifest["input_reports"]
+        }
+        for archive, decisions in decisions_by_archive.items():
+            descriptor = reports_by_archive[archive]
+            sizes = cls._raw_member_sizes(fixture.root / archive)
+            fingerprint_path = fixture.preprocess / descriptor["fingerprint_file"]
+            write_jsonl_zst(
+                fingerprint_path,
+                [
+                    {
+                        "record_version": 1,
+                        "fingerprint_version": 1,
+                        "doc_id": row["doc_id"],
+                        "archive": row["archive"],
+                        "bucket": row["bucket"],
+                        "archive_index": row["archive_index"],
+                        "manifest_index": row["manifest_index"],
+                        "member_path": row["member_path"],
+                        "size_bytes": sizes[row["member_path"]],
+                        "starcoder2_tokens": row["source_tokens"],
+                        "content_sha256": row["content_sha256"],
+                        "normalized_sha256": row["normalized_sha256"],
+                        "quality_flags": row["quality_flags"],
+                        "benchmark_reason": row["benchmark_reason"],
+                        "provenance": row["provenance"],
+                    }
+                    for row in decisions
+                ],
+            )
+            descriptor["fingerprint_sha256"] = file_sha256(fingerprint_path)
+            report_path = fixture.preprocess / descriptor["report"]
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["fingerprint_sha256"] = descriptor["fingerprint_sha256"]
+            write_json(report_path, report)
+            descriptor["report_sha256"] = file_sha256(report_path)
+
+        report_projection = [
+            {"path": row["report"], "sha256": row["report_sha256"]}
+            for row in source_manifest["input_reports"]
+        ]
+        completeness = json.loads(
+            json.dumps(source_manifest["collection_completeness"])
+        )
+        completeness["reports"]["inventory_sha256"] = canonical_sha256(
+            report_projection
+        )
+        source_identity = json.loads(json.dumps(source_manifest["identity"]))
+        source_identity.update(
+            format_version=6,
+            policy_sha256=canonical_sha256(policy),
+            quota_config_sha256=file_sha256(quota_path),
+            report_inventory_sha256=canonical_sha256(report_projection),
+            collection_completeness=completeness,
+            raw_archive_integrity_policy=(
+                "deferred-full-sha256-mandatory-before-publication"
+            ),
+            sqlite_execution={
+                "mode": "local-wal-with-durable-snapshots",
+                "protocol_version": 1,
+                "active_journal_mode": "wal",
+                "canonical_journal_mode": "delete",
+                "snapshot_retention": 3,
+                "wal_autocheckpoint_pages": 32_768,
+                "locking_mode": "exclusive",
+            },
+        )
+
+        thresholds = split_thresholds(quota_targets)
+        seed = policy["selection"]["seed"]
+
+        source_root = (
+            work_root
+            / "source-v6"
+            / "sqlite-snapshots-v1"
+            / "snapshot-000000000001"
+        )
+        source_root.mkdir(parents=True)
+        database = source_root / "curation.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE metadata(
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE archives(
+                    report_path TEXT PRIMARY KEY, report_sha256 TEXT NOT NULL,
+                    archive TEXT NOT NULL UNIQUE, bucket TEXT NOT NULL,
+                    fingerprint_file TEXT NOT NULL,
+                    fingerprint_sha256 TEXT NOT NULL,
+                    documents INTEGER NOT NULL, tokens INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE documents(
+                    doc_id BLOB PRIMARY KEY, archive TEXT NOT NULL,
+                    bucket TEXT NOT NULL, manifest_index INTEGER NOT NULL,
+                    member_path TEXT NOT NULL, tokens INTEGER NOT NULL,
+                    content_hash BLOB NOT NULL, normalized_hash BLOB NOT NULL,
+                    source_group BLOB NOT NULL, final_cluster BLOB NOT NULL,
+                    canonical_rank BLOB NOT NULL, selection_rank BLOB NOT NULL,
+                    UNIQUE(archive, manifest_index),
+                    UNIQUE(archive, member_path)
+                ) WITHOUT ROWID;
+                CREATE TABLE reasons(
+                    doc_id BLOB NOT NULL, reason TEXT NOT NULL,
+                    PRIMARY KEY(doc_id, reason)
+                ) WITHOUT ROWID;
+                CREATE INDEX reasons_reason ON reasons(reason);
+                CREATE TABLE canonical_map(
+                    doc_id BLOB PRIMARY KEY, canonical_doc_id BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE exact_choice(
+                    content_hash BLOB PRIMARY KEY, canonical_rank BLOB NOT NULL,
+                    canonical_doc_id BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE final_choice(
+                    final_cluster BLOB PRIMARY KEY, canonical_rank BLOB NOT NULL,
+                    canonical_doc_id BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE groups(
+                    group_id BLOB PRIMARY KEY, split TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE selected(
+                    doc_id BLOB PRIMARY KEY, split TEXT NOT NULL,
+                    selected_tokens INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE output_archives(
+                    archive TEXT PRIMARY KEY, decision_file TEXT NOT NULL,
+                    decision_sha256 TEXT NOT NULL, records INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE near_map(
+                    doc_id BLOB PRIMARY KEY, cluster BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE events(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event TEXT NOT NULL, payload TEXT NOT NULL
+                );
+                CREATE TABLE phase_progress(
+                    subphase TEXT PRIMARY KEY, status TEXT NOT NULL,
+                    cursor_json TEXT NOT NULL, processed_rows INTEGER NOT NULL,
+                    processed_tokens INTEGER NOT NULL,
+                    committed_batches INTEGER NOT NULL, details_json TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE durable_counts(
+                    singleton INTEGER PRIMARY KEY, archives INTEGER NOT NULL,
+                    documents INTEGER NOT NULL, selected_documents INTEGER NOT NULL,
+                    output_archives INTEGER NOT NULL
+                );
+                """
+            )
+            for key, value in {**source_identity, "database_version": 4, "phase": "canonicalized"}.items():
+                connection.execute(
+                    "INSERT INTO metadata(key,value) VALUES (?,?)",
+                    (key, json.dumps(value, sort_keys=True, separators=(",", ":"))),
+                )
+            for descriptor in source_manifest["input_reports"]:
+                report = json.loads(
+                    (fixture.preprocess / descriptor["report"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                connection.execute(
+                    "INSERT INTO archives VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        descriptor["report"],
+                        descriptor["report_sha256"],
+                        descriptor["archive"],
+                        report["bucket"],
+                        descriptor["fingerprint_file"],
+                        descriptor["fingerprint_sha256"],
+                        descriptor["documents"],
+                        descriptor["content_tokens"],
+                    ),
+                )
+            accepted: list[bytes] = []
+            groups: dict[bytes, str] = {}
+            for archive, rows in decisions_by_archive.items():
+                del archive
+                for row in rows:
+                    doc_id = bytes.fromhex(row["doc_id"])
+                    keep = row["decision"] == "keep" or (
+                        row["bucket"] == "wikipedia"
+                        and row["manifest_index"] < 6
+                    )
+                    effective_split = (
+                        row["split"] if row["split"] is not None else row["assigned_split"]
+                    )
+                    group = (
+                        cls._fixture_source_group(
+                            row["bucket"], row["provenance"], row["doc_id"]
+                        )
+                        if keep
+                        else bytes.fromhex(row["split_group_id"])
+                    )
+                    if keep and assign_group_split(
+                        seed, group, thresholds
+                    ) != effective_split:
+                        raise AssertionError("fixture provenance split authority drifted")
+                    final_cluster = bytes.fromhex(row["normalized_sha256"])
+                    rank = b"\0" * 8 + doc_id
+                    connection.execute(
+                        "INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            doc_id,
+                            row["archive"],
+                            row["bucket"],
+                            row["manifest_index"],
+                            row["member_path"],
+                            row["source_tokens"],
+                            bytes.fromhex(row["content_sha256"]),
+                            bytes.fromhex(row["normalized_sha256"]),
+                            group,
+                            final_cluster,
+                            rank,
+                            rank,
+                        ),
+                    )
+                    if keep:
+                        accepted.append(doc_id)
+                        groups[group] = effective_split
+                        connection.execute(
+                            "INSERT INTO canonical_map VALUES (?,?)", (doc_id, doc_id)
+                        )
+                        connection.execute(
+                            "INSERT INTO exact_choice VALUES (?,?,?)",
+                            (bytes.fromhex(row["content_sha256"]), rank, doc_id),
+                        )
+                        connection.execute(
+                            "INSERT INTO final_choice VALUES (?,?,?)",
+                            (final_cluster, rank, doc_id),
+                        )
+                    else:
+                        for reason in row["reasons"]:
+                            connection.execute(
+                                "INSERT INTO reasons VALUES (?,?)", (doc_id, reason)
+                            )
+            for group, split in groups.items():
+                connection.execute("INSERT INTO groups VALUES (?,?)", (group, split))
+            connection.execute(
+                "INSERT INTO selected VALUES (?,?,?)", (accepted[0], "train", 3)
+            )
+            connection.execute(
+                "INSERT INTO phase_progress VALUES (?,?,?,?,?,?,?)",
+                (
+                    "selection.groups",
+                    "complete",
+                    json.dumps({"group_id": "terminal"}),
+                    len(groups),
+                    0,
+                    1,
+                    json.dumps(
+                        {
+                            "groups": len(groups),
+                            "mismatched_assignments": 0,
+                            "seed": seed,
+                        }
+                    ),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO events(event,payload) VALUES (?,?)",
+                (
+                    "canonicalized",
+                    json.dumps(
+                        {
+                            "accepted_canonical_documents": len(accepted),
+                            "exact_choices": len(accepted),
+                            "final_choices": len(accepted),
+                            "canonical_map_rows": len(accepted),
+                        }
+                    ),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO phase_progress VALUES (?,?,?,?,?,?,?)",
+                (
+                    "selection.quota.train.python",
+                    "complete",
+                    "{}",
+                    1,
+                    3,
+                    1,
+                    "{}",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO durable_counts VALUES (1,?,?,?,0)",
+                (len(decisions_by_archive), sum(map(len, decisions_by_archive.values())), 1),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        checkpoint = source_root / "CHECKPOINT.json"
+        write_json(
+            checkpoint,
+            {
+                "checkpoint_version": 2,
+                "database_version": 4,
+                "phase": "canonicalized",
+                "identity": source_identity,
+                "counts": {
+                    "archives": len(decisions_by_archive),
+                    "documents": sum(map(len, decisions_by_archive.values())),
+                    "selected_documents": 1,
+                    "output_archives": 0,
+                },
+            },
+        )
+        source_identity_sha = canonical_sha256(source_identity)
+        snapshot_manifest = source_root / "manifest.json"
+        state_connection = sqlite3.connect(database)
+        try:
+            database_state = _database_state(state_connection)
+            canonical_journal_mode = str(
+                state_connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).casefold()
+        finally:
+            state_connection.close()
+        write_json(
+            snapshot_manifest,
+            {
+                "format": "curation-local-sqlite-snapshot",
+                "format_version": 1,
+                "status": "complete",
+                "generation": 1,
+                "created_utc": "2026-01-01T00:00:00+00:00",
+                "reason": "materializer-publisher-contract-fixture",
+                "identity": source_identity,
+                "identity_sha256": source_identity_sha,
+                "previous_manifest_sha256": None,
+                "canonical_journal_mode": canonical_journal_mode,
+                "database": {
+                    "path": str(database.resolve()),
+                    "bytes": database.stat().st_size,
+                    "sha256": file_sha256(database),
+                },
+                "database_state": database_state,
+                "authority_artifacts": {
+                    "CHECKPOINT.json": {
+                        "path": str(checkpoint.resolve()),
+                        "bytes": checkpoint.stat().st_size,
+                        "sha256": file_sha256(checkpoint),
+                    }
+                },
+                "runtime_provenance": {"fixture": True},
+                "admission_sha256": hashlib.sha256(
+                    b"fixture-admission"
+                ).hexdigest(),
+                "durable_capacity_preflight": {"fixture": True},
+                "snapshot_retention": 3,
+                "prepare_evidence": {"fixture": True},
+            },
+        )
+        (source_root / "manifest.json.sha256").write_text(
+            f"{file_sha256(snapshot_manifest)}  manifest.json\n", encoding="ascii"
+        )
+        publication = work_root / "selection-v7"
+        with AllEligiblePublisher(
+            root=fixture.root,
+            staging_root=fixture.preprocess,
+            source_db=database,
+            source_checkpoint=checkpoint,
+            source_snapshot_manifest=snapshot_manifest,
+            output=publication,
+            policy_path=fixture.policy_path,
+            quota_path=fixture.quota_path,
+            benchmark_denylist_path=fixture.denylist_path,
+        ) as publisher:
+            result = publisher.run()
+        return publication, result["manifest"]
 
     def test_end_to_end_preserves_prefix_boundaries_splits_and_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1289,6 +2136,249 @@ class MaterializeTrainingCorpusTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(MaterializationError, error):
                     fixture.materializer(Path(temporary) / "output")
+
+    def test_all_eligible_v7_materializes_full_documents_and_order_v4_mixture(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = MaterializationFixture(Path(temporary) / "source")
+            source_manifest = self._convert_fixture_to_all_eligible_profile(fixture)
+            output = Path(temporary) / "materialized"
+            result = fixture.materializer(output).run()
+            self.assertTrue(result["complete"])
+            self.assertEqual(
+                result["manifest"]["split_isolation"][
+                    "authoritative_assignment"
+                ],
+                "frozen_leakage_safe_source_groups",
+            )
+            self.assertNotIn("quotas", source_manifest)
+            source = json.loads(
+                (output / "provenance/source.json").read_text(encoding="utf-8")
+            )
+            policy = json.loads(
+                (output / "provenance/policy.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(source["publication_scope"], "production-durable-snapshot")
+            self.assertEqual(
+                source["source_curation"]["snapshot"]["identity_sha256"],
+                source["source_curation"]["identity_sha256"],
+            )
+            self.assertEqual(
+                source["curation_sqlite_execution"]["mode"],
+                "local-wal-with-durable-snapshots",
+            )
+            self.assertEqual(
+                policy["selection_profile"], ALL_ELIGIBLE_SELECTION_PROFILE
+            )
+            self.assertEqual(
+                policy["selection_strategy"], ALL_ELIGIBLE_SELECTION_STRATEGY
+            )
+            for split in ("train", "validation", "test"):
+                order = validate_training_order(
+                    output / "orders" / split / "manifest.json"
+                )
+                self.assertEqual(
+                    order["rows_per_domain"],
+                    {"python": 2, "other_code": 2, "english": 1},
+                )
+                self.assertEqual(
+                    order["expected_input_token_weights"],
+                    {"python": 0.4, "other_code": 0.4, "english": 0.2},
+                )
+                for domain in ("python", "other_code", "english"):
+                    packed = validate_packed_manifest(
+                        output / "packed" / split / domain / "manifest.json"
+                    )
+                    self.assertEqual(packed["documents"], 2)
+                    self.assertEqual(packed["source_content_tokens"], 11)
+
+    def test_production_publisher_v7_output_materializes_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = MaterializationFixture(root / "source")
+            publication, published = self._publish_fixture_with_production_v7(
+                fixture, root / "publisher-work"
+            )
+            self.assertTrue(published["production_ready"])
+            self.assertEqual(
+                published["publication_scope"], "production-durable-snapshot"
+            )
+            self.assertNotIn("quotas", published)
+            fixture.selection = publication
+            output = root / "materialized"
+            result = fixture.materializer(output).run()
+            self.assertTrue(result["complete"])
+            for split in ("train", "validation", "test"):
+                order = validate_training_order(
+                    output / "orders" / split / "manifest.json"
+                )
+                self.assertEqual(
+                    order["rows_per_domain"],
+                    {"python": 2, "other_code": 2, "english": 1},
+                )
+            provenance = json.loads(
+                (output / "provenance/policy.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                provenance["selected_totals"], published["selected_totals"]
+            )
+
+    def test_all_eligible_v7_manifest_contract_fails_closed(self) -> None:
+        cases = (
+            (
+                "test-only-scope",
+                lambda manifest: manifest.__setitem__(
+                    "publication_scope", "test-only-unbound-source"
+                ),
+                "publication authority contract mismatch",
+            ),
+            (
+                "missing-snapshot",
+                lambda manifest: manifest["identity"]["source_curation"].__setitem__(
+                    "snapshot", None
+                ),
+                "source_curation.snapshot schema mismatch",
+            ),
+            (
+                "raw-integrity-drift",
+                lambda manifest: manifest["identity"].__setitem__(
+                    "raw_archive_integrity_policy", "trust-reports-only"
+                ),
+                "raw-archive integrity policy",
+            ),
+            (
+                "sqlite-execution-drift",
+                lambda manifest: manifest["identity"]["sqlite_execution"].__setitem__(
+                    "active_journal_mode", "delete"
+                ),
+                "SQLite execution contract mismatch",
+            ),
+            (
+                "missing-sqlite-execution",
+                lambda manifest: manifest["identity"].pop("sqlite_execution"),
+                "selection.identity schema mismatch",
+            ),
+            (
+                "read-performance-drift",
+                lambda manifest: manifest["identity"]["source_curation"][
+                    "read_performance"
+                ].__setitem__("durability_pragmas_modified", True),
+                "source read-performance contract is unsupported",
+            ),
+            (
+                "empty-query-plan",
+                lambda manifest: manifest["identity"]["source_curation"].__setitem__(
+                    "archive_bitmap_query_plan", []
+                ),
+                "archive_bitmap_query_plan evidence is malformed",
+            ),
+            (
+                "rejection-association-drift",
+                lambda manifest: manifest["identity"]["source_curation"].__setitem__(
+                    "rejection_reason_associations", 9
+                ),
+                "rejection reason association accounting differs",
+            ),
+            (
+                "authoritative-quotas",
+                lambda manifest: manifest.__setitem__("quotas", []),
+                "must not carry an authoritative quota summary",
+            ),
+            (
+                "profile-drift",
+                lambda manifest: manifest["selection_profile"].__setitem__(
+                    "document_action", "keep_prefix"
+                ),
+                "Unsupported all-eligible selection profile",
+            ),
+        )
+        for label, mutate, error in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                fixture = MaterializationFixture(Path(temporary) / "source")
+                self._convert_fixture_to_all_eligible_profile(fixture)
+                manifest_path = fixture.selection / "manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                mutate(manifest)
+                write_json(manifest_path, manifest)
+                (fixture.selection / "manifest.sha256").write_text(
+                    f"{file_sha256(manifest_path)}  manifest.json\n",
+                    encoding="ascii",
+                )
+                with self.assertRaisesRegex(MaterializationError, error):
+                    fixture.materializer(Path(temporary) / "output")
+
+    def test_all_eligible_v7_rejects_bitmap_corruption(self) -> None:
+        cases = (
+            (
+                "magic",
+                lambda raw: raw.__setitem__(0, raw[0] ^ 1),
+                "bitmap magic mismatch",
+            ),
+            (
+                "padding",
+                lambda raw: raw.__setitem__(-1, raw[-1] | 0x80),
+                "bitmap header/payload",
+            ),
+            (
+                "kept-count",
+                lambda raw: raw.__setitem__(-1, raw[-1] ^ 1),
+                "kept-document count mismatch",
+            ),
+        )
+        for label, mutate, error in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                fixture = MaterializationFixture(Path(temporary) / "source")
+                manifest = self._convert_fixture_to_all_eligible_profile(fixture)
+                descriptor = next(
+                    row
+                    for row in manifest["decision_shards"]
+                    if "/python/" in row["archive"]
+                )
+                decision_path = fixture.selection / descriptor["path"]
+                raw = bytearray(decision_path.read_bytes())
+                mutate(raw)
+                decision_path.write_bytes(raw)
+                descriptor["sha256"] = file_sha256(decision_path)
+                manifest["decision_inventory_sha256"] = canonical_sha256(
+                    manifest["decision_shards"]
+                )
+                manifest_path = fixture.selection / "manifest.json"
+                write_json(manifest_path, manifest)
+                (fixture.selection / "manifest.sha256").write_text(
+                    f"{file_sha256(manifest_path)}  manifest.json\n",
+                    encoding="ascii",
+                )
+                with self.assertRaisesRegex(MaterializationError, error):
+                    fixture.materializer(Path(temporary) / "output").run()
+
+    def test_all_eligible_v7_reconciles_manifest_totals_to_decisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = MaterializationFixture(Path(temporary) / "source")
+            manifest = self._convert_fixture_to_all_eligible_profile(fixture)
+            total = manifest["selected_totals"][0]
+            total["selected_tokens"] -= 1
+            reference = manifest["reference_quotas"][0]
+            reference["observed_tokens"] = total["selected_tokens"]
+            reference["shortfall_tokens"] = max(
+                0,
+                reference["reference_target_tokens"]
+                - reference["observed_tokens"],
+            )
+            reference["surplus_tokens"] = max(
+                0,
+                reference["observed_tokens"]
+                - reference["reference_target_tokens"],
+            )
+            manifest_path = fixture.selection / "manifest.json"
+            write_json(manifest_path, manifest)
+            (fixture.selection / "manifest.sha256").write_text(
+                f"{file_sha256(manifest_path)}  manifest.json\n", encoding="ascii"
+            )
+            with self.assertRaisesRegex(
+                MaterializationError, "Materialized all-eligible total mismatch"
+            ):
+                fixture.materializer(Path(temporary) / "output").run()
 
     def test_packing_can_finish_before_gpu_geometry_and_finalize_later(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
