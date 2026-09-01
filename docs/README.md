@@ -19,6 +19,7 @@ the production runbook for ordered execution.
 - [Local-WAL curation acceleration](data/curation-acceleration.md)
 - [Streaming raw audit](data/streaming-preprocess.md)
 - [Curation-independent raw token cache](data/raw-token-cache.md)
+- [Raw-token-cache materializer integration](data/raw-token-cache-materializer-integration.md)
 - [FineWeb-Edu acquisition](data/english-pipeline.md)
 - [Wikipedia acquisition](data/wikipedia-pipeline.md)
 - [Optional English near-deduplication](data/english-near-dedup.md)
