@@ -200,6 +200,23 @@ class FastCurationLauncherTest(unittest.TestCase):
             self.assertFalse(config.authority_path.exists())
             self.assertFalse(config.output.exists())
 
+    def test_child_command_preserves_virtualenv_interpreter_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            _fixture, config = self.fixture(base)
+            base_python = base / "python3.11"
+            base_python.write_bytes(b"fixture interpreter")
+            base_python.chmod(0o755)
+            venv_python = base / "venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.symlink_to(base_python)
+
+            with mock.patch.object(launcher.sys, "executable", str(venv_python)):
+                argv = launcher._child_argv(config)
+
+            self.assertEqual(argv[0], str(venv_python.absolute()))
+            self.assertNotEqual(argv[0], str(base_python.resolve()))
+
     def test_incomplete_collection_fails_before_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture, config = self.fixture(Path(temporary))

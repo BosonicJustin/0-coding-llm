@@ -335,9 +335,26 @@ def _atomic_new(path: Path, payload: bytes) -> None:
     _fsync_directory(path.parent)
 
 
+def _python_launch_path() -> Path:
+    """Return the invoked interpreter path without collapsing a venv symlink.
+
+    Resolving ``sys.executable`` changes ``/path/to/venv/bin/python`` into the
+    base interpreter on symlink-based virtual environments.  Launching that
+    resolved path drops the virtual environment's site-packages even though
+    the launcher itself was started inside the venv.
+    """
+
+    path = Path(os.path.abspath(sys.executable))
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise FastCurationLaunchError(
+            f"Current Python interpreter is missing or not executable: {path}"
+        )
+    return path
+
+
 def _child_argv(config: LaunchConfig) -> list[str]:
     return [
-        str(Path(sys.executable).resolve(strict=True)),
+        str(_python_launch_path()),
         "-u",
         str((SCRIPTS_ROOT / "curate_corpus.py").resolve(strict=True)),
         "--root",
@@ -477,7 +494,10 @@ def _authority_identity(
         },
         "storage_contract": builder.storage_contract,
         "implementation": {
-            "python_executable": str(Path(sys.executable).resolve(strict=True)),
+            "python_executable": str(_python_launch_path()),
+            "python_executable_resolved": str(
+                _python_launch_path().resolve(strict=True)
+            ),
             "python_version": platform.python_version(),
             "launcher_sha256": file_sha256(Path(__file__).resolve(strict=True)),
             "curator_sha256": file_sha256(
