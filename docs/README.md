@@ -16,6 +16,7 @@ the production runbook for ordered execution.
 ## Data pipeline
 
 - [End-to-end data pipeline](data/data-pipeline.md)
+- [Data formats from Parquet to PyTorch batches](data/data-format-walkthrough.md)
 - [Current fast corpus generation v2](data/fast-generation-v2.md)
 - [Fast all-eligible curation runbook](data/fast-all-eligible-curation.md)
 - [Stack and English curation contract](data/curation.md)

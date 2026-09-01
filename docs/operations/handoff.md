@@ -10,7 +10,7 @@ and measurements remain in [experiment-log.md](../experiment/experiment-log.md).
 | Purpose | Server root | State |
 |---|---|---|
 | Frozen pre-training generation v1 | `/workspace/dataset` | Read-only; do not resume or mutate jobs here |
-| Pre-training top-up generation v2 | `/workspace/dataset-other-code-topup-v2` | Collector and incremental preprocessor active |
+| Pre-training top-up generation v2 | `/workspace/dataset-other-code-topup-v2` | Collection/preprocessing closed; curation and raw-token caching active |
 | SFT/RL source and derived artifacts | `/workspace/posttraining-data` | Quarantined from pre-training |
 
 The selective v2 clone hard-links immutable v1 raw archives, tokenizer files,
@@ -20,31 +20,35 @@ temporary files, telemetry SQLite, curation, and packed outputs are excluded.
 Never edit a hard-linked existing file in place; append new immutable files or
 atomically replace only the independently copied v2 control files.
 
-## Last verified server state — 2026-09-01 06:40:36 UTC
+## Last verified server state — 2026-09-01 11:32:23 UTC
 
-- The v2 clone completed successfully at 06:30:51 UTC and atomically published
-  its final root. Manifest SHA-256 is
-  `815c6256f0354f1b6a6cc524d96e745331c68afd02f3e72b19bb2d66ed2b3de9`;
-  it records 21,181 hard links / 72,337,391,686 bytes and five copied controls.
-- The other-code collector was relaunched at 06:36:50 UTC in tmux
-  `stack-v3-topup-v2` using `/opt/coding-model-data-venv`. All eight workers are
-  active. Committed other-code tokens advanced from 25,952,231,562 to
-  26,066,335,409 while Python remained exactly 25,770,142,666. The 06:32 attempt
-  failed on missing dependencies before touching data.
-- The dedicated environment's 20 focused collector/clone tests passed. Its
-  freeze is
-  `/workspace/dataset-other-code-topup-v2/logs/data-environment.freeze.txt`,
-  SHA-256
-  `c84c69f333754bfbd97b3ec851ec132916466a06424043349ae273429ef81bfb`.
-- Incremental archive audit/fingerprinting is active at low priority in tmux
-  `preprocess-topup-v2-live`. The first new report, for other-code archive 550,
-  covers 27,966 documents / 28,085,641 tokens with zero benchmark hits.
-- No curator is active. The stopped first-generation local database remains at
-  `/local/curation/selection-fast-local-v2/curation.sqlite3`, with its WAL and
-  SHM sidecars retained. Its canonical rows and leakage-safe groups are useful
-  as audited evidence, but partial exact-quota selection is not a corpus
-  authority. A manifestless/incomplete NFS snapshot is not authority.
-- No token-ID materialization is active or complete.
+- Collection and streaming preprocessing are complete. The closed v2 corpus
+  contains 4,568 raw archives, 56,502,609 documents, and 73,992,914,797 exact
+  raw tokens. All 4,568 reports and fingerprints are present with zero archive
+  error records.
+- Exact raw totals are 25,770,142,666 Python tokens, 35,363,570,483 other-code
+  tokens, 10,287,360,535 FineWeb-Edu tokens, and 2,571,841,113 Wikipedia
+  tokens.
+- Curation is active in tmux `all-eligible-curation-v2`. The complete
+  56,502,609-document inventory and four bulk indexes finished at 11:18 UTC.
+  The process remains CPU-active with a fresh checkpoint at phase
+  `inventory_complete`; terminal canonicalization and the immutable final
+  snapshot have not yet been published.
+- The curation authority uses local WAL state at
+  `/local/curation/all-eligible-source-v2` and durable output under
+  `/workspace/dataset-other-code-topup-v2/curated/all-eligible-source-v2`.
+  Do not copy, replace, or resume it with changed code or flags.
+- Raw token caching is active in tmux `raw-token-cache-v2-16w` with 16 workers.
+  It had authenticated 3,866 archive caches containing 68,955,111,064 tokens,
+  or 93.19% of the closed raw-token total. Completed archive caches are
+  immutable and resumable; in-flight staging is non-authoritative.
+- The latest capacity check showed 205 GB free on local disk and 616 GB free on
+  the network volume. Cgroup counters showed zero OOM and zero OOM-kill events.
+- The server checkout remains at the source identity frozen by the running
+  curator. Do not pull the newer local/GitHub `main` while curation is active.
+  Sync only after the final curation result and snapshot authenticate.
+- No selection-v7 publication, closed-world cache inventory, packed corpus, or
+  production order has started for v2.
 - Raw OpenCodeInstruct remains under `/workspace/posttraining-data`; it does not
   enter either pre-training generation.
 
@@ -95,23 +99,22 @@ The exact nine-cell split/domain table is in
 
 ## Immediate operation
 
-Only monitor the active collector until checkpoint recovery produces stable
-forward progress and confirms Python is skipped. Do not start a second
-collector or preprocessing concurrently:
+Monitor the two existing jobs without starting duplicates or changing their
+source identities:
 
 ```bash
-tmux has-session -t stack-v3-topup-v2
-pgrep -af 'collect_stack_v3_parallel.py|collect_stack_v3.py'
-tail -n 50 /workspace/dataset-other-code-topup-v2/logs/collector-topup-v2.log
-/opt/coding-model-data-venv/bin/python \
-  /workspace/0-coding-llm/scripts/quota_tracker.py \
-  --root /workspace/dataset-other-code-topup-v2 \
-  --config /workspace/0-coding-llm/configs/data_quotas_other_code_topup_v2.json \
-  status --phase collection --json
-df -h /workspace
+tmux has-session -t all-eligible-curation-v2
+tmux has-session -t raw-token-cache-v2-16w
+pgrep -af 'curate_corpus.py|cache_raw_tokens.py'
+cat /local/curation/all-eligible-source-v2/CHECKPOINT.json
+df -h /local /workspace
+cat /sys/fs/cgroup/memory.events
 ```
 
-The completed clone remains independently verifiable:
+Do not infer cache completion from aggregate token totals alone. Completion
+requires exact per-archive source/report/fingerprint/tokenizer authentication,
+no in-flight staging directories, and an unlocked builder lock. The completed
+clone remains independently verifiable:
 
 ```bash
 DATA_V2=/workspace/dataset-other-code-topup-v2
@@ -130,25 +133,34 @@ jq -e '.complete == true and
 
 ## Remaining sequence
 
-These are separate, ordered launches; none is automatic:
+Advance one authenticated boundary at a time:
 
-1. First qualify the already-running `stack-v3-topup-v2`: verify Python is
-   skipped and only other-code totals/files advance, then let it reach 35B.
-2. After the v2 collection completion marker is atomically republished, run
-   `preprocess-topup-v2`. Require exact closed-collection coverage and zero
-   errors.
-3. Run a new full curation generation through canonicalization and leakage-safe
-   groups. Freeze and authenticate its durable snapshot.
-4. Publish all eligible canonical documents with the qualified v7 keep-bitmap
-   publisher.
-5. Run the v7-aware materializer, certify decoded samples and attention
-   boundaries, then build packed order v4 after the six-GPU geometry smoke.
-6. Only after packed/order certification run CUDA/FlexAttention, BF16,
-   single-GPU overfit, six-rank NCCL, throughput, and exact-resume gates.
+1. Let curation finish canonicalization, leakage-safe grouping, integrity
+   checks, and its one immutable final SQLite snapshot. Verify the guarded
+   launcher result and snapshot sidecar before using it.
+2. Let raw token caching reach exact closed-world completion. Do not stop it
+   merely because aggregate token counts appear close to the target.
+3. After curation has exited, sync the server to the reviewed clean Git commit.
+   Publish selection-v7 from the exact final snapshot.
+4. Run the nine-cell packed-supply gate before any large packing write. The
+   historical Python validation supply is 133 rows below the nominal 0.5B
+   target, so freeze the largest feasible balanced held-out cap if the v2 gate
+   confirms that shortfall. Do not change split seed or curation quota config.
+5. After token caching exits and its lock is free, publish the authenticated
+   closed-world cache inventory.
+6. Materialize all nine packed streams with the raw-cache adapter and stop after
+   packing. Validate packed shards and document indexes; a journal alone is not
+   completion evidence.
+7. On the final six-GPU pod, qualify hardware and run the measured geometry
+   grid. Finalize deterministic orders only from the accepted measured geometry.
+8. Copy to GPU-local NVMe when used for training, requalify the copied corpus,
+   run full data/attention/overfit/soak/resume gates, build run authority, and
+   only then launch the multi-day pre-training run.
 
-The production publisher/materializer v7 work is still being qualified. Do not
-start curation publication or tokenization based only on a source checkout that
-contains draft code.
+The selection publisher, supply gate, cache-backed materializer, final corpus
+qualifier, six-GPU pod qualifier, and geometry evidence producer are implemented
+and tested locally. The post-curation orchestrator and unified progress reporter
+remain under adversarial review and must not be deployed until committed.
 
 ## Six-GPU training boundary
 
