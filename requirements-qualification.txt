@@ -1,0 +1,7 @@
+# Lightweight non-PyTorch dependencies for the CPU corpus-qualification venv.
+# Install a CPU-only torch>=2.6 wheel separately as documented in
+# docs/operations/training-corpus-qualification.md. Keeping torch out of this
+# file prevents pip from silently selecting a CUDA runtime on the CPU pod.
+numpy>=2.0,<3
+tokenizers>=0.21,<0.24
+zstandard>=0.23,<1

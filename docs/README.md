@@ -9,6 +9,7 @@ the production runbook for ordered execution.
 - [Current handoff](operations/handoff.md)
 - [Pre-training readiness checklist](operations/pretraining-checklist.md)
 - [Production runbook](operations/production-runbook.md)
+- [Final training-corpus qualification](operations/training-corpus-qualification.md)
 
 ## Data pipeline
 
