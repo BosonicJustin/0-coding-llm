@@ -627,12 +627,18 @@ class FixedBatchStream(Iterable[Mapping[str, torch.Tensor]]):
 
 
 def tiny_model_config(*, vocab_size: int, max_seq_len: int) -> ModelConfig:
-    """Architecture-compatible CPU/debug configuration."""
+    """Architecture-compatible CPU/CUDA debug configuration.
+
+    FlexAttention's compiled CUDA kernels require query/key and value head
+    dimensions of at least 16.  Keeping the diagnostic model at that minimum
+    lets the advertised tiny ``torch.compile`` gate exercise the production
+    backend instead of failing during kernel lowering.
+    """
 
     return ModelConfig(
         vocab_size=vocab_size,
-        dim=32,
-        hidden_dim=88,
+        dim=64,
+        hidden_dim=176,
         n_layers=2,
         n_heads=4,
         n_kv_heads=2,
@@ -1079,6 +1085,43 @@ def _move_batch_to_device(
     return moved, counted_loss_tokens
 
 
+def _accumulate_domain_metrics(
+    *,
+    domain_ids: torch.Tensor,
+    row_loss_sums: torch.Tensor,
+    row_loss_tokens: torch.Tensor,
+    row_input_tokens: torch.Tensor,
+    loss_sums: torch.Tensor,
+    loss_tokens: torch.Tensor,
+    input_tokens: torch.Tensor,
+    rows: torch.Tensor,
+) -> None:
+    """Accumulate the three domain counters deterministically on CPU or CUDA.
+
+    CUDA ``torch.bincount`` has no deterministic implementation. The domain
+    cardinality is fixed at three, so explicit masked reductions are cheap and
+    keep deterministic training and exact resume enabled.
+    """
+
+    expected_rows = domain_ids.numel()
+    if domain_ids.ndim != 1 or any(
+        value.ndim != 1 or value.numel() != expected_rows
+        for value in (row_loss_sums, row_loss_tokens, row_input_tokens)
+    ):
+        raise ValueError("Per-domain metric inputs must be aligned rank-one tensors")
+    destinations = (loss_sums, loss_tokens, input_tokens, rows)
+    if any(value.shape != (len(DOMAIN_ORDER),) for value in destinations):
+        raise ValueError("Per-domain metric destinations have the wrong shape")
+
+    detached_loss_sums = row_loss_sums.detach().to(dtype=torch.float64)
+    for domain_id in range(len(DOMAIN_ORDER)):
+        selected = domain_ids == domain_id
+        loss_sums[domain_id].add_(detached_loss_sums[selected].sum())
+        loss_tokens[domain_id].add_(row_loss_tokens[selected].sum())
+        input_tokens[domain_id].add_(row_input_tokens[selected].sum())
+        rows[domain_id].add_(selected.sum(dtype=torch.int64))
+
+
 class ValidationRunner:
     """Repeatable, distributed held-out evaluation over an immutable order."""
 
@@ -1208,25 +1251,16 @@ class ValidationRunner:
                         row_loss_tokens,
                         batch["input_ids"].shape[1],
                     )
-                    local_domain_loss_sums += torch.bincount(
-                        domain_ids,
-                        weights=output.loss_sums_per_row.detach().double(),
-                        minlength=len(DOMAIN_ORDER),
+                    _accumulate_domain_metrics(
+                        domain_ids=domain_ids,
+                        row_loss_sums=output.loss_sums_per_row,
+                        row_loss_tokens=row_loss_tokens,
+                        row_input_tokens=row_input_tokens,
+                        loss_sums=local_domain_loss_sums,
+                        loss_tokens=local_domain_loss_tokens,
+                        input_tokens=local_domain_input_tokens,
+                        rows=local_domain_rows,
                     )
-                    local_domain_loss_tokens += torch.bincount(
-                        domain_ids,
-                        weights=row_loss_tokens,
-                        minlength=len(DOMAIN_ORDER),
-                    ).to(torch.int64)
-                    local_domain_input_tokens += torch.bincount(
-                        domain_ids,
-                        weights=row_input_tokens,
-                        minlength=len(DOMAIN_ORDER),
-                    ).to(torch.int64)
-                    local_domain_rows += torch.bincount(
-                        domain_ids,
-                        minlength=len(DOMAIN_ORDER),
-                    ).to(torch.int64)
                     local_loss_sum += output.loss_sum.detach().double()
                     local_model_loss_tokens += output.num_loss_tokens.detach()
                     local_loss_tokens += token_count
@@ -2210,25 +2244,16 @@ class Trainer:
                             row_loss_tokens,
                             batch["input_ids"].shape[1],
                         )
-                        local_domain_loss_sums += torch.bincount(
-                            domain_ids,
-                            weights=output.loss_sums_per_row.detach().double(),
-                            minlength=len(DOMAIN_ORDER),
+                        _accumulate_domain_metrics(
+                            domain_ids=domain_ids,
+                            row_loss_sums=output.loss_sums_per_row,
+                            row_loss_tokens=row_loss_tokens,
+                            row_input_tokens=row_input_tokens,
+                            loss_sums=local_domain_loss_sums,
+                            loss_tokens=local_domain_loss_tokens,
+                            input_tokens=local_domain_input_tokens,
+                            rows=local_domain_rows,
                         )
-                        local_domain_loss_tokens += torch.bincount(
-                            domain_ids,
-                            weights=row_loss_tokens,
-                            minlength=len(DOMAIN_ORDER),
-                        ).to(torch.int64)
-                        local_domain_input_tokens += torch.bincount(
-                            domain_ids,
-                            weights=row_input_tokens,
-                            minlength=len(DOMAIN_ORDER),
-                        ).to(torch.int64)
-                        local_domain_rows += torch.bincount(
-                            domain_ids,
-                            minlength=len(DOMAIN_ORDER),
-                        ).to(torch.int64)
             except StopIteration as exc:
                 self.optimizer.zero_grad(set_to_none=True)
                 raise RuntimeError(

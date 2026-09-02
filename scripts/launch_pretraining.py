@@ -1144,8 +1144,8 @@ def inspect_model_memory(
         # training entry point into the fail-fast launcher.
         model_config = ModelConfig(
             vocab_size=vocab_size,
-            dim=32,
-            hidden_dim=88,
+            dim=64,
+            hidden_dim=176,
             n_layers=2,
             n_heads=4,
             n_kv_heads=2,

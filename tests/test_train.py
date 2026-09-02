@@ -28,6 +28,7 @@ from pretrain.train import (
     Trainer as ProductionTrainer,
     ValidationRunner,
     WandbLogger,
+    _accumulate_domain_metrics,
     _atomic_torch_save,
     _bind_wandb_run_id,
     _finalize_training_run,
@@ -159,6 +160,51 @@ class TrainingHarnessTest(unittest.TestCase):
     def setUp(self) -> None:
         seed_everything(123, deterministic=True)
         self.model_config = tiny_model_config(vocab_size=64, max_seq_len=8)
+
+    def test_tiny_model_uses_compile_compatible_attention_heads(self) -> None:
+        self.assertGreaterEqual(self.model_config.head_dim, 16)
+        self.assertEqual(self.model_config.dim, 64)
+        self.assertEqual(self.model_config.hidden_dim, 176)
+
+    def test_domain_metric_accumulation_matches_expected_totals(self) -> None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        domain_ids = torch.tensor([0, 2, 1, 0], device=device)
+        row_loss_sums = torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)
+        row_loss_tokens = torch.tensor([2, 3, 4, 5], device=device)
+        row_input_tokens = torch.tensor([8, 8, 8, 8], device=device)
+        loss_sums = torch.zeros(3, dtype=torch.float64, device=device)
+        loss_tokens = torch.zeros(3, dtype=torch.int64, device=device)
+        input_tokens = torch.zeros(3, dtype=torch.int64, device=device)
+        rows = torch.zeros(3, dtype=torch.int64, device=device)
+
+        deterministic_before = torch.are_deterministic_algorithms_enabled()
+        try:
+            torch.use_deterministic_algorithms(True)
+            _accumulate_domain_metrics(
+                domain_ids=domain_ids,
+                row_loss_sums=row_loss_sums,
+                row_loss_tokens=row_loss_tokens,
+                row_input_tokens=row_input_tokens,
+                loss_sums=loss_sums,
+                loss_tokens=loss_tokens,
+                input_tokens=input_tokens,
+                rows=rows,
+            )
+        finally:
+            torch.use_deterministic_algorithms(deterministic_before)
+
+        torch.testing.assert_close(
+            loss_sums.cpu(), torch.tensor([5.0, 3.0, 2.0], dtype=torch.float64)
+        )
+        torch.testing.assert_close(
+            loss_tokens.cpu(), torch.tensor([7, 4, 3], dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            input_tokens.cpu(), torch.tensor([16, 8, 8], dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            rows.cpu(), torch.tensor([2, 1, 1], dtype=torch.int64)
+        )
 
     def test_deterministic_cuda_requires_pinned_cublas_workspace(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):
@@ -550,8 +596,10 @@ class TrainingHarnessTest(unittest.TestCase):
             strict=True,
         ):
             # Separate backward calls change floating-point summation order,
-            # but must produce the same token-weighted optimizer update.
-            torch.testing.assert_close(left, right, rtol=1e-4, atol=1e-6)
+            # but must produce the same token-weighted optimizer update.  The
+            # compile-compatible debug model has wider reduction dimensions,
+            # so allow a few float32 ULPs without weakening the semantic gate.
+            torch.testing.assert_close(left, right, rtol=1e-4, atol=5e-5)
 
     def test_checkpoint_resume_is_exact_and_restores_rng(self) -> None:
         batch = make_batch(masked_targets=2)
