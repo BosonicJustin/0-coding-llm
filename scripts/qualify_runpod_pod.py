@@ -81,6 +81,7 @@ _GPU_UUID = re.compile(
     r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))\Z",
     re.IGNORECASE,
 )
+_TOPOLOGY_SGR = re.compile(r"\x1b\[[0-9]{1,3}(?:;[0-9]{1,3})*m")
 _SAFE_TOPOLOGY_CODES = frozenset(
     {"X", "PIX", "PXB", "PHB", "NODE", "SYS", "N/A"}
 )
@@ -508,10 +509,25 @@ def _resolve_visible_inventory(
 def _parse_topology(
     text: str, *, physical_indices: Sequence[int]
 ) -> dict[str, Any]:
+    # Some nvidia-smi releases underline the header even when stdout is piped.
+    # Normalize only numeric SGR sequences in the parsing copy.  The receipt
+    # retains and hashes ``text`` below, and all other escape/control sequences
+    # fail closed rather than being silently discarded.
+    parse_text = _TOPOLOGY_SGR.sub("", text)
+    forbidden_controls = [
+        character
+        for character in parse_text
+        if (ord(character) < 32 and character not in "\t\n\r")
+        or ord(character) in {0x7F, 0x9B}
+    ]
+    if "\x1b" in parse_text or forbidden_controls:
+        raise PodQualificationError(
+            "nvidia-smi topology contains a non-SGR escape/control sequence"
+        )
     labels = [f"GPU{index}" for index in physical_indices]
     header: list[str] | None = None
     rows: dict[str, list[str]] = {}
-    for line in text.splitlines():
+    for line in parse_text.splitlines():
         tokens = line.split()
         if not tokens:
             continue

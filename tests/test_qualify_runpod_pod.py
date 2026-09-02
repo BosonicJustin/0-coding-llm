@@ -893,6 +893,38 @@ class NvidiaEvidenceParsingTests(unittest.TestCase):
         self.assertEqual(parsed["labels_in_visible_order"], ["GPU5", "GPU4", "GPU3", "GPU2", "GPU1", "GPU0"])
         self.assertEqual(parsed["nvlink_pairs"], 15)
 
+    def test_topology_parser_accepts_sgr_underlined_header_but_hashes_raw(self) -> None:
+        header = (
+            "\t\x1b[4mGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tCPU "
+            "Affinity\tNUMA Affinity\tGPU NUMA ID\x1b[0m"
+        )
+        rows = []
+        for left in range(6):
+            links = ["X" if left == right else "NV18" for right in range(6)]
+            rows.append(
+                f"GPU{left}\t" + "\t".join(links) + "\t0-31\t0\tN/A"
+            )
+        raw = "\n".join([header, *rows])
+        parsed = qualify._parse_topology(raw, physical_indices=list(range(6)))
+        self.assertEqual(parsed["nvlink_pairs"], 15)
+        self.assertEqual(parsed["matrix"][0][1], "NV18")
+        self.assertEqual(parsed["raw"], raw)
+        self.assertEqual(
+            parsed["raw_sha256"], hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        )
+
+    def test_topology_parser_rejects_non_sgr_escape_or_control_sequences(self) -> None:
+        fixtures = (
+            "\x1b]0;title\x07GPU0 GPU1",
+            "GPU0\x07 GPU1",
+            "\x1b[2JGPU0 GPU1",
+        )
+        for raw in fixtures:
+            with self.subTest(raw=repr(raw)), self.assertRaisesRegex(
+                qualify.PodQualificationError, "non-SGR"
+            ):
+                qualify._parse_topology(raw, physical_indices=list(range(6)))
+
     def test_byte_parser_is_binary_and_rejects_zero(self) -> None:
         self.assertEqual(qualify.parse_bytes("16GiB"), 16 * 1024**3)
         with self.assertRaises(Exception):
