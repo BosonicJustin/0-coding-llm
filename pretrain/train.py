@@ -97,6 +97,32 @@ def verify_order_payload_checksum(order_manifest_path: str | Path) -> str:
     return actual_digest
 
 
+def _order_data_identity(
+    order_manifest_sha256: str,
+    order_payload_sha256: str,
+) -> str:
+    """Return the loader/checkpoint identity of one immutable packed order.
+
+    Tokenizer identity is deliberately not folded into this string.  The
+    tokenizer manifest and vocabulary hashes are verified, checkpointed, and
+    resume-checked as separate first-class fields; the batch sampler can only
+    attest the order manifest and its payload.
+    """
+
+    manifest_sha256 = require_sha256(
+        order_manifest_sha256,
+        field="order_manifest_sha256",
+    )
+    payload_sha256 = require_sha256(
+        order_payload_sha256,
+        field="order_payload_sha256",
+    )
+    return (
+        f"order-manifest-sha256:{manifest_sha256};"
+        f"order-payload-sha256:{payload_sha256}"
+    )
+
+
 def batch_fingerprint(batch: Mapping[str, torch.Tensor]) -> str:
     """Fingerprint all tensors in a fixed diagnostic batch.
 
@@ -3280,13 +3306,9 @@ def _run_initialized_training(
                 model,
                 train_config,
                 device=device,
-                data_identity=(
-                    f"order-manifest-sha256:{order_manifest_digest};"
-                    f"order-payload-sha256:{order_payload_digest};"
-                    "tokenizer-manifest-sha256:"
-                    f"{order_payload['tokenizer_manifest_sha256']};"
-                    "tokenizer-vocabulary-sha256:"
-                    f"{tokenizer_identity['vocabulary_sha256']}"
+                data_identity=_order_data_identity(
+                    order_manifest_digest,
+                    order_payload_digest,
                 ),
                 tokenizer_manifest_sha256=str(
                     order_payload["tokenizer_manifest_sha256"]

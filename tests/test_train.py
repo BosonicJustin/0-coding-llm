@@ -37,6 +37,7 @@ from pretrain.train import (
     _atomic_torch_save,
     _bind_wandb_run_id,
     _finalize_training_run,
+    _order_data_identity,
     _raise_if_distributed_stage_failed,
     _resolve_device,
     batch_fingerprint,
@@ -1656,9 +1657,17 @@ class TrainingHarnessTest(unittest.TestCase):
                 geometry["consumed_supervised_tokens"],
                 geometry["consumed_input_tokens"],
             )
-            data_identity = (
-                f"order-manifest-sha256:{sha256_file(order)};"
-                f"order-payload-sha256:{verify_order_payload_checksum(order)}"
+            data_identity = _order_data_identity(
+                sha256_file(order),
+                verify_order_payload_checksum(order),
+            )
+            (
+                tokenizer_manifest_sha256,
+                tokenizer_vocabulary_sha256,
+            ) = OVERFIT_MODULE.synthetic_tokenizer_identities(64)
+            tokenizer_identities = dict(
+                tokenizer_manifest_sha256=tokenizer_manifest_sha256,
+                tokenizer_vocabulary_sha256=tokenizer_vocabulary_sha256,
             )
 
             seed_everything(42, deterministic=True)
@@ -1669,6 +1678,7 @@ class TrainingHarnessTest(unittest.TestCase):
                 device="cpu",
                 data_identity=data_identity,
                 training_geometry=geometry,
+                **tokenizer_identities,
             )
             full_loader, full_sampler = create_training_dataloader(
                 order,
@@ -1677,6 +1687,7 @@ class TrainingHarnessTest(unittest.TestCase):
                 pin_memory=False,
             )
             try:
+                self.assertEqual(data_identity, full_sampler.data_identity)
                 full.train(full_loader)
             finally:
                 full_sampler.close()
@@ -1702,6 +1713,7 @@ class TrainingHarnessTest(unittest.TestCase):
                 data_identity=data_identity,
                 checkpoint_path=checkpoint,
                 training_geometry=geometry,
+                **tokenizer_identities,
             )
             partial_loader, partial_sampler = create_training_dataloader(
                 order,
@@ -1712,6 +1724,20 @@ class TrainingHarnessTest(unittest.TestCase):
             try:
                 partial.train(partial_loader, until_step=2)
                 partial.save_checkpoint()
+                checkpoint_payload = torch.load(checkpoint, weights_only=False)
+                self.assertEqual(
+                    checkpoint_payload["data_identity"],
+                    partial_sampler.data_identity,
+                )
+                self.assertNotIn("tokenizer-", checkpoint_payload["data_identity"])
+                self.assertEqual(
+                    checkpoint_payload["tokenizer_manifest_sha256"],
+                    tokenizer_manifest_sha256,
+                )
+                self.assertEqual(
+                    checkpoint_payload["tokenizer_vocabulary_sha256"],
+                    tokenizer_vocabulary_sha256,
+                )
             finally:
                 partial_sampler.close()
                 partial_loader.dataset.close()
@@ -1723,6 +1749,7 @@ class TrainingHarnessTest(unittest.TestCase):
                 device="cpu",
                 data_identity=data_identity,
                 training_geometry=geometry,
+                **tokenizer_identities,
             )
             resumed.load_checkpoint(checkpoint)
             resumed_loader, resumed_sampler = create_training_dataloader(
