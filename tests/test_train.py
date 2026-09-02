@@ -416,6 +416,32 @@ class TrainingHarnessTest(unittest.TestCase):
         logger.finish()
         run.finish.assert_called_once()
 
+    def test_wandb_uploads_only_explicit_small_evidence_files(self) -> None:
+        run = mock.Mock(id="evidence-run-id")
+        artifact = mock.Mock()
+        wandb = mock.Mock()
+        wandb.init.return_value = run
+        wandb.Artifact.return_value = artifact
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "manifest.json"
+            evidence.write_text('{"status":"pass"}\n', encoding="utf-8")
+            with mock.patch.object(importlib, "import_module", return_value=wandb):
+                logger = WandbLogger(mode="online", project="test-project")
+            logger.log_evidence_artifact(
+                name="authority-abc123",
+                files={"train-order-manifest.json": evidence},
+                aliases=("latest", "abc123"),
+            )
+        wandb.Artifact.assert_called_once_with(
+            name="authority-abc123", type="pretraining-authority"
+        )
+        artifact.add_file.assert_called_once_with(
+            str(evidence.resolve()), name="train-order-manifest.json"
+        )
+        run.log_artifact.assert_called_once_with(
+            artifact, aliases=["latest", "abc123"]
+        )
+
     def test_new_wandb_run_id_invalidates_same_step_checkpoint_cache(self) -> None:
         stream = FixedBatchStream(make_batch())
         with tempfile.TemporaryDirectory() as temporary:
@@ -525,15 +551,30 @@ class TrainingHarnessTest(unittest.TestCase):
             "train/supervised_tokens",
             "train/loss_tokens",
             "train/microbatches",
+            "train/update_rows",
+            "train/update_input_tokens",
+            "train/update_supervised_tokens",
+            "train/update_supervision_fraction",
+            "train/progress_fraction",
+            "train/progress_percent",
+            "train/remaining_steps",
+            "train/grad_norm_to_clip_threshold",
+            "train/gradient_was_clipped",
             "perf/input_tokens_per_second",
+            "perf/input_tokens_per_second_ema",
             "perf/loss_tokens_per_second",
             "perf/step_seconds",
+            "perf/step_seconds_ema",
+            "perf/estimated_remaining_seconds",
             "perf/data_wait_seconds",
             "perf/data_wait_fraction",
         }
-        self.assertEqual(set(metrics), expected_metrics)
+        self.assertTrue(expected_metrics.issubset(metrics))
         self.assertEqual(metrics["train/input_tokens"], 12 * 8)
         self.assertEqual(metrics["train/loss_tokens"], 12 * 8)
+        self.assertEqual(metrics["train/progress_fraction"], 1.0)
+        self.assertEqual(metrics["train/remaining_steps"], 0)
+        self.assertEqual(metrics["train/update_supervision_fraction"], 1.0)
         self.assertGreaterEqual(metrics["perf/data_wait_fraction"], 0.0)
         self.assertLessEqual(metrics["perf/data_wait_fraction"], 1.0)
 

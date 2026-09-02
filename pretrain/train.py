@@ -47,6 +47,7 @@ from pretrain.data import (
     frozen_training_geometry,
 )
 from pretrain.tokenizer_identity import (
+    TOKENIZER_MANIFEST_NAME,
     TokenizerIdentityError,
     require_sha256,
     verify_tokenizer_identity,
@@ -452,6 +453,7 @@ class WandbLogger:
             raise ValueError(f"Unsupported W&B mode {mode!r}")
         self.mode = mode
         self._run: Any | None = None
+        self._wandb: Any | None = None
         self.run_id: str | None = None
         if mode == "disabled":
             return
@@ -475,6 +477,7 @@ class WandbLogger:
         if run_id is not None:
             init_kwargs.update(id=run_id, resume="allow")
         self._run = wandb.init(**init_kwargs)
+        self._wandb = wandb
         self.run_id = str(self._run.id)
         # Training and validation are separate records at the same optimizer
         # step. An explicit W&B internal ``step=`` would cause the later record
@@ -482,10 +485,53 @@ class WandbLogger:
         # allowing both records to be committed.
         self._run.define_metric("train/step")
         self._run.define_metric("*", step_metric="train/step")
+        for metric in (
+            "train/loss",
+            "train/perplexity",
+            "validation/loss",
+            "validation/perplexity",
+        ):
+            self._run.define_metric(metric, step_metric="train/step", summary="min")
+        for metric in (
+            "perf/input_tokens_per_second",
+            "perf/input_tokens_per_second_ema",
+        ):
+            self._run.define_metric(metric, step_metric="train/step", summary="max")
 
     def log(self, metrics: Mapping[str, float | int]) -> None:
         if self._run is not None:
             self._run.log(dict(metrics))
+
+    def log_evidence_artifact(
+        self,
+        *,
+        name: str,
+        files: Mapping[str, Path],
+        aliases: Iterable[str] = (),
+    ) -> None:
+        """Upload small authority receipts without ever uploading corpus text.
+
+        The size cap prevents an incorrect path from turning packed data or a
+        multi-gigabyte checkpoint into a surprise tracking upload.
+        """
+
+        if self._run is None or self._wandb is None:
+            return
+        total_bytes = 0
+        validated: list[tuple[str, Path]] = []
+        for artifact_name, raw_path in files.items():
+            candidate = Path(raw_path)
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ValueError(f"W&B evidence must be a regular file: {candidate}")
+            path = candidate.resolve(strict=True)
+            total_bytes += path.stat().st_size
+            validated.append((artifact_name, path))
+        if total_bytes > 16 * 1024 * 1024:
+            raise ValueError("W&B evidence artifact exceeds the 16 MiB safety cap")
+        artifact = self._wandb.Artifact(name=name, type="pretraining-authority")
+        for artifact_name, path in validated:
+            artifact.add_file(str(path), name=artifact_name)
+        self._run.log_artifact(artifact, aliases=list(aliases))
 
     def finish(self) -> None:
         if self._run is not None:
@@ -1329,6 +1375,7 @@ class ValidationRunner:
             "validation/rows": rows,
             "validation/input_tokens": input_tokens,
             "validation/supervised_tokens": loss_tokens,
+            "validation/supervision_fraction": loss_tokens / input_tokens,
             "validation/seconds": elapsed,
             "validation/input_tokens_per_second": input_tokens / elapsed,
             "validation/supervised_tokens_per_second": loss_tokens / elapsed,
@@ -1351,6 +1398,15 @@ class ValidationRunner:
                         domain_input_tokens[index]
                     ),
                     f"validation/{domain}/supervised_tokens": tokens,
+                    f"validation/{domain}/row_fraction": (
+                        int(domain_rows[index]) / rows
+                    ),
+                    f"validation/{domain}/input_token_fraction": (
+                        int(domain_input_tokens[index]) / input_tokens
+                    ),
+                    f"validation/{domain}/supervised_token_fraction": (
+                        tokens / loss_tokens
+                    ),
                 }
             )
             if tokens:
@@ -1499,6 +1555,11 @@ class Trainer:
         self.implementation_signature = self._compute_implementation_signature()
         self._last_checkpoint: tuple[Path, int] | None = None
         self.state = TrainState()
+        self._telemetry_started = time.perf_counter()
+        self._telemetry_updates = 0
+        self._step_seconds_ema: float | None = None
+        self._input_throughput_ema: float | None = None
+        self._parameter_count = sum(parameter.numel() for parameter in model.parameters())
         if (
             config.precision == "bfloat16"
             and self.device.type == "cuda"
@@ -1644,6 +1705,7 @@ class Trainer:
             return
         if dirty_boundary:
             raise RuntimeError("Checkpoints are only valid at clean optimizer-step boundaries")
+        checkpoint_started = time.perf_counter()
         rng_states = self._collect_rng_states()
         local_save_error: BaseException | None = None
         preserve_previous = bool(
@@ -1705,6 +1767,23 @@ class Trainer:
         if preserve_previous:
             self._preserve_previous_on_next_save = False
         self._last_checkpoint = checkpoint_key
+        if self.rank == 0:
+            previous = destination.with_name(
+                f"{destination.stem}.previous{destination.suffix}"
+            )
+            self._log_metrics(
+                {
+                    "train/step": self.state.completed_steps,
+                    "checkpoint/completed": 1,
+                    "checkpoint/bytes": destination.stat().st_size,
+                    "checkpoint/seconds": time.perf_counter() - checkpoint_started,
+                    "checkpoint/has_previous_generation": int(previous.is_file()),
+                    "checkpoint/train_input_tokens": self.state.consumed_input_tokens,
+                    "checkpoint/train_supervised_tokens": (
+                        self.state.consumed_supervised_tokens
+                    ),
+                }
+            )
 
     def load_checkpoint(self, path: str | Path) -> TrainState:
         """Restore full state and RNGs, validating all trajectory identities."""
@@ -2368,6 +2447,25 @@ class Trainer:
                 local_data_wait_seconds,
             )
             token_loss = global_loss_sum / global_loss_tokens
+            input_throughput = global_input_tokens / elapsed
+            loss_throughput = global_loss_tokens / elapsed
+            self._telemetry_updates += 1
+            smoothing = 0.05
+            self._step_seconds_ema = (
+                elapsed
+                if self._step_seconds_ema is None
+                else smoothing * elapsed + (1.0 - smoothing) * self._step_seconds_ema
+            )
+            self._input_throughput_ema = (
+                input_throughput
+                if self._input_throughput_ema is None
+                else smoothing * input_throughput
+                + (1.0 - smoothing) * self._input_throughput_ema
+            )
+            remaining_steps = self.config.max_steps - self.state.completed_steps
+            process_elapsed = time.perf_counter() - self._telemetry_started
+            progress_fraction = self.state.completed_steps / self.config.max_steps
+            supervision_fraction = global_loss_tokens / global_input_tokens
             last_metrics = {
                 "train/step": self.state.completed_steps,
                 "train/loss": token_loss,
@@ -2381,20 +2479,59 @@ class Trainer:
                 "train/supervised_tokens": self.state.consumed_supervised_tokens,
                 "train/loss_tokens": self.state.consumed_supervised_tokens,
                 "train/microbatches": self.state.completed_microbatches,
-                "perf/input_tokens_per_second": global_input_tokens / elapsed,
-                "perf/loss_tokens_per_second": global_loss_tokens / elapsed,
+                "train/update_rows": update_rows,
+                "train/update_input_tokens": global_input_tokens,
+                "train/update_supervised_tokens": global_loss_tokens,
+                "train/update_supervision_fraction": supervision_fraction,
+                "train/global_microbatch_rows": self.config.global_microbatch_rows,
+                "train/local_microbatch_rows": self.local_batch_size,
+                "train/gradient_accumulation_steps": (
+                    self.config.gradient_accumulation_steps
+                ),
+                "train/world_size": self.world_size,
+                "train/max_grad_norm": self.config.max_grad_norm,
+                "train/grad_norm_to_clip_threshold": (
+                    grad_norm / self.config.max_grad_norm
+                ),
+                "train/gradient_was_clipped": int(
+                    grad_norm > self.config.max_grad_norm
+                ),
+                "train/progress_fraction": progress_fraction,
+                "train/progress_percent": 100.0 * progress_fraction,
+                "train/remaining_steps": remaining_steps,
+                "train/input_tokens_per_parameter": (
+                    self.state.consumed_input_tokens / self._parameter_count
+                ),
+                "perf/input_tokens_per_second": input_throughput,
+                "perf/loss_tokens_per_second": loss_throughput,
+                "perf/sequences_per_second": update_rows / elapsed,
+                "perf/optimizer_updates_per_hour": 3600.0 / elapsed,
                 "perf/step_seconds": elapsed,
+                "perf/step_seconds_ema": self._step_seconds_ema,
+                "perf/input_tokens_per_second_ema": self._input_throughput_ema,
+                "perf/estimated_remaining_seconds": (
+                    remaining_steps * self._step_seconds_ema
+                ),
+                "perf/process_elapsed_seconds": process_elapsed,
                 "perf/data_wait_seconds": data_wait_seconds,
                 "perf/data_wait_fraction": data_wait_fraction,
             }
             if self.device.type == "cuda":
+                cuda_free_bytes, cuda_total_bytes = torch.cuda.mem_get_info(self.device)
+                cuda_allocated_bytes = torch.cuda.memory_allocated(self.device)
+                cuda_reserved_bytes = torch.cuda.memory_reserved(self.device)
                 last_metrics.update(
                     {
-                        "system/cuda_memory_allocated_bytes": torch.cuda.memory_allocated(
-                            self.device
+                        "system/cuda_device_index": int(self.device.index or 0),
+                        "system/cuda_memory_allocated_bytes": cuda_allocated_bytes,
+                        "system/cuda_memory_reserved_bytes": cuda_reserved_bytes,
+                        "system/cuda_memory_free_bytes": cuda_free_bytes,
+                        "system/cuda_memory_total_bytes": cuda_total_bytes,
+                        "system/cuda_memory_allocated_fraction": (
+                            cuda_allocated_bytes / cuda_total_bytes
                         ),
-                        "system/cuda_memory_reserved_bytes": torch.cuda.memory_reserved(
-                            self.device
+                        "system/cuda_memory_reserved_fraction": (
+                            cuda_reserved_bytes / cuda_total_bytes
                         ),
                         "system/cuda_peak_memory_allocated_bytes": (
                             torch.cuda.max_memory_allocated(self.device)
@@ -2407,6 +2544,8 @@ class Trainer:
             if domain_stats is not None:
                 for domain in DOMAIN_ORDER:
                     window_tokens = int(domain_stats[domain]["loss_tokens"])
+                    window_rows = int(domain_stats[domain]["rows"])
+                    window_input_tokens = int(domain_stats[domain]["input_tokens"])
                     last_metrics.update(
                         {
                             f"train/{domain}/rows": self.state.consumed_rows_per_domain[
@@ -2417,6 +2556,26 @@ class Trainer:
                             ),
                             f"train/{domain}/supervised_tokens": (
                                 self.state.consumed_supervised_tokens_per_domain[domain]
+                            ),
+                            f"train/{domain}/update_rows": window_rows,
+                            f"train/{domain}/update_input_tokens": window_input_tokens,
+                            f"train/{domain}/update_supervised_tokens": window_tokens,
+                            f"train/{domain}/update_row_fraction": (
+                                window_rows / update_rows
+                            ),
+                            f"train/{domain}/update_input_token_fraction": (
+                                window_input_tokens / global_input_tokens
+                            ),
+                            f"train/{domain}/update_supervised_token_fraction": (
+                                window_tokens / global_loss_tokens
+                            ),
+                            f"train/{domain}/cumulative_input_token_fraction": (
+                                self.state.consumed_input_tokens_per_domain[domain]
+                                / self.state.consumed_input_tokens
+                            ),
+                            f"train/{domain}/cumulative_supervised_token_fraction": (
+                                self.state.consumed_supervised_tokens_per_domain[domain]
+                                / self.state.consumed_supervised_tokens
                             ),
                         }
                     )
@@ -3000,6 +3159,12 @@ def _run_initialized_training(
             rank=rank,
             world_size=world_size,
         )
+        run_config["resume"] = {
+            "requested": args.resume is not None,
+            "checkpoint": None if args.resume is None else str(args.resume.resolve()),
+            "resumed_step": trainer.state.completed_steps,
+            "remaining_steps": train_config.max_steps - trainer.state.completed_steps,
+        }
 
         wandb_logger: MetricLogger = NullLogger()
         wandb_initialization_error: str | None = None
@@ -3037,6 +3202,33 @@ def _run_initialized_training(
                     and wandb_logger.run_id is not None
                 ):
                     initialized_wandb_run_id = wandb_logger.run_id
+                    evidence_files = {
+                        "train-order-manifest.json": args.order_manifest,
+                        "tokenizer-manifest.json": (
+                            Path(tokenizer_identity["path"])
+                            / TOKENIZER_MANIFEST_NAME
+                        ),
+                    }
+                    if args.validation_order_manifest is not None:
+                        evidence_files["validation-order-manifest.json"] = (
+                            args.validation_order_manifest
+                        )
+                    try:
+                        wandb_logger.log_evidence_artifact(
+                            name=(
+                                "pretraining-input-authority-"
+                                f"{order_manifest_digest[:16]}"
+                            ),
+                            files=evidence_files,
+                            aliases=("latest", order_manifest_digest[:16]),
+                        )
+                    except Exception as exc:
+                        print(
+                            "warning: W&B evidence artifact upload failed; "
+                            f"continuing with metrics: {type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
         if world_size > 1:
             initialization_status = [
                 wandb_initialization_error,
@@ -3060,6 +3252,31 @@ def _run_initialized_training(
             else NullLogger()
         )
         trainer.logger = logger
+        trainer._log_metrics(
+            {
+                "train/step": trainer.state.completed_steps,
+                "system/run_initialized": 1,
+                "system/resumed": int(args.resume is not None),
+                "train/world_size": world_size,
+                "train/global_microbatch_rows": train_config.global_microbatch_rows,
+                "train/local_microbatch_rows": trainer.local_batch_size,
+                "train/gradient_accumulation_steps": (
+                    train_config.gradient_accumulation_steps
+                ),
+                "train/optimizer_update_rows": (
+                    train_config.global_microbatch_rows
+                    * train_config.gradient_accumulation_steps
+                ),
+                "train/target_steps": train_config.max_steps,
+                "train/remaining_steps": (
+                    train_config.max_steps - trainer.state.completed_steps
+                ),
+                "train/progress_fraction": (
+                    trainer.state.completed_steps / train_config.max_steps
+                ),
+                "train/model_parameters": trainer._parameter_count,
+            }
+        )
 
         train_loader_error: BaseException | None = None
         try:

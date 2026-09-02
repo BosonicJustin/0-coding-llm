@@ -5,8 +5,8 @@ With no arguments this creates a tiny temporary packed corpus, loads one global
 batch through the real mmap/order/collation path, and trains a tiny CPU model.
 Pass a real order manifest and ``--model-size 1.3b --device cuda`` under
 six-rank torchrun for the GPU gate. Separate uninterrupted, partial, and resume
-processes can prove exact final trajectory equality. W&B is either disabled or
-offline, so this qualification never depends on a network service.
+processes can prove exact final trajectory equality. W&B can be disabled,
+recorded offline, or streamed online when live preflight visibility is desired.
 """
 
 from __future__ import annotations
@@ -655,7 +655,9 @@ def main() -> int:
         help="defaults on for 1.3b and off for tiny",
     )
     parser.add_argument(
-        "--wandb-mode", choices=("disabled", "offline"), default="disabled"
+        "--wandb-mode",
+        choices=("disabled", "offline", "online"),
+        default="disabled",
     )
     parser.add_argument("--wandb-project", default="coding-model-from-scratch")
     parser.add_argument("--wandb-run-name")
