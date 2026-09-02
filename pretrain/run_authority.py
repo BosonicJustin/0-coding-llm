@@ -44,6 +44,7 @@ POD_QUALIFICATION_VERSION = 1
 CORPUS_QUALIFICATION_FORMAT = "materialized-pretraining-corpus-qualification"
 CORPUS_QUALIFICATION_VERSION = 1
 GEOMETRY_FORMAT = "pretraining-accepted-geometry"
+GEOMETRY_WAIVER_FORMAT = "pretraining-accepted-geometry-with-waiver"
 RECIPE_FORMAT = "pretraining-training-recipe"
 CERTIFICATION_FORMAT = "production-pretraining-full-data-validation"
 WORLD_SIZE = 6
@@ -1430,8 +1431,23 @@ def inspect_geometry_receipt(
     bound = _verified_sidecar(path, label="accepted-geometry receipt")
     if bound["artifact"] != descriptor:
         raise RunAuthorityError("Geometry receipt changed during inspection")
-    if receipt.get("format") != GEOMETRY_FORMAT or receipt.get("format_version") != 1:
+    receipt_format = receipt.get("format")
+    if receipt_format == GEOMETRY_WAIVER_FORMAT:
+        try:
+            from pretrain.geometry_waiver import validate_geometry_waiver_receipt
+
+            validate_geometry_waiver_receipt(
+                receipt,
+                expected_hardware_contract_sha256=hardware_contract_sha256,
+            )
+        except (OSError, ValueError) as exc:
+            raise RunAuthorityError(
+                f"Accepted-geometry waiver evidence is invalid: {exc}"
+            ) from exc
+    elif receipt_format != GEOMETRY_FORMAT:
         raise RunAuthorityError("Unsupported accepted-geometry receipt format")
+    if receipt.get("format_version") != 1:
+        raise RunAuthorityError("Unsupported accepted-geometry receipt version")
     if receipt.get("status") != "pass":
         raise RunAuthorityError("Accepted-geometry receipt did not pass")
     if receipt.get("hardware_contract_sha256") != hardware_contract_sha256:

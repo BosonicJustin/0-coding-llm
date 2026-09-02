@@ -117,6 +117,32 @@ def validate_authority_geometry_soak(
         raise GeometryEvidenceError(
             "Accepted-geometry receipt differs from the authority's embedded copy"
         )
+    final_soak_waived = receipt.get("final_soak_waived") is True
+    waiver_validation: dict[str, Any] | None = None
+    if final_soak_waived:
+        try:
+            from pretrain.geometry_waiver import validate_geometry_waiver_receipt
+
+            train_order = data.get("train_order")
+            validation_order = data.get("validation_order")
+            hardware_contract = hardware.get("contract")
+            if not all(
+                isinstance(value, Mapping)
+                for value in (train_order, validation_order, hardware_contract)
+            ):
+                raise GeometryEvidenceError(
+                    "Waived geometry requires authoritative hardware/train/validation bindings"
+                )
+            waiver_validation = validate_geometry_waiver_receipt(
+                receipt,
+                expected_hardware_contract_sha256=str(hardware_contract["sha256"]),
+                expected_train_order=train_order,
+                expected_validation_order=validation_order,
+            )
+        except (KeyError, OSError, ValueError) as exc:
+            raise GeometryEvidenceError(
+                f"Separate-final-soak waiver evidence is invalid: {exc}"
+            ) from exc
     accepted = receipt.get("accepted")
     measurements = receipt.get("measurements")
     expected_hardware = hardware.get("expected")
@@ -274,7 +300,7 @@ def validate_authority_geometry_soak(
             "Reported throughput does not match external token delta / wall time"
         )
 
-    return {
+    result = {
         "status": "pass",
         "soak_steps": soak_steps,
         "tokens_per_update": tokens_per_update,
@@ -287,3 +313,9 @@ def validate_authority_geometry_soak(
         "required_free_memory_bytes_per_gpu": required_free,
         "minimum_free_memory_bytes_per_gpu": minimum_free,
     }
+    if final_soak_waived:
+        result.update(
+            final_soak_waived=True,
+            waiver_validation=waiver_validation,
+        )
+    return result
