@@ -258,6 +258,40 @@ class StorageAndResumeTest(unittest.TestCase):
             self.assertTrue(evidence.mount_read_only)
             self.assertEqual(evidence.classification, "local-or-block")
 
+    def test_runpod_moosefs_bare_fuse_is_network_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = "mfs#ca-mtl-1.runpod.net:9421[network-volume]"
+            mountinfo = (
+                f"37 25 0:31 / {root} rw,relatime - fuse {source} rw\n"
+            )
+            with mock.patch.object(launch.sys, "platform", "linux"):
+                evidence = launch.inspect_mount(root, mountinfo_text=mountinfo)
+            self.assertEqual(evidence.filesystem_type, "fuse")
+            self.assertEqual(evidence.mount_source, source)
+            self.assertEqual(evidence.classification, "network")
+            self.assertFalse(evidence.mount_read_only)
+
+    def test_bare_fuse_without_network_endpoint_remains_local(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            sources = (
+                "/dev/fuse",
+                "portal",
+                "mfs#ca-mtl-1.runpod.net",
+                "mfs#ca-mtl-1.runpod.net:99999[network-volume]",
+            )
+            for source in sources:
+                with self.subTest(source=source):
+                    mountinfo = (
+                        f"37 25 0:31 / {root} rw,relatime - fuse {source} rw\n"
+                    )
+                    with mock.patch.object(launch.sys, "platform", "linux"):
+                        evidence = launch.inspect_mount(
+                            root, mountinfo_text=mountinfo
+                        )
+                    self.assertEqual(evidence.classification, "local-or-block")
+
     def test_new_lineage_requires_three_generation_peak_plus_headroom(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

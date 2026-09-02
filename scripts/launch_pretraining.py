@@ -86,6 +86,11 @@ _NETWORK_FILESYSTEMS = frozenset(
 _EPHEMERAL_FILESYSTEMS = frozenset(
     {"aufs", "devtmpfs", "overlay", "ramfs", "squashfs", "tmpfs"}
 )
+_MOOSEFS_FUSE_SOURCE = re.compile(
+    r"mfs#(?P<host>[A-Za-z0-9][A-Za-z0-9.-]*):(?P<port>[0-9]{1,5})"
+    r"(?:\[[^\]\r\n]*\])?\Z",
+    re.IGNORECASE,
+)
 _CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 _PYTHON_HASH_SEED = "0"
 _FP32_BYTES = 4
@@ -330,6 +335,26 @@ def _linux_mount_evidence(path: Path, text: str) -> tuple[str, str, str, bool] |
     return mount_point, filesystem_type, source, read_only
 
 
+def _is_network_backed_bare_fuse(
+    filesystem_type: str, mount_source: str | None
+) -> bool:
+    """Recognize MooseFS's generic ``fuse`` mount without trusting all FUSE.
+
+    RunPod network volumes expose ``fstype=fuse`` rather than a subtype such as
+    ``fuse.sshfs``.  Their source is an explicit MooseFS network endpoint of the
+    form ``mfs#host:port[optional-path]``.  Requiring that endpoint signature
+    keeps ordinary local FUSE filesystems classified as local/block storage.
+    """
+
+    if filesystem_type != "fuse" or mount_source is None:
+        return False
+    match = _MOOSEFS_FUSE_SOURCE.fullmatch(mount_source)
+    if match is None:
+        return False
+    port = int(match.group("port"))
+    return 1 <= port <= 65_535
+
+
 def inspect_mount(path: Path, *, mountinfo_text: str | None = None) -> MountEvidence:
     resolved = _resolve_existing_directory(path, label="storage root")
     filesystem_type = "unknown"
@@ -349,7 +374,11 @@ def inspect_mount(path: Path, *, mountinfo_text: str | None = None) -> MountEvid
         if detected is not None:
             mount_point, filesystem_type, mount_source, mount_read_only = detected
             mount_read_only = bool(mount_read_only)
-    if filesystem_type in _NETWORK_FILESYSTEMS or filesystem_type.startswith("fuse."):
+    if (
+        filesystem_type in _NETWORK_FILESYSTEMS
+        or filesystem_type.startswith("fuse.")
+        or _is_network_backed_bare_fuse(filesystem_type, mount_source)
+    ):
         classification = "network"
     elif filesystem_type in _EPHEMERAL_FILESYSTEMS:
         classification = "ephemeral"
