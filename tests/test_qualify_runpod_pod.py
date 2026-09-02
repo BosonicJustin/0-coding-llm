@@ -21,6 +21,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import qualify_runpod_pod as qualify
 from pretrain import run_authority
 from pretrain import geometry_qualification
+from pretrain import data as training_data
+from pretrain.materialize import FORMAT as MATERIALIZE_FORMAT
+from pretrain.materialize import FORMAT_VERSION as MATERIALIZE_FORMAT_VERSION
+from pretrain.materialize import JOURNAL_NAME as MATERIALIZE_JOURNAL_NAME
 
 
 def _gpu_observation() -> dict[str, object]:
@@ -235,6 +239,85 @@ def _observation() -> dict[str, object]:
             ],
         },
     }
+
+
+def _portable_heldout_fixture(root: Path) -> tuple[dict[str, Path], Path, Path, dict[str, object]]:
+    corpus = root / "packed-v1"
+    tokenizer_sha = "1" * 64
+    policy_sha = "2" * 64
+    selection_sha = "3" * 64
+    sequence_length = 4
+    vocab_size = 16
+    rows = {"python": 4, "other_code": 4, "english": 2}
+    train_manifests: dict[str, Path] = {}
+    for split in ("train", "validation", "test"):
+        split_manifests: dict[str, Path] = {}
+        for domain in training_data.DOMAIN_ORDER:
+            output = corpus / "packed" / split / domain
+            writer = training_data.PackedShardWriter(
+                output,
+                domain=domain,
+                split=split,
+                sequence_length=sequence_length,
+                vocab_size=vocab_size,
+                eos_token_id=0,
+                tokenizer_manifest_sha256=tokenizer_sha,
+                rows_per_shard=8,
+                construction_seed=1234,
+                curation_policy_sha256=policy_sha,
+                selection_manifest_sha256=selection_sha,
+            )
+            writer.add_document([2] * (rows[domain] * sequence_length))
+            writer.finish(source_cursor={"fixture": f"{split}/{domain}"})
+            manifest = output / "manifest.json"
+            split_manifests[domain] = manifest
+            if split == "train":
+                train_manifests[domain] = manifest
+        if split in {"validation", "test"}:
+            training_data.build_training_order(
+                split_manifests,
+                corpus / "orders" / split,
+                seed=qualify.PORTABLE_ORDER_SEED + (1 if split == "validation" else 2),
+                expected_weights=qualify.PORTABLE_INPUT_WEIGHTS,
+                expected_total_input_tokens=40,
+                input_token_tolerance=0,
+            )
+    journal = {
+        "format": MATERIALIZE_FORMAT,
+        "format_version": MATERIALIZE_FORMAT_VERSION,
+        "identity": {
+            "tokenizer_manifest_sha256": tokenizer_sha,
+            "curation_policy_sha256": policy_sha,
+            "selection_manifest_sha256": selection_sha,
+            "packing_configuration": {
+                "sequence_length": sequence_length,
+                "expected_vocab_size": vocab_size,
+                "expected_eos_token_id": 0,
+            },
+        },
+        "state": {
+            "phase": "packed",
+            "archive_count": 1,
+            "completed_archives": 1,
+        },
+    }
+    (corpus / MATERIALIZE_JOURNAL_NAME).write_text(
+        json.dumps(journal, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    common: dict[str, object] = {
+        "sequence_length": sequence_length,
+        "vocab_size": vocab_size,
+        "eos_token_id": 0,
+        "tokenizer_manifest_sha256": tokenizer_sha,
+        "curation_policy_sha256": policy_sha,
+        "selection_manifest_sha256": selection_sha,
+    }
+    return (
+        train_manifests,
+        corpus / "orders" / "validation" / "manifest.json",
+        corpus / "orders" / "test" / "manifest.json",
+        common,
+    )
 
 
 class PodQualificationValidationTests(unittest.TestCase):
@@ -530,18 +613,39 @@ class PodQualificationValidationTests(unittest.TestCase):
         }
         host["data"].update(
             {
-                "immutable_data_receipt": {
-                    "artifact": {
-                        "path": "/workspace/data/.RESTORE_READY.json",
-                        "bytes": 1,
-                        "sha256": "f" * 64,
+                "content_authentication": {
+                    "kind": "portable-heldout-publication-completion",
+                    "status": "pass",
+                    "producer_contract": (
+                        "all-nine-packed-payloads-and-provenance-deep-authenticated-"
+                        "before-atomic-heldout-publication"
+                    ),
+                    "restore_receipt_present_at_seal": False,
+                    "payloads_rehashed_by_bootstrap": False,
+                    "kernel_write_protection": False,
+                    "final_launch_authorized": False,
+                    "orders": {
+                        split: {
+                            "manifest": {
+                                "path": f"/workspace/data/orders/{split}/manifest.json",
+                                "bytes": 1,
+                                "sha256": "f" * 64,
+                            },
+                            "payload": {
+                                "path": f"/workspace/data/orders/{split}/order.bin",
+                                "bytes": 1,
+                                "sha256": "e" * 64,
+                            },
+                        }
+                        for split in ("validation", "test")
                     },
-                    "payload_sha256_verified": True,
                 },
-                "write_protection": {
-                    "policy": (
-                        "all-regular-files-and-directories-have-no-write-mode-bits"
-                    )
+                "writable_overlay_limitation": {
+                    "observed_writable": True,
+                    "kernel_write_protection": False,
+                    "content_can_change_after_receipt": True,
+                    "scope": "geometry-only-provisional",
+                    "final_launch_authorized": False,
                 },
             }
         )
@@ -582,47 +686,35 @@ class PodQualificationValidationTests(unittest.TestCase):
                     Path(temporary) / "hardware.json", relabelled
                 )
 
-    def test_overlay_data_requires_restore_receipt_and_mode_protection(self) -> None:
+    def test_overlay_data_accepts_sealed_portable_heldout_publications(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            marker = root / ".RESTORE_READY.json"
-            marker.write_text(
-                json.dumps(
-                    {
-                        "format": "transcendent-logic-pretraining-data-restore",
-                        "format_version": 1,
-                        "status": "ready",
-                        "payload_sha256_verified": True,
-                        "packed_file_count": 13_284,
-                        "packed_total_bytes": 129_783_678_021,
-                        "remote_inventory_sha256": "a" * 64,
-                    }
-                ),
-                encoding="utf-8",
+            train, validation, test, common = _portable_heldout_fixture(root)
+            evidence = qualify._inspect_portable_heldout_completion(  # noqa: SLF001
+                validation_order_manifest=validation,
+                test_order_manifest=test,
+                train_manifests=train,
+                common=common,
+                local_data_root=root,
             )
-            payload = root / "payload.bin"
-            payload.write_bytes(b"fixture")
-            receipt = qualify._inspect_restore_readiness(  # noqa: SLF001
-                marker, local_data_root=root
+            self.assertEqual(
+                evidence["kind"], "portable-heldout-publication-completion"
             )
-            self.assertTrue(receipt["payload_sha256_verified"])
+            self.assertFalse(evidence["payloads_rehashed_by_bootstrap"])
+            self.assertFalse(evidence["final_launch_authorized"])
+
+            test_payload = test.parent / "order.bin"
+            test_payload.write_bytes(test_payload.read_bytes() + b"tampered")
             with self.assertRaisesRegex(
-                qualify.PodQualificationError, "chmod -R a-w"
+                qualify.PodQualificationError, "Invalid portable test order"
             ):
-                qualify._inspect_permission_write_protection(root)  # noqa: SLF001
-            marker.chmod(0o444)
-            payload.chmod(0o444)
-            root.chmod(0o555)
-            try:
-                protected = qualify._inspect_permission_write_protection(  # noqa: SLF001
-                    root
+                qualify._inspect_portable_heldout_completion(  # noqa: SLF001
+                    validation_order_manifest=validation,
+                    test_order_manifest=test,
+                    train_manifests=train,
+                    common=common,
+                    local_data_root=root,
                 )
-                self.assertEqual(protected["file_count"], 2)
-                self.assertEqual(protected["directory_count"], 1)
-            finally:
-                root.chmod(0o755)
-                marker.chmod(0o644)
-                payload.chmod(0o644)
 
     def test_deterministic_environment_requires_exact_values_without_secrets(self) -> None:
         environment = {

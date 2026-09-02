@@ -43,6 +43,12 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import launch_pretraining as launch  # noqa: E402
+from pretrain import data as training_data  # noqa: E402
+from pretrain.materialize import (  # noqa: E402
+    FORMAT as MATERIALIZE_FORMAT,
+    FORMAT_VERSION as MATERIALIZE_FORMAT_VERSION,
+    JOURNAL_NAME as MATERIALIZE_JOURNAL_NAME,
+)
 from pretrain.run_authority import (  # noqa: E402
     HARDWARE_FORMAT,
     POD_QUALIFICATION_FORMAT,
@@ -63,6 +69,9 @@ from pretrain.tokenizer_identity import (  # noqa: E402
 FORMAT_VERSION = 1
 WORLD_SIZE = 6
 MINIMUM_PROVISIONAL_MEMLOCK_BYTES = 8 * 1024**2
+PORTABLE_ORDER_SEED = 1_234
+PORTABLE_HELDOUT_MAXIMUM_INPUT_TOKENS = 500_000_000
+PORTABLE_INPUT_WEIGHTS = {"python": 0.4, "other_code": 0.4, "english": 0.2}
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CUDA_VERSION = re.compile(r"^(\d+)\.(\d+)(?:\.\d+)?$")
 _NVIDIA_CUDA_HEADER = re.compile(r"CUDA Version:\s*(\d+\.\d+)")
@@ -799,22 +808,61 @@ def validate_host_observation(
     if not isinstance(data_evidence, dict) or data_evidence.get("status") != "pass":
         raise PodQualificationError("Tokenizer/order path validation did not pass")
     if overlay_exception:
-        immutable_receipt = data_evidence.get("immutable_data_receipt")
-        write_protection = data_evidence.get("write_protection")
+        authentication = data_evidence.get("content_authentication")
+        limitation = data_evidence.get("writable_overlay_limitation")
+        if not isinstance(authentication, dict) or authentication.get("status") not in {
+            "pass",
+            "ready",
+        }:
+            raise PodQualificationError(
+                "Overlay-local provisional data lacks authenticated content evidence"
+            )
+        evidence_kind = authentication.get("kind")
+        if evidence_kind == "authenticated-s3-restore-receipt":
+            valid_authentication = (
+                set(authentication.get("artifact", {}))
+                == {"path", "bytes", "sha256"}
+                and authentication.get("payload_sha256_verified") is True
+            )
+        elif evidence_kind == "portable-heldout-publication-completion":
+            orders = authentication.get("orders")
+            valid_authentication = (
+                authentication.get("producer_contract")
+                == (
+                    "all-nine-packed-payloads-and-provenance-deep-authenticated-"
+                    "before-atomic-heldout-publication"
+                )
+                and authentication.get("restore_receipt_present_at_seal") is False
+                and authentication.get("payloads_rehashed_by_bootstrap") is False
+                and authentication.get("kernel_write_protection") is False
+                and authentication.get("final_launch_authorized") is False
+                and isinstance(orders, dict)
+                and set(orders) == {"validation", "test"}
+                and all(
+                    isinstance(orders[split], dict)
+                    and set(orders[split].get("manifest", {}))
+                    == {"path", "bytes", "sha256"}
+                    and set(orders[split].get("payload", {}))
+                    == {"path", "bytes", "sha256"}
+                    for split in ("validation", "test")
+                )
+            )
+        else:
+            valid_authentication = False
+        if not valid_authentication:
+            raise PodQualificationError(
+                "Overlay-local provisional content-authentication evidence is invalid"
+            )
         if (
-            not isinstance(immutable_receipt, dict)
-            or set(immutable_receipt.get("artifact", {}))
-            != {"path", "bytes", "sha256"}
-            or immutable_receipt.get("payload_sha256_verified") is not True
-            or not isinstance(write_protection, dict)
-            or write_protection.get("policy")
-            not in {
-                "kernel-enforced-read-only-mount",
-                "all-regular-files-and-directories-have-no-write-mode-bits",
-            }
+            not isinstance(limitation, dict)
+            or limitation.get("observed_writable") is not True
+            or limitation.get("kernel_write_protection") is not False
+            or limitation.get("content_can_change_after_receipt") is not True
+            or limitation.get("scope") != "geometry-only-provisional"
+            or limitation.get("final_launch_authorized") is not False
         ):
             raise PodQualificationError(
-                "Overlay-local provisional data lacks immutable restore/write-protection evidence"
+                "Writable-overlay exception is not explicitly recorded as provisional"
             )
     package = observation.get("package_lock")
     if not isinstance(package, dict) or not _SHA256.fullmatch(
@@ -991,46 +1039,257 @@ def _inspect_restore_readiness(
     }
 
 
-def _inspect_permission_write_protection(root: Path) -> dict[str, Any]:
-    """Prove an overlay copy is mode-protected against accidental mutation."""
+def _portable_corpus_root(
+    train_manifests: Mapping[str, Path], *, local_data_root: Path
+) -> Path:
+    if set(train_manifests) != set(training_data.DOMAIN_ORDER):
+        raise PodQualificationError(
+            "Portable completion evidence requires exactly three train manifests"
+        )
+    roots: set[Path] = set()
+    for domain in training_data.DOMAIN_ORDER:
+        path = train_manifests[domain].resolve(strict=True)
+        try:
+            root = path.parents[3]
+        except IndexError as exc:
+            raise PodQualificationError(
+                f"Train packed-manifest path is not canonical: {path}"
+            ) from exc
+        expected = root / "packed" / "train" / domain / "manifest.json"
+        if path != expected:
+            raise PodQualificationError(
+                f"Train packed-manifest path is not canonical: {path}; expected {expected}"
+            )
+        roots.add(root)
+    if len(roots) != 1:
+        raise PodQualificationError("Train packed manifests do not share one corpus root")
+    corpus_root = roots.pop()
+    _require_inside(corpus_root, local_data_root, label="portable corpus root")
+    return corpus_root
 
-    file_count = 0
-    directory_count = 0
-    seen: set[Path] = set()
-    for current, directories, files in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        entries = [current_path]
-        entries.extend(current_path / name for name in directories)
-        entries.extend(current_path / name for name in files)
-        for entry in entries:
-            if entry in seen:
-                continue
-            seen.add(entry)
-            metadata = entry.lstat()
-            if stat.S_ISLNK(metadata.st_mode):
+
+def _inspect_portable_heldout_completion(
+    *,
+    validation_order_manifest: Path,
+    test_order_manifest: Path,
+    train_manifests: Mapping[str, Path],
+    common: Mapping[str, Any],
+    local_data_root: Path,
+) -> dict[str, Any]:
+    """Seal the finalizer's two atomic held-out publications without rescanning data.
+
+    ``PortablePackedFinalizer`` authenticates every packed payload (full local
+    SHA-256 when no restore receipt is supplied), its provenance, and the
+    document indexes *before* publishing either held-out order.  Both canonical
+    order directories therefore form a trusted completion marker.  This check
+    re-hashes their compact order payloads and all referenced packed manifests;
+    it deliberately does not re-read the roughly 130 GB packed payload.
+
+    The resulting evidence is admissible only in the explicitly provisional
+    geometry receipt.  It is not a claim of kernel immutability and can never
+    authorize the production launch.
+    """
+
+    local_data_root = local_data_root.resolve(strict=True)
+    corpus_root = _portable_corpus_root(
+        train_manifests, local_data_root=local_data_root
+    )
+    journal_path = corpus_root / MATERIALIZE_JOURNAL_NAME
+    journal_descriptor = _artifact(
+        journal_path, label="portable packed-corpus journal"
+    )
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8", errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PodQualificationError(f"Cannot read portable packed journal: {exc}") from exc
+    identity = journal.get("identity") if isinstance(journal, dict) else None
+    state = journal.get("state") if isinstance(journal, dict) else None
+    if (
+        not isinstance(journal, dict)
+        or set(journal) != {"format", "format_version", "identity", "state"}
+        or journal.get("format") != MATERIALIZE_FORMAT
+        or journal.get("format_version") != MATERIALIZE_FORMAT_VERSION
+        or not isinstance(identity, dict)
+        or not isinstance(state, dict)
+        or state.get("phase") != "packed"
+        or not _plain_int(state.get("archive_count"), minimum=1)
+        or state.get("completed_archives") != state.get("archive_count")
+    ):
+        raise PodQualificationError(
+            "Portable packed journal does not prove a completed packed phase"
+        )
+    packing = identity.get("packing_configuration")
+    expected_identity = {
+        "tokenizer_manifest_sha256": common.get("tokenizer_manifest_sha256"),
+        "curation_policy_sha256": common.get("curation_policy_sha256"),
+        "selection_manifest_sha256": common.get("selection_manifest_sha256"),
+    }
+    if any(identity.get(field) != value for field, value in expected_identity.items()):
+        raise PodQualificationError(
+            "Portable journal identity differs from the train packed manifests"
+        )
+    if (
+        not isinstance(packing, dict)
+        or packing.get("sequence_length") != common.get("sequence_length")
+        or packing.get("expected_vocab_size") != common.get("vocab_size")
+        or packing.get("expected_eos_token_id") != common.get("eos_token_id")
+    ):
+        raise PodQualificationError(
+            "Portable journal packing configuration differs from packed manifests"
+        )
+
+    supplied_orders = {
+        "validation": validation_order_manifest,
+        "test": test_order_manifest,
+    }
+    orders: dict[str, Any] = {}
+    for split, supplied in supplied_orders.items():
+        expected_path = corpus_root / "orders" / split / "manifest.json"
+        path = _require_inside(
+            supplied, local_data_root, label=f"portable {split} order manifest"
+        )
+        if path != expected_path or path.parent.name != split:
+            raise PodQualificationError(
+                f"Portable {split} order path is not canonical: {path}; "
+                f"expected {expected_path}"
+            )
+        staging = corpus_root / "orders" / f".{split}.portable-part"
+        if staging.exists() or staging.is_symlink():
+            raise PodQualificationError(
+                f"Portable {split} order still has a staging publication: {staging}"
+            )
+        try:
+            order, order_payload_path = training_data._load_order_manifest(  # type: ignore[attr-defined]
+                path, verify_checksum=True
+            )
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise PodQualificationError(
+                f"Invalid portable {split} order publication: {exc}"
+            ) from exc
+        expected_seed = PORTABLE_ORDER_SEED + (
+            1 if split == "validation" else 2
+        )
+        consumption = order.get("training_consumption")
+        budget = order.get("input_token_budget")
+        if (
+            order.get("split") != split
+            or order.get("seed") != expected_seed
+            or order.get("expected_input_token_weights") != PORTABLE_INPUT_WEIGHTS
+            or order.get("tokenizer_manifest_sha256")
+            != common.get("tokenizer_manifest_sha256")
+            or order.get("sequence_length") != common.get("sequence_length")
+            or order.get("vocab_size") != common.get("vocab_size")
+            or order.get("eos_token_id") != common.get("eos_token_id")
+            or not isinstance(consumption, dict)
+            or consumption.get("policy")
+            != "runtime-training-geometry-not-frozen"
+            or consumption.get("frozen_global_microbatch_rows") is not None
+            or consumption.get("frozen_gradient_accumulation_steps") is not None
+            or not isinstance(budget, dict)
+            or budget.get("expected_total") != budget.get("actual_total")
+            or budget.get("tolerance") != 0
+            or not _plain_int(budget.get("actual_total"), minimum=1)
+            or budget["actual_total"] > PORTABLE_HELDOUT_MAXIMUM_INPUT_TOKENS
+        ):
+            raise PodQualificationError(
+                f"Portable {split} order is not the expected held-out publication"
+            )
+
+        referenced_manifests: dict[str, Any] = {}
+        for domain in training_data.DOMAIN_ORDER:
+            descriptor = order["dataset_manifests"][domain]
+            relative = descriptor["path"]
+            if Path(relative).is_absolute():
                 raise PodQualificationError(
-                    f"Local data write-protection tree contains a symlink: {entry}"
+                    f"Portable {split}/{domain} packed path is absolute"
                 )
-            if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)):
+            packed_path = (path.parent / relative).resolve(strict=True)
+            expected_packed = (
+                corpus_root / "packed" / split / domain / "manifest.json"
+            )
+            if packed_path != expected_packed:
                 raise PodQualificationError(
-                    f"Local data write-protection tree contains a special node: {entry}"
+                    f"Portable {split}/{domain} packed path is not canonical"
                 )
-            if metadata.st_mode & 0o222:
+            packed_descriptor = _artifact(
+                packed_path, label=f"portable {split}/{domain} packed manifest"
+            )
+            if packed_descriptor["sha256"] != descriptor["sha256"]:
                 raise PodQualificationError(
-                    "Writable overlay data requires `chmod -R a-w` before provisional "
-                    f"qualification; writable path found: {entry}"
+                    f"Portable {split}/{domain} packed manifest changed after order publication"
                 )
-            if stat.S_ISDIR(metadata.st_mode):
-                directory_count += 1
-            else:
-                file_count += 1
-    if file_count < 1 or directory_count < 1:
-        raise PodQualificationError("Local data write-protection tree is empty")
+            try:
+                packed, _ = training_data._parse_packed_manifest(packed_path)  # type: ignore[attr-defined]
+            except (OSError, TypeError, ValueError) as exc:
+                raise PodQualificationError(
+                    f"Invalid portable {split}/{domain} packed manifest: {exc}"
+                ) from exc
+            expected_packed_identity = {
+                "split": split,
+                "domain": domain,
+                "tokenizer_manifest_sha256": common.get(
+                    "tokenizer_manifest_sha256"
+                ),
+                "curation_policy_sha256": common.get("curation_policy_sha256"),
+                "selection_manifest_sha256": common.get(
+                    "selection_manifest_sha256"
+                ),
+                "sequence_length": common.get("sequence_length"),
+                "vocab_size": common.get("vocab_size"),
+                "eos_token_id": common.get("eos_token_id"),
+            }
+            if any(
+                packed.get(field) != value
+                for field, value in expected_packed_identity.items()
+            ):
+                raise PodQualificationError(
+                    f"Portable {split}/{domain} identity differs from train corpus"
+                )
+            referenced_manifests[domain] = packed_descriptor
+
+        order_payload_descriptor = _artifact(
+            order_payload_path, label=f"portable {split} order payload"
+        )
+        if (
+            order_payload_descriptor["sha256"] != order["order"]["sha256"]
+            or order_payload_descriptor["bytes"] != order["order"]["bytes"]
+        ):
+            raise PodQualificationError(
+                f"Portable {split} order payload changed during inspection"
+            )
+        orders[split] = {
+            "manifest": _artifact(path, label=f"portable {split} order manifest"),
+            "payload": order_payload_descriptor,
+            "rows": order["rows"],
+            "input_tokens": budget["actual_total"],
+            "packed_manifests": referenced_manifests,
+        }
+
+    restore_marker = corpus_root.parent / ".RESTORE_READY.json"
+    if restore_marker.exists() or restore_marker.is_symlink():
+        raise PodQualificationError(
+            "Portable held-out deep-verification evidence is ambiguous because a "
+            f"restore receipt is present: {restore_marker}"
+        )
     return {
-        "policy": "all-regular-files-and-directories-have-no-write-mode-bits",
-        "file_count": file_count,
-        "directory_count": directory_count,
-        "root_device": root.stat().st_dev,
+        "kind": "portable-heldout-publication-completion",
+        "format_version": 1,
+        "status": "pass",
+        "corpus_root": str(corpus_root),
+        "packed_journal": journal_descriptor,
+        "trusted_producer": _artifact(
+            PROJECT_ROOT / "pretrain" / "portable_finalize.py",
+            label="portable finalizer source",
+        ),
+        "orders": orders,
+        "producer_contract": (
+            "all-nine-packed-payloads-and-provenance-deep-authenticated-before-"
+            "atomic-heldout-publication"
+        ),
+        "restore_receipt_present_at_seal": False,
+        "payloads_rehashed_by_bootstrap": False,
+        "kernel_write_protection": False,
+        "final_launch_authorized": False,
     }
 
 
@@ -1142,6 +1401,7 @@ def _inspect_provisional_storage_and_data(
         "english": args.english_packed_manifest,
     }
     records: dict[str, Any] = {}
+    train_manifest_paths: dict[str, Path] = {}
     common: dict[str, Any] | None = None
     for domain, raw_path in manifest_arguments.items():
         path = _require_inside(
@@ -1176,6 +1436,8 @@ def _inspect_provisional_storage_and_data(
                 "vocab_size",
                 "eos_token_id",
                 "tokenizer_manifest_sha256",
+                "curation_policy_sha256",
+                "selection_manifest_sha256",
             ):
                 if payload.get(field) != common.get(field):
                     raise PodQualificationError(
@@ -1185,6 +1447,7 @@ def _inspect_provisional_storage_and_data(
             "manifest": descriptor,
             "rows": payload["rows"],
         }
+        train_manifest_paths[domain] = path
     assert common is not None
     try:
         tokenizer = verify_tokenizer_identity(
@@ -1196,27 +1459,62 @@ def _inspect_provisional_storage_and_data(
         raise PodQualificationError(
             f"Tokenizer/packed-manifest validation failed: {exc}"
         ) from exc
-    immutable_receipt: dict[str, Any] | None = None
-    write_protection: dict[str, Any] | None = None
+    content_authentication: dict[str, Any] | None = None
+    writable_overlay_limitation: dict[str, Any] | None = None
     if args.allow_provisional_overlay_local_storage:
-        if args.immutable_data_receipt is None:
-            raise PodQualificationError(
-                "Overlay-local provisional qualification requires "
-                "--immutable-data-receipt"
-            )
-        immutable_receipt = _inspect_restore_readiness(
-            args.immutable_data_receipt,
-            local_data_root=local_data_root,
+        heldout_arguments = (
+            args.heldout_validation_order_manifest,
+            args.heldout_test_order_manifest,
         )
-        if storage["local_data"]["mount_read_only"] is True:
-            write_protection = {
-                "policy": "kernel-enforced-read-only-mount",
-                "file_count": None,
-                "directory_count": None,
-                "root_device": local_data_root.stat().st_dev,
+        has_heldout = any(path is not None for path in heldout_arguments)
+        has_restore = args.immutable_data_receipt is not None
+        if has_restore == has_heldout:
+            raise PodQualificationError(
+                "Overlay-local provisional qualification requires exactly one "
+                "content-evidence route: --immutable-data-receipt, or both "
+                "--heldout-validation-order-manifest and "
+                "--heldout-test-order-manifest"
+            )
+        if has_restore:
+            assert args.immutable_data_receipt is not None
+            content_authentication = {
+                "kind": "authenticated-s3-restore-receipt",
+                "status": "ready",
+                **_inspect_restore_readiness(
+                    args.immutable_data_receipt,
+                    local_data_root=local_data_root,
+                ),
             }
         else:
-            write_protection = _inspect_permission_write_protection(local_data_root)
+            if not all(path is not None for path in heldout_arguments):
+                raise PodQualificationError(
+                    "Both held-out order manifests are required for portable "
+                    "finalizer completion evidence"
+                )
+            assert args.heldout_validation_order_manifest is not None
+            assert args.heldout_test_order_manifest is not None
+            content_authentication = _inspect_portable_heldout_completion(
+                validation_order_manifest=args.heldout_validation_order_manifest,
+                test_order_manifest=args.heldout_test_order_manifest,
+                train_manifests=train_manifest_paths,
+                common=common,
+                local_data_root=local_data_root,
+            )
+        writable_overlay_limitation = {
+            "observed_writable": storage["local_data"]["mount_read_only"] is not True,
+            "kernel_write_protection": storage["local_data"]["mount_read_only"] is True,
+            "content_can_change_after_receipt": storage["local_data"][
+                "mount_read_only"
+            ]
+            is not True,
+            "scope": "geometry-only-provisional",
+            "final_launch_authorized": False,
+        }
+        if storage["local_data"]["mount_read_only"] is True:
+            # The exception flag is only for the actual writable-overlay case.
+            raise PodQualificationError(
+                "Do not request the overlay exception for a read-only data mount"
+            )
     data = {
         "status": "pass",
         "qualification_scope": (
@@ -1230,6 +1528,8 @@ def _inspect_provisional_storage_and_data(
             "vocab_size": common["vocab_size"],
             "eos_token_id": common["eos_token_id"],
             "tokenizer_manifest_sha256": common["tokenizer_manifest_sha256"],
+            "curation_policy_sha256": common.get("curation_policy_sha256"),
+            "selection_manifest_sha256": common.get("selection_manifest_sha256"),
         },
         "tokenizer": {
             "path": str(tokenizer_root),
@@ -1242,8 +1542,8 @@ def _inspect_provisional_storage_and_data(
             "manifest bytes and tokenizer identity only; final order inspection and "
             "full-data certification remain mandatory for launch"
         ),
-        "immutable_data_receipt": immutable_receipt,
-        "write_protection": write_protection,
+        "content_authentication": content_authentication,
+        "writable_overlay_limitation": writable_overlay_limitation,
     }
     return {"storage": storage, "data": data}
 
@@ -1693,14 +1993,31 @@ def _parser() -> argparse.ArgumentParser:
         "--allow-provisional-overlay-local-storage",
         action="store_true",
         help=(
-            "geometry-only exception for an overlay/local data copy; requires an "
-            "authenticated restore receipt and kernel or mode write protection"
+            "geometry-only exception for a writable overlay/local data copy; "
+            "requires authenticated restore evidence or both atomic held-out "
+            "publications, and never authorizes full training"
         ),
     )
     bootstrap.add_argument(
         "--immutable-data-receipt",
         type=Path,
         help="deep-hashed S3 restore readiness receipt for the local data root",
+    )
+    bootstrap.add_argument(
+        "--heldout-validation-order-manifest",
+        type=Path,
+        help=(
+            "canonical validation order published after portable finalizer deep "
+            "authentication; use together with --heldout-test-order-manifest"
+        ),
+    )
+    bootstrap.add_argument(
+        "--heldout-test-order-manifest",
+        type=Path,
+        help=(
+            "canonical test order published after portable finalizer deep "
+            "authentication; use together with --heldout-validation-order-manifest"
+        ),
     )
     bootstrap.add_argument(
         "--allow-provisional-bounded-memlock",
@@ -1726,6 +2043,8 @@ def _parser() -> argparse.ArgumentParser:
     verify.set_defaults(
         allow_provisional_overlay_local_storage=False,
         immutable_data_receipt=None,
+        heldout_validation_order_manifest=None,
+        heldout_test_order_manifest=None,
         allow_provisional_bounded_memlock=False,
         minimum_provisional_memlock_bytes=None,
     )
