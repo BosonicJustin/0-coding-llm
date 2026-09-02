@@ -507,6 +507,123 @@ class PodQualificationValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(qualify.PodQualificationError, message):
                     qualify.validate_host_observation(host)
 
+    def test_explicit_provisional_overlay_and_bounded_memlock_are_geometry_only(
+        self,
+    ) -> None:
+        host = _host_observation()
+        for name in ("local_work", "local_data"):
+            host["storage"][name]["classification"] = "ephemeral"
+            host["storage"][name]["filesystem_type"] = "overlay"
+        host["storage"]["local_data"]["mount_read_only"] = False
+        host["storage"]["local_data"]["read_only"] = False
+        host["resource_limits"]["memlock"] = {
+            "soft": 8 * 1024**2,
+            "hard": 8 * 1024**2,
+        }
+        host["resource_limits"]["memlock_unlimited"] = False
+        host["admission_policy"] = {
+            "scope": "geometry-only-provisional",
+            "allow_overlay_local_storage": True,
+            "allow_bounded_memlock": True,
+            "minimum_memlock_bytes": 8 * 1024**2,
+            "final_launch_authorized": False,
+        }
+        host["data"].update(
+            {
+                "immutable_data_receipt": {
+                    "artifact": {
+                        "path": "/workspace/data/.RESTORE_READY.json",
+                        "bytes": 1,
+                        "sha256": "f" * 64,
+                    },
+                    "payload_sha256_verified": True,
+                },
+                "write_protection": {
+                    "policy": (
+                        "all-regular-files-and-directories-have-no-write-mode-bits"
+                    )
+                },
+            }
+        )
+        qualify.validate_host_observation(host, provisional=True)
+        with self.assertRaisesRegex(
+            qualify.PodQualificationError, "Local work root"
+        ):
+            qualify.validate_host_observation(host)
+        host["admission_policy"]["minimum_memlock_bytes"] = 8 * 1024**2 + 1
+        with self.assertRaisesRegex(
+            qualify.PodQualificationError, "MEMLOCK"
+        ):
+            qualify.validate_host_observation(host, provisional=True)
+
+    def test_provisional_exception_policy_cannot_be_relabelled_as_final(self) -> None:
+        observation = _observation()
+        provisional = qualify.build_hardware_receipt(
+            observation,
+            nvlink_policy="observe",
+            provisional=True,
+            created_utc="2026-09-01T00:00:00+00:00",
+        )
+        provisional["qualification"]["host"]["admission_policy"] = {
+            "scope": "geometry-only-provisional",
+            "allow_overlay_local_storage": True,
+            "allow_bounded_memlock": False,
+            "minimum_memlock_bytes": None,
+            "final_launch_authorized": False,
+        }
+        relabelled = json.loads(json.dumps(provisional))
+        relabelled["format"] = run_authority.HARDWARE_FORMAT
+        relabelled["status"] = "accepted"
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                qualify.PodQualificationError, "cannot authorize final launch"
+            ):
+                qualify.publish_receipt(
+                    Path(temporary) / "hardware.json", relabelled
+                )
+
+    def test_overlay_data_requires_restore_receipt_and_mode_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / ".RESTORE_READY.json"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "format": "transcendent-logic-pretraining-data-restore",
+                        "format_version": 1,
+                        "status": "ready",
+                        "payload_sha256_verified": True,
+                        "packed_file_count": 13_284,
+                        "packed_total_bytes": 129_783_678_021,
+                        "remote_inventory_sha256": "a" * 64,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = root / "payload.bin"
+            payload.write_bytes(b"fixture")
+            receipt = qualify._inspect_restore_readiness(  # noqa: SLF001
+                marker, local_data_root=root
+            )
+            self.assertTrue(receipt["payload_sha256_verified"])
+            with self.assertRaisesRegex(
+                qualify.PodQualificationError, "chmod -R a-w"
+            ):
+                qualify._inspect_permission_write_protection(root)  # noqa: SLF001
+            marker.chmod(0o444)
+            payload.chmod(0o444)
+            root.chmod(0o555)
+            try:
+                protected = qualify._inspect_permission_write_protection(  # noqa: SLF001
+                    root
+                )
+                self.assertEqual(protected["file_count"], 2)
+                self.assertEqual(protected["directory_count"], 1)
+            finally:
+                root.chmod(0o755)
+                marker.chmod(0o644)
+                payload.chmod(0o644)
+
     def test_deterministic_environment_requires_exact_values_without_secrets(self) -> None:
         environment = {
             **qualify._EXPECTED_ENVIRONMENT,

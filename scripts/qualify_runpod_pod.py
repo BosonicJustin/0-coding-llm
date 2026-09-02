@@ -62,6 +62,7 @@ from pretrain.tokenizer_identity import (  # noqa: E402
 
 FORMAT_VERSION = 1
 WORLD_SIZE = 6
+MINIMUM_PROVISIONAL_MEMLOCK_BYTES = 8 * 1024**2
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CUDA_VERSION = re.compile(r"^(\d+)\.(\d+)(?:\.\d+)?$")
 _NVIDIA_CUDA_HEADER = re.compile(r"CUDA Version:\s*(\d+\.\d+)")
@@ -677,7 +678,9 @@ def validate_gpu_observation(
     }
 
 
-def validate_host_observation(observation: Mapping[str, Any]) -> None:
+def validate_host_observation(
+    observation: Mapping[str, Any], *, provisional: bool = False
+) -> None:
     storage = observation.get("storage")
     if not isinstance(storage, dict):
         raise PodQualificationError("Storage evidence is missing")
@@ -693,10 +696,50 @@ def validate_host_observation(observation: Mapping[str, Any]) -> None:
     assert isinstance(shm, dict)
     if network.get("classification") != "network" or network.get("read_only") is not False:
         raise PodQualificationError("Network root must be a writable network filesystem")
-    if work.get("classification") != "local-or-block" or work.get("read_only") is not False:
-        raise PodQualificationError("Local work root must be writable local/block storage")
-    if data.get("classification") != "local-or-block" or data.get("mount_read_only") is not True:
-        raise PodQualificationError("Local training data must be on a read-only local/block mount")
+    policy = observation.get("admission_policy")
+    if not isinstance(policy, dict):
+        policy = {
+            "scope": "final-launch-strict",
+            "allow_overlay_local_storage": False,
+            "allow_bounded_memlock": False,
+            "minimum_memlock_bytes": None,
+        }
+    overlay_exception = (
+        provisional
+        and policy.get("scope") == "geometry-only-provisional"
+        and policy.get("allow_overlay_local_storage") is True
+    )
+    if overlay_exception:
+        if (
+            work.get("classification") not in {"local-or-block", "ephemeral"}
+            or work.get("filesystem_type") not in {"overlay", "ext4", "xfs"}
+            or work.get("read_only") is not False
+        ):
+            raise PodQualificationError(
+                "Provisional local work must be a writable overlay/local filesystem"
+            )
+        if (
+            data.get("classification") not in {"local-or-block", "ephemeral"}
+            or data.get("filesystem_type") not in {"overlay", "ext4", "xfs"}
+        ):
+            raise PodQualificationError(
+                "Provisional local data must be on the qualified overlay/local filesystem"
+            )
+    else:
+        if (
+            work.get("classification") != "local-or-block"
+            or work.get("read_only") is not False
+        ):
+            raise PodQualificationError(
+                "Local work root must be writable local/block storage"
+            )
+        if (
+            data.get("classification") != "local-or-block"
+            or data.get("mount_read_only") is not True
+        ):
+            raise PodQualificationError(
+                "Local training data must be on a read-only local/block mount"
+            )
     if network.get("device") == work.get("device"):
         raise PodQualificationError("Network and local work roots resolve to the same device")
     if data.get("device") != work.get("device"):
@@ -718,8 +761,33 @@ def validate_host_observation(observation: Mapping[str, Any]) -> None:
         raise PodQualificationError("RLIMIT_NOFILE is below the production floor")
     if limits.get("stack_sufficient") is not True:
         raise PodQualificationError("RLIMIT_STACK is below the production floor")
-    if limits.get("memlock_unlimited") is not True:
+    bounded_memlock_exception = (
+        provisional
+        and policy.get("scope") == "geometry-only-provisional"
+        and policy.get("allow_bounded_memlock") is True
+    )
+    if bounded_memlock_exception:
+        minimum_memlock = policy.get("minimum_memlock_bytes")
+        memlock = limits.get("memlock")
+        if (
+            not _plain_int(minimum_memlock, minimum=MINIMUM_PROVISIONAL_MEMLOCK_BYTES)
+            or not isinstance(memlock, dict)
+            or not _plain_int(memlock.get("soft"), minimum=minimum_memlock)
+            or not _plain_int(memlock.get("hard"), minimum=minimum_memlock)
+        ):
+            raise PodQualificationError(
+                "Bounded provisional RLIMIT_MEMLOCK is below the explicit floor"
+            )
+    elif limits.get("memlock_unlimited") is not True:
         raise PodQualificationError("RLIMIT_MEMLOCK soft limit must be unlimited")
+    if not provisional and (
+        policy.get("scope") != "final-launch-strict"
+        or policy.get("allow_overlay_local_storage") is not False
+        or policy.get("allow_bounded_memlock") is not False
+    ):
+        raise PodQualificationError(
+            "Provisional storage/memlock exceptions can never authorize final launch"
+        )
 
     environment = observation.get("environment")
     if not isinstance(environment, dict) or not environment.get("required"):
@@ -730,6 +798,24 @@ def validate_host_observation(observation: Mapping[str, Any]) -> None:
     data_evidence = observation.get("data")
     if not isinstance(data_evidence, dict) or data_evidence.get("status") != "pass":
         raise PodQualificationError("Tokenizer/order path validation did not pass")
+    if overlay_exception:
+        immutable_receipt = data_evidence.get("immutable_data_receipt")
+        write_protection = data_evidence.get("write_protection")
+        if (
+            not isinstance(immutable_receipt, dict)
+            or set(immutable_receipt.get("artifact", {}))
+            != {"path", "bytes", "sha256"}
+            or immutable_receipt.get("payload_sha256_verified") is not True
+            or not isinstance(write_protection, dict)
+            or write_protection.get("policy")
+            not in {
+                "kernel-enforced-read-only-mount",
+                "all-regular-files-and-directories-have-no-write-mode-bits",
+            }
+        ):
+            raise PodQualificationError(
+                "Overlay-local provisional data lacks immutable restore/write-protection evidence"
+            )
     package = observation.get("package_lock")
     if not isinstance(package, dict) or not _SHA256.fullmatch(
         str(package.get("lock", {}).get("sha256", ""))
@@ -745,7 +831,7 @@ def build_hardware_receipt(
     created_utc: str | None = None,
 ) -> dict[str, Any]:
     gpu_contract = validate_gpu_observation(observation["gpu"], nvlink_policy=nvlink_policy)
-    validate_host_observation(observation["host"])
+    validate_host_observation(observation["host"], provisional=provisional)
     if created_utc is None:
         created_utc = datetime.now(timezone.utc).isoformat()
     try:
@@ -865,6 +951,86 @@ def _storage_record(
         "used_bytes": int(usage.used),
         "free_bytes": int(usage.free),
         "minimum_free_bytes": minimum_free_bytes,
+    }
+
+
+def _inspect_restore_readiness(
+    path: Path, *, local_data_root: Path
+) -> dict[str, Any]:
+    data_root = local_data_root.resolve(strict=True)
+    receipt = _require_inside(path, data_root, label="immutable data receipt")
+    if receipt.parent != data_root:
+        raise PodQualificationError(
+            "Immutable data receipt must be a direct child of local data root"
+        )
+    descriptor = _artifact(receipt, label="immutable data receipt")
+    try:
+        payload = json.loads(receipt.read_text(encoding="utf-8", errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PodQualificationError(f"Cannot read immutable data receipt: {exc}") from exc
+    if not isinstance(payload, dict) or (
+        payload.get("format") != "transcendent-logic-pretraining-data-restore"
+        or payload.get("format_version") != 1
+        or payload.get("status") != "ready"
+        or payload.get("payload_sha256_verified") is not True
+        or not _plain_int(payload.get("packed_file_count"), minimum=1)
+        or not _plain_int(payload.get("packed_total_bytes"), minimum=1)
+        or not isinstance(payload.get("remote_inventory_sha256"), str)
+        or _SHA256.fullmatch(payload["remote_inventory_sha256"]) is None
+    ):
+        raise PodQualificationError(
+            "Immutable data receipt does not prove a completed deep-hashed restore"
+        )
+    return {
+        "artifact": descriptor,
+        "format": payload["format"],
+        "remote_inventory_sha256": payload["remote_inventory_sha256"],
+        "packed_file_count": payload["packed_file_count"],
+        "packed_total_bytes": payload["packed_total_bytes"],
+        "payload_sha256_verified": True,
+    }
+
+
+def _inspect_permission_write_protection(root: Path) -> dict[str, Any]:
+    """Prove an overlay copy is mode-protected against accidental mutation."""
+
+    file_count = 0
+    directory_count = 0
+    seen: set[Path] = set()
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        entries = [current_path]
+        entries.extend(current_path / name for name in directories)
+        entries.extend(current_path / name for name in files)
+        for entry in entries:
+            if entry in seen:
+                continue
+            seen.add(entry)
+            metadata = entry.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise PodQualificationError(
+                    f"Local data write-protection tree contains a symlink: {entry}"
+                )
+            if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)):
+                raise PodQualificationError(
+                    f"Local data write-protection tree contains a special node: {entry}"
+                )
+            if metadata.st_mode & 0o222:
+                raise PodQualificationError(
+                    "Writable overlay data requires `chmod -R a-w` before provisional "
+                    f"qualification; writable path found: {entry}"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                directory_count += 1
+            else:
+                file_count += 1
+    if file_count < 1 or directory_count < 1:
+        raise PodQualificationError("Local data write-protection tree is empty")
+    return {
+        "policy": "all-regular-files-and-directories-have-no-write-mode-bits",
+        "file_count": file_count,
+        "directory_count": directory_count,
+        "root_device": root.stat().st_dev,
     }
 
 
@@ -1030,6 +1196,27 @@ def _inspect_provisional_storage_and_data(
         raise PodQualificationError(
             f"Tokenizer/packed-manifest validation failed: {exc}"
         ) from exc
+    immutable_receipt: dict[str, Any] | None = None
+    write_protection: dict[str, Any] | None = None
+    if args.allow_provisional_overlay_local_storage:
+        if args.immutable_data_receipt is None:
+            raise PodQualificationError(
+                "Overlay-local provisional qualification requires "
+                "--immutable-data-receipt"
+            )
+        immutable_receipt = _inspect_restore_readiness(
+            args.immutable_data_receipt,
+            local_data_root=local_data_root,
+        )
+        if storage["local_data"]["mount_read_only"] is True:
+            write_protection = {
+                "policy": "kernel-enforced-read-only-mount",
+                "file_count": None,
+                "directory_count": None,
+                "root_device": local_data_root.stat().st_dev,
+            }
+        else:
+            write_protection = _inspect_permission_write_protection(local_data_root)
     data = {
         "status": "pass",
         "qualification_scope": (
@@ -1055,6 +1242,8 @@ def _inspect_provisional_storage_and_data(
             "manifest bytes and tokenizer identity only; final order inspection and "
             "full-data certification remain mandatory for launch"
         ),
+        "immutable_data_receipt": immutable_receipt,
+        "write_protection": write_protection,
     }
     return {"storage": storage, "data": data}
 
@@ -1330,8 +1519,27 @@ def collect_observation(args: argparse.Namespace) -> dict[str, Any]:
         PROJECT_ROOT / "requirements-wandb.txt", label="W&B requirements"
     )
     script = _artifact(Path(__file__).resolve(strict=True), label="qualification script")
+    provisional = args.command == "bootstrap"
+    admission_policy = {
+        "scope": (
+            "geometry-only-provisional" if provisional else "final-launch-strict"
+        ),
+        "allow_overlay_local_storage": bool(
+            provisional and args.allow_provisional_overlay_local_storage
+        ),
+        "allow_bounded_memlock": bool(
+            provisional and args.allow_provisional_bounded_memlock
+        ),
+        "minimum_memlock_bytes": (
+            args.minimum_provisional_memlock_bytes
+            if provisional and args.allow_provisional_bounded_memlock
+            else None
+        ),
+        "final_launch_authorized": not provisional,
+    }
     host = {
         **storage_data,
+        "admission_policy": admission_policy,
         "environment": environment_evidence,
         "resource_limits": _inspect_resource_limits(
             minimum_nofile=args.minimum_nofile,
@@ -1349,7 +1557,7 @@ def collect_observation(args: argparse.Namespace) -> dict[str, Any]:
     }
     # Reject bad mounts, headroom, ulimits, data, environment, or W&B before
     # initializing CUDA contexts or spending time on the six-process smoke.
-    validate_host_observation(host)
+    validate_host_observation(host, provisional=provisional)
     local_work_root = Path(storage_data["storage"]["local_work"]["path"])
     gpu = _collect_gpu_observation(
         environment=os.environ,
@@ -1481,6 +1689,32 @@ def _parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--python-packed-manifest", type=Path, required=True)
     bootstrap.add_argument("--other-code-packed-manifest", type=Path, required=True)
     bootstrap.add_argument("--english-packed-manifest", type=Path, required=True)
+    bootstrap.add_argument(
+        "--allow-provisional-overlay-local-storage",
+        action="store_true",
+        help=(
+            "geometry-only exception for an overlay/local data copy; requires an "
+            "authenticated restore receipt and kernel or mode write protection"
+        ),
+    )
+    bootstrap.add_argument(
+        "--immutable-data-receipt",
+        type=Path,
+        help="deep-hashed S3 restore readiness receipt for the local data root",
+    )
+    bootstrap.add_argument(
+        "--allow-provisional-bounded-memlock",
+        action="store_true",
+        help=(
+            "geometry-only exception for finite RLIMIT_MEMLOCK; the observed limit "
+            "and explicit floor remain in the provisional receipt"
+        ),
+    )
+    bootstrap.add_argument(
+        "--minimum-provisional-memlock-bytes",
+        type=parse_bytes,
+        default=MINIMUM_PROVISIONAL_MEMLOCK_BYTES,
+    )
 
     verify = commands.add_parser(
         "verify", help="run final read-only pod checks and publish a hardware receipt"
@@ -1489,6 +1723,12 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--train-order-manifest", type=Path, required=True)
     verify.add_argument("--validation-order-manifest", type=Path, required=True)
     verify.add_argument("--eval-batches", type=int, required=True)
+    verify.set_defaults(
+        allow_provisional_overlay_local_storage=False,
+        immutable_data_receipt=None,
+        allow_provisional_bounded_memlock=False,
+        minimum_provisional_memlock_bytes=None,
+    )
 
     worker = commands.add_parser("_nccl-worker", help=argparse.SUPPRESS)
     worker.add_argument("--output-dir", type=Path, required=True)

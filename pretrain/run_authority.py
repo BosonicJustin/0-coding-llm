@@ -752,6 +752,27 @@ def _inspect_hardware_contract(
     if created.tzinfo is None:
         raise RunAuthorityError("Qualified hardware created_utc must be timezone-aware")
     _validate_pod_qualification(contract)
+    admission_policy = contract["qualification"]["host"].get("admission_policy")
+    if expected_format == HARDWARE_FORMAT and admission_policy is not None:
+        if (
+            not isinstance(admission_policy, dict)
+            or admission_policy.get("scope") != "final-launch-strict"
+            or admission_policy.get("allow_overlay_local_storage") is not False
+            or admission_policy.get("allow_bounded_memlock") is not False
+            or admission_policy.get("final_launch_authorized") is not True
+        ):
+            raise RunAuthorityError(
+                "Geometry-only storage/memlock exceptions cannot authorize final launch"
+            )
+    if expected_format == PROVISIONAL_HARDWARE_FORMAT and admission_policy is not None:
+        if (
+            not isinstance(admission_policy, dict)
+            or admission_policy.get("scope") != "geometry-only-provisional"
+            or admission_policy.get("final_launch_authorized") is not False
+        ):
+            raise RunAuthorityError(
+                "Provisional hardware admission policy is not geometry-only"
+            )
     return {
         "contract": bound["artifact"],
         "sidecar": bound["sidecar"],
