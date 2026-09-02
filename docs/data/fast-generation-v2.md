@@ -1,49 +1,45 @@
 # Fast corpus generation v2
 
-This is the current data-publication plan. It replaces exact, per-domain quota
-selection inside SQLite with a much cheaper boundary: keep every eligible
-canonical document, then make the packed `order.bin` files authoritative for
-the 40/40/20 mixture and model-input budgets. The original dataset generation
-is frozen; the v2 generation is built beside it.
+This is the generation-v2 design and build record. It replaced exact,
+per-domain quota selection inside SQLite with a cheaper boundary: keep every
+eligible canonical document, then make the packed `order.bin` files
+authoritative for the 40/40/20 mixture and model-input budgets. The original
+dataset generation remains frozen; generation v2 was built beside it.
 
-## Current server state
+For current corpus identity and launch status, use the
+[pre-training corpus record](final-corpus-record.md). The operational commands
+below are retained as build history and recovery documentation; they are not
+instructions to restart completed collection, preprocessing, curation,
+selection, token-cache, or packing jobs.
 
-State below was checked at **2026-09-01 06:40:36 UTC**.
+## Current outcome — 2026-09-02
 
-- `/workspace/dataset` is the frozen v1 dataset root. No collection,
-  preprocessing, curation, or token-materialization job is writing to it.
-- The selective hard-link clone completed successfully at 06:30:51 UTC and
-  atomically published `/workspace/dataset-other-code-topup-v2`. Its manifest
-  SHA-256 is
-  `815c6256f0354f1b6a6cc524d96e745331c68afd02f3e72b19bb2d66ed2b3de9`.
-  It records 21,181 hard links totaling 72,337,391,686 bytes and five copied
-  control files.
-- The other-code collector was relaunched at 06:36:50 UTC in tmux
-  `stack-v3-topup-v2` using `/opt/coding-model-data-venv`. All eight workers are
-  active. Committed other-code supply advanced from 25,952,231,562 to
-  26,066,335,409 tokens while Python remained exactly 25,770,142,666 tokens.
-  A 06:32 launch failed on missing dependencies before touching data.
-- The dedicated data environment passed 20 focused collector/clone tests. Its
-  sorted `pip freeze` is
-  `/workspace/dataset-other-code-topup-v2/logs/data-environment.freeze.txt`,
-  SHA-256
-  `c84c69f333754bfbd97b3ec851ec132916466a06424043349ae273429ef81bfb`.
-  Key versions are `datasets==4.8.5`, `huggingface_hub==1.29.0`,
-  `pyarrow==25.0.1`, `tokenizers==0.23.1`, and `zstandard==0.25.0`.
-- Low-priority incremental preprocessing is active in tmux
-  `preprocess-topup-v2-live`. It already authenticated and fingerprinted new
-  archive `raw/other_code/part-000550.tar.zst` (27,966 documents and
-  28,085,641 tokens) with zero benchmark hits; aggregate telemetry indexing is
-  deliberately deferred.
-- No curator is active. The previous local-WAL database is a stopped audit
-  source, not a corpus publication: it is at
-  `/local/curation/selection-fast-local-v2/curation.sqlite3` with its retained
-  WAL and SHM sidecars. An unfinished NFS snapshot directory is not authority.
-- **No token-ID materialization has started.** There are no production
-  `tokens.bin`, packed shards, or production `order.bin` files yet.
+- Collection, per-archive preprocessing, corpus curation, selection-v7, the
+  closed-world raw-token cache, and all nine split/domain packed streams are
+  complete. The packed journal is at phase `packed` with all 4,568 archives
+  committed.
+- The portable recovery copy is
+  `s3://transcendent-logic-data-618079239540/coding-llm/pretraining/2026-09-02-packed-v1/`.
+  It is deliberately a **packed-only** artifact: it contains the authenticated
+  packed data and provenance needed for recovery, but no final split orders or
+  top-level production corpus manifest.
+- That portable artifact has been restored with checksum verification to
+  six-H100 pod-local NVMe at `/root/transcendent-logic-data`. The checkout used
+  to qualify and consume it is `/root/0-coding-llm`.
+- Deterministic train, validation, and test orders and the final top-level
+  corpus manifest remain pending six-GPU geometry qualification and portable
+  finalization. No stage may retokenize documents or rewrite packed shards.
+- The first training trajectory is one pass through a selected 40/40/20 order:
+  exactly 12,836,736 unique packed-row references, 66,858 complete
+  192-row optimizer updates, and 52,579,270,656 input positions. Selection is
+  without replacement; no row repeats. Packed surplus is reserved for later
+  experiments rather than appended to this run.
+- Fuzzy/semantic near-deduplication remains deliberately deferred for this
+  baseline. The completed corpus uses Stack v3's upstream code deduplication
+  plus global exact and normalized-identical canonicalization.
 
-The clone hard-links immutable raw archives, tokenizer files, source manifests,
-collector restart state, quota ledgers, and completed preprocess
+The completed clone hard-links immutable raw archives, tokenizer files, source
+manifests, collector restart state, quota ledgers, and completed preprocess
 reports/fingerprints. It copies mutable closure/status files to independent
 inodes and excludes logs, locks, temporary files, telemetry SQLite, curation,
 and packed outputs. Existing hard-linked files must never be edited in place.
@@ -68,7 +64,7 @@ test "$(sha256sum "$DATA_V2/logs/data-environment.freeze.txt" | cut -d' ' -f1)" 
   c84c69f333754bfbd97b3ec851ec132916466a06424043349ae273429ef81bfb
 ```
 
-## Exact audited supply
+## Historical pre-top-up supply audit
 
 The WAL-aware, read-only audit completed in 255.2 seconds with `safe: true`,
 zero accounting anomalies, 49,461,115 eligible canonical documents, and
@@ -97,10 +93,12 @@ eligible **content-token** counts and document counts are:
 | **All splits** | **Other code** | **15,697,799** | **16,811,351,831** |
 | **All splits** | **English** | **10,580,632** | **12,478,718,733** |
 
-These are pre-EOS source counts, not packed model-input counts. The current
-other-code train supply cannot support 21.032B other-code training tokens. At a
-strict 40/40/20 mixture, it limits the current train corpus to about 41.32B
-tokens before row/EOS effects.
+These are pre-EOS source counts from the frozen v1 audit, not the completed v2
+packed supply and not model-input counts. They explained the other-code top-up:
+at that point, other-code train supply could not support 21.032B other-code
+training tokens and limited a strict 40/40/20 corpus to about 41.32B tokens
+before row/EOS effects. The completed v2 packed supply is recorded in
+[the canonical corpus record](final-corpus-record.md#packed-supply).
 
 ## Why the v2 other-code target is 35B
 
@@ -124,17 +122,17 @@ headroom assumption:
 | Headroom over the point estimate | 27.914% |
 | Expected eligible-train surplus if yield repeats | 1,257,406,143 |
 
-The target is a capacity estimate, not a guarantee: new documents can be
-filtered or lose global canonical selection. The post-v2 supply audit decides
-whether the final 52.58B order is feasible.
+The target was a capacity estimate rather than a guarantee: new documents could
+be filtered or lose global canonical selection. The completed v2 packed supply
+now proves that the selected 52,579,270,656-position order is feasible.
 
-## Ordered v2 pipeline
+## Ordered v2 pipeline record
 
-### 1. Resume only other-code collection
+### 1. Other-code collection — complete
 
-This launch is now active. The command is recorded for exact recovery; do not
-execute a second copy while `stack-v3-topup-v2` or its collector processes are
-alive. It uses the v2 root and the same versioned quota file everywhere:
+The collector completed against the 35B cumulative other-code target while
+Python and English remained frozen. The launch command is retained for exact
+provenance; do not rerun it against the closed corpus:
 
 ```bash
 PROJECT_ROOT=/workspace/0-coding-llm
@@ -148,33 +146,18 @@ tmux new-session -d -s stack-v3-topup-v2 -c "$PROJECT_ROOT" \
     $PROJECT_ROOT/scripts/run_download.sh"
 ```
 
-The cloned checkpoint and plan resume at their exact shard/repository cursors.
-Python already exceeds its unchanged target, so the collector must report it as
-full and skip it; only `other_code` may gain archives/tokens. Stop immediately
-if Python totals or files increase. The collector atomically replaces the v2
-closure record only after both unchanged Python and new other-code targets are
-satisfied.
+The cloned checkpoint and plan resumed at their exact shard/repository cursors.
+Python was already above its unchanged target and was skipped; only
+`other_code` gained archives/tokens. The collector published the v2 closure
+record only after the unchanged Python/English targets and the new other-code
+target were satisfied.
 
-Monitor without touching v1:
+### 2. Incremental preprocessing — complete
 
-```bash
-tmux has-session -t stack-v3-topup-v2
-pgrep -af 'collect_stack_v3_parallel.py|collect_stack_v3.py'
-tail -n 50 /workspace/dataset-other-code-topup-v2/logs/collector-topup-v2.log
-/opt/coding-model-data-venv/bin/python \
-  /workspace/0-coding-llm/scripts/quota_tracker.py \
-  --root /workspace/dataset-other-code-topup-v2 \
-  --config /workspace/0-coding-llm/configs/data_quotas_other_code_topup_v2.json \
-  status --phase collection --json
-```
-
-### 2. Incrementally preprocess new archives
-
-Run this only after collection closes. The v2 clone already contains immutable
-reports and fingerprints for v1 archives, so the preprocessor verifies and
-skips those completed archive identities and processes only newly finalized
-other-code archives. The quota path must remain the same v2 file used by the
-collector.
+After collection closed, the preprocessor verified and skipped immutable v1
+archive identities and processed only newly finalized other-code archives. It
+used the same v2 quota file as the collector. The historical launch command is
+retained for provenance, not restart:
 
 ```bash
 PROJECT_ROOT=/workspace/0-coding-llm
@@ -188,15 +171,15 @@ tmux new-session -d -s preprocess-topup-v2 -c "$PROJECT_ROOT" \
     $PROJECT_ROOT/scripts/run_preprocess.sh"
 ```
 
-Completion requires closed-collection status, exact ledger/raw/report/
-fingerprint coverage, and zero errors. The optional telemetry SQLite index is
-not required.
+Completion was accepted only with closed-collection status, exact
+ledger/raw/report/fingerprint coverage, and zero errors. The optional telemetry
+SQLite index was not required.
 
-### 3. Rebuild canonicalization and leakage-safe groups
+### 3. Canonicalization and leakage-safe groups — complete
 
 Do **not** copy or incrementally patch the v1 curation SQLite database. New
 other-code documents can collide with existing exact/normalized hashes and can
-change which deterministic canonical wins. Therefore v2 needs a fresh curation
+change which deterministic canonical wins. Therefore v2 used a fresh curation
 generation over all hard-linked old inputs plus all new inputs, including full
 inventory, quality/benchmark reasons, global exact/normalized canonicalization,
 and leakage-safe group-to-split assignment.
@@ -207,14 +190,14 @@ the local exact/normalized pass and benchmark propagation still run. Preserve
 raw inputs so English fuzzy near-dedup can be tested later if results or a
 duplicate audit justify it.
 
-The production command and completion checks are now frozen in
+The production command and completion checks used for the build are frozen in
 [Fast all-eligible curation runbook](fast-all-eligible-curation.md).
 It uses `--fast-all-eligible-handoff`: exact quotas and legacy decisions are
 never created, periodic full NFS snapshots are suppressed, and one final
 immutable LocalSQLiteStore snapshot is returned for the v7 publisher. Never
 point it at the stopped v1 database.
 
-### 4. Publish all eligible canonical documents
+### 4. Publish all eligible canonical documents — complete
 
 Exact quota selection inside SQLite is skipped. The v7 publisher reads only a
 complete immutable curation snapshot and emits, per raw archive, a compact keep
@@ -224,28 +207,33 @@ is 0 for a recorded rejection. Every kept document is complete—there is no
 quota-ending token prefix and no `quota_overflow` rejection. Partial state from
 the abandoned exact selector is non-authoritative.
 
-The resulting selection manifest records all nine split/domain document and
-content-token totals. It does **not** claim a 40/40/20 mixture. Publisher and
-materializer v7 qualification is still in progress, so do not launch this stage
-until its production contract tests pass and the exact snapshot paths are
-frozen in the run authority.
+The resulting authenticated selection-v7 manifest records all nine
+split/domain document and content-token totals. It does **not** claim a
+40/40/20 mixture; that remains an order-level property. All kept documents are
+complete.
 
-### 5. Tokenize, pack, then construct authoritative orders
+### 5. Token cache and packing complete; authoritative orders pending
 
-Materialization reads each kept full document, rechecks its pinned token count,
-tokenizes it once with the frozen StarCoder2 tokenizer, inserts EOS boundaries,
-and writes separate packed streams for Python, other code, and English in each
-split. Only then does deterministic packed order v4 select rows without
-replacement and globally shuffle their references.
+Materialization read each kept full document from the authenticated raw-token
+cache, rechecked its pinned token count, inserted EOS boundaries, and wrote
+separate packed streams for Python, other code, and English in each split. The
+cache, all nine packed manifests, immutable token/start shards, and packed-phase
+journal are complete and authenticated. Deterministic packed order v4 is the
+remaining step; it will select existing rows without replacement and globally
+shuffle their references after geometry qualification.
 
 `orders/<split>/order.bin` plus its manifest—not the raw proportions, the v7
-keep counts, or directory order—is the mixture/budget authority. Train targets
-the largest optimizer-update-aligned whole-row prefix at or below 52.58B input
-tokens with 40/40/20 row allocation. Validation and test each target the largest
-feasible balanced 40/40/20 whole-row cap at or below 0.5B. If a held-out domain
-cannot supply its nominal share, use the smaller balanced cap; do not download
-more data solely to make a language-model held-out split exactly 0.5B.
+keep counts, or directory order—will be the mixture/budget authority. The
+frozen train decision is 12,836,736 unique rows, 66,858 complete updates at 192
+rows per update, and exactly 52,579,270,656 input positions under the 40/40/20
+allocation, with no replacement and no repeats. Validation and test each use
+the largest feasible balanced 40/40/20 whole-row cap at or below 0.5B. If a
+held-out domain cannot supply its nominal share, use the smaller balanced cap;
+do not download more data solely to make a language-model held-out split
+exactly 0.5B.
 
-No token-ID materialization may start before the v2 collection, incremental
-preprocessing, full new canonical/group build, all-eligible publication, and
-their production validations are complete.
+Finalization must operate only on the existing packed rows. It must not rebuild
+the token cache, retokenize source documents, reorder tokens within a row,
+change split membership, or rewrite any packed shard. Until the order manifests
+and top-level corpus manifest are published and authenticated, the packed-only
+artifact is recoverable data but is not launch authority.

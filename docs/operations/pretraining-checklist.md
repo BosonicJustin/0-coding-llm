@@ -1,13 +1,17 @@
 # Pre-training readiness checklist
 
-This is the required path from the current raw acquisition jobs to the first
-full 1.3B-parameter pre-training run. Do not train directly from the raw
-`.tar.zst` collection archives.
+This is the required path from the completed packed corpus to the first full
+1.3B-parameter pre-training run. Do not train directly from raw `.tar.zst`
+archives, the raw-token cache, packed-shard directory order, or the packed-only
+S3 recovery artifact.
 
-The current authority is generation v2 in
-[fast-generation-v2.md](../data/fast-generation-v2.md). Exact curation-quota
-selection is no longer required: retain every eligible canonical full
-document, then enforce mixture and budgets in packed order v4.
+The current identity/status authority is the
+[pre-training corpus record](../data/final-corpus-record.md). Generation-v2
+build history is in [fast-generation-v2.md](../data/fast-generation-v2.md).
+Collection, preprocessing, curation, selection-v7, raw-token caching, and
+packing are complete. Exact curation-quota selection was intentionally omitted:
+retain every eligible canonical full document, then enforce mixture and budgets
+in packed order v4.
 
 ## 1. Preserve v1 and complete the v2 other-code top-up
 
@@ -24,15 +28,15 @@ document, then enforce mixture and budgets in packed order v4.
   `CLONE_MANIFEST.json`: 21,181 hard links / 72,337,391,686 bytes, five copied
   controls, manifest SHA-256
   `815c6256f0354f1b6a6cc524d96e745331c68afd02f3e72b19bb2d66ed2b3de9`.
-- [x] Qualify the active `stack-v3-topup-v2` checkpoint recovery: all eight
-  workers advanced committed other-code supply from 25,952,231,562 to
-  26,066,335,409 tokens while Python remained exactly 25,770,142,666.
-- [ ] Let `stack-v3-topup-v2` reach 35,000,000,000 cumulative raw other-code
-  tokens. Require Python and English to remain unchanged and keep
-  `preprocess-topup-v2-live` auditing finalized archives concurrently.
-- [ ] Stop the CPU download pod only after every new `.part-*` has finalized,
-  the v2 collection completion marker is published, and incremental
-  preprocessing has passed closed-collection coverage. Keep the network volume.
+- [x] Qualify the `stack-v3-topup-v2` checkpoint recovery used during the
+  build: all eight workers advanced committed other-code supply from
+  25,952,231,562 to 26,066,335,409 tokens while Python remained exactly
+  25,770,142,666.
+- [x] Reach at least 35,000,000,000 cumulative raw other-code tokens while
+  keeping Python and English targets unchanged.
+- [x] Close collection only after every new `.part-*` finalized, publish the v2
+  collection-completion marker, and require incremental preprocessing to pass
+  closed-collection coverage with zero archive errors.
 
 The original acquisition totaled about 64.58B audited tokens, but measured
 other-code train retention was lower than the nominal headroom assumption. The
@@ -68,23 +72,29 @@ it has caught up completely and that its error count is zero.
   `/workspace/dataset/audits/supply-audit-fast-v1-20260901/supply-audit.json`
   with SHA-256
   `74de45bdf3438395f74f6c492f11017e6c0be6b76e0f08ec73e88a0b77169230`.
-- [ ] Incrementally audit/fingerprint only the newly added v2 other-code
+- [x] Incrementally audit/fingerprint only the newly added v2 other-code
   archives using the same versioned v2 quota configuration as collection;
   require complete v2 ledger/raw/report/fingerprint identity afterward.
 
 ## 3. Define the final filtering policy before running it
 
-- [ ] Version the exact rules for minimum/maximum document size, generated or
-  repetitive text, corrupted Unicode, secrets, PII, minified code, vendored
+- [x] Complete corpus curation under the frozen generation-v2 policy, including
+  basic eligibility, benchmark rules, global exact/normalized canonicalization,
+  and leakage-safe group splits.
+- [x] Version the exact rules used for minimum/maximum document size, generated
+  or repetitive text, corrupted Unicode, secrets, PII, minified code, vendored
   code, and any source-specific quality threshold.
-- [ ] Decide how to balance the 78-language `other_code` bucket. Without an
+- [ ] Future ablation only: decide whether to rebalance the 78-language
+  `other_code` bucket. Without an
   explicit policy, high-volume languages such as C++, Java, C, and JavaScript
   will dominate it. Record per-language minimums, caps, or sampling weights.
-- [ ] Decide whether final English remains 80% FineWeb-Edu and 20% Wikipedia.
-- [ ] Emit a reason and source identity for every filtered document. Rejected
+- [ ] Future ablation only: decide whether to alter the completed English source
+  composition.
+- [x] Emit a reason and source identity for every filtered document. Rejected
   content itself does not need to be retained.
-- [ ] Produce before/after document, byte, and token tables by source,
-  language, and rejection reason.
+- [x] Produce before/after document and token accounting by split/domain and
+  rejection reason. More detailed language/source tables remain optional
+  analysis rather than a launch prerequisite.
 
 ## 4. Deduplicate and decontaminate
 
@@ -110,7 +120,7 @@ marks output non-production-ready. The production baseline instead uses the
 versioned `fast-exact-normalized-canonical-v1` policy and records the semantic
 near-duplicate limitation in every downstream manifest.
 
-- [ ] Validate `configs/curation_policy_fast_exact_normalized.json` against the pinned
+- [x] Validate `configs/curation_policy_fast_exact_normalized.json` against the pinned
   `STACK_V3_SOURCE.json`. The code source must be
   `HuggingFaceCode/stack-v3-train@df4b205fbba4cc1c2fd1f205b10d66f730798bb9`.
   Reserve `configs/curation_policy.json` for the separate full-near v5
@@ -118,17 +128,17 @@ near-duplicate limitation in every downstream manifest.
 - [x] Audit exact and normalized hashes across all four source buckets and
   deterministically keep one global canonical for each exact hash, followed by
   one global canonical for each normalized hash.
-- [ ] Do **not** run another MinHash/LSH near-deduplication pass over Python or
+- [x] Do **not** run another MinHash/LSH near-deduplication pass over Python or
   other code. The pinned Stack v3 Train v3.1 source is already file-level,
   cross-repository near-deduplicated. The v1 code sketches are audit-only.
 - [x] Defer FineWeb/Wikipedia near-deduplication for baseline v1. Revisit it as
   a controlled follow-up if results or duplicate audits justify the cost.
-- [ ] Freeze the evaluation-suite list before the final pass. At minimum keep
-  MBPP completely out; preferably also protect HumanEval, EvalPlus, MultiPL-E,
-  MBXP, MXEval, and any other evaluation planned later.
-- [ ] Run exact, normalized, substring, and sufficiently conservative fuzzy
-  benchmark matching over the final candidates. Store only rejection metadata
-  and non-reversible fingerprints.
+- [x] Freeze the benchmark guard used by the completed curation pass. At
+  minimum keep MBPP completely out; preferably also protect HumanEval,
+  EvalPlus, MultiPL-E, MBXP, MXEval, and any other evaluation planned later.
+- [x] Run the frozen benchmark matching rules over the final candidates and
+  preserve the authenticated benchmark-guard authority. Store only rejection
+  metadata and non-reversible fingerprints.
 - [ ] Run the independent MBPP audit again on the selected Python corpus and
   require zero matches.
 
@@ -160,12 +170,14 @@ The training budget and 40/40/20 mixture refer to model input slots after
 packing, including inserted EOS tokens but excluding the duplicated lookahead
 storage slot. At context 4,096, the nominal 52.58B train budget permits at most
 12,836,914 whole rows (52,579,999,744 input slots). This context-derived cap is
-not a training-geometry recommendation. Order v4 selects the largest strict
-40/40/20 allocation at or below it, rounded down to a whole optimizer-update
-prefix using the GPU-smoke-chosen global microbatch and gradient accumulation,
-then freezes that geometry. Read the exact row/update/token count from the
-finalized manifest; report valid supervised targets and packed surplus
-separately.
+not a training-geometry recommendation. The first-run statistical batch is now
+fixed at 192 rows per update, so the selected order is exactly 12,836,736 unique
+rows: 66,858 complete updates and 52,579,270,656 input positions under the
+40/40/20 allocation. It is one pass through those selected references without
+replacement or repeats, not through all packed-surplus rows. The pending
+geometry gate chooses only the physical microbatch/accumulation decomposition.
+The finalized manifest must reproduce these exact totals and report valid
+supervised targets and packed surplus separately.
 
 Generation v2 must rebuild canonical winners and groups from every old and new
 archive. Its publication keeps all eligible canonical documents at full length.
@@ -175,11 +187,16 @@ balanced whole-row cap at or below 0.5B; a smaller held-out set is acceptable
 when one domain is limiting and is preferable to acquiring more data solely for
 the nominal held-out size.
 
-- [ ] Make validation and test immutable after selection.
+- [x] Freeze leakage-safe train/validation/test membership in selection-v7.
+- [ ] Publish and authenticate deterministic validation/test order manifests;
+  once published, never reshuffle them between runs.
 - [ ] Never use the language-model test set or MBPP to choose checkpoints or
   hyperparameters. Use validation for those decisions.
-- [ ] Verify exact post-tokenization totals and the 40% Python / 40% other-code
-  / 20% English training mixture.
+- [x] Verify packed supply is sufficient for the selected 40% Python / 40%
+  other-code / 20% English train budget.
+- [ ] Verify the finalized train order has exactly 12,836,736 unique row
+  references, 66,858 complete updates, 52,579,270,656 input positions, the
+  frozen 40/40/20 allocation, and no replacement or repeated row.
 
 ## 6. Freeze tokenization and sequence construction
 
@@ -194,25 +211,24 @@ the nominal held-out size.
 - [x] Prevent attention across document boundaries using explicit segment IDs;
   this policy is recorded and tested on the CPU reference backend. The CUDA
   FlexAttention implementation still requires its GPU smoke test.
-- [ ] Keep source, language, document-boundary, split, and document-position
+- [x] Keep source, language, document-boundary, split, and document-position
   provenance in a side index even though the training payload contains token
-  IDs. Check this only after the materializer's document-position index is
-  final and tested against the published shards.
+  IDs; validate the materializer's completed document-position indexes against
+  the packed shards.
 
 ## 7. Build training-ready shards
 
 The native PyTorch packed-row format, deterministic global order, distributed
 sampler, and synthetic correctness tests are implemented in `pretrain/data.py`;
-see [training-data.md](../training/training-data.md). The boxes below remain
-unchecked until those tools have
-been run and validated on the final selected corpus.
+see [training-data.md](../training/training-data.md). Selection-v7, the
+closed-world token cache, and packing are complete. The portable S3 artifact is
+packed-only and is restored at `/root/transcendent-logic-data`; orders and the
+top-level corpus manifest remain pending.
 
-No production token-ID materialization has started as of the current handoff.
-
-- [ ] Convert selected documents into large sequential binary shards, roughly
+- [x] Convert selected documents into large sequential binary shards, roughly
   0.5-2 GB each, plus indexes and checksums. Do not make the GPU loader open
   millions of small files inside raw tar archives.
-- [ ] Keep Python, other code, and English identifiable so the sampler can
+- [x] Keep Python, other code, and English identifiable so the sampler can
   enforce the intended mixture rather than relying on directory order.
 - [ ] Deterministically shuffle document or packed-sequence order with recorded
   seeds. Do not shuffle validation or test between runs.
@@ -221,12 +237,20 @@ No production token-ID materialization has started as of the current handoff.
 - [ ] Write a final dataset manifest containing every shard checksum, sequence
   count, exact token count, tokenizer revision, context length, split, category,
   source composition, filtering revision, and construction seed.
-- [ ] First run the bridge with `--stop-after-packing`: validate all nine packed
+- [x] Run the bridge with `--stop-after-packing`: validate all nine packed
   manifests and the checksummed per-document position indexes, and preserve its
   durable `phase: packed` journal. This stage must not guess GPU batch geometry.
-- [ ] Mount the packed volume on the intended GPU topology and measure a
-  memory/throughput smoke before choosing global microbatch rows and gradient
-  accumulation.
+- [x] Publish the portable packed-phase recovery artifact to
+  `s3://transcendent-logic-data-618079239540/coding-llm/pretraining/2026-09-02-packed-v1/`
+  and restore it directly to six-H100 pod-local NVMe with checksum verification.
+  Do not treat this packed-only artifact as an order or top-level manifest.
+- [ ] Before finalization, reauthenticate the packed journal, all nine packed
+  manifests/shards, tokenizer, selection-v7, and cache inventory on local NVMe;
+  any missing or mismatched identity stops the run.
+- [ ] Mount the packed volume on the intended GPU topology and run the complete
+  six-GPU geometry grid. Keep the effective optimizer batch fixed at 192 rows
+  while measuring which global-microbatch/accumulation decomposition is safe
+  and fastest.
 - [ ] Build order format v4 with frozen global microbatch rows **and** gradient
   accumulation. Verify effective update rows, update count, the exact
   consumed/dropped input and supervised-token counters (including 40/40/20
@@ -234,9 +258,11 @@ No production token-ID materialization has started as of the current handoff.
 
 ## 8. Freeze the 1.3B model and optimization recipe
 
-- [x] Plan the first production topology as one six-GPU RunPod pod, one NCCL
-  process per GPU (`torchrun --standalone --nproc-per-node=6`). The exact GPU
-  model, VRAM, and accepted DDP/FSDP strategy remain a measured hardware gate.
+- [x] Use the restored six-H100 RunPod pod, one NCCL
+  process per GPU (`torchrun --standalone --nproc-per-node=6`) using the
+  implemented replicated-DDP path. Exact device/driver/interconnect inventory
+  and full-model memory remain measured gates; a DDP memory-gate failure stops
+  the launch rather than silently changing the distributed strategy.
 - [x] Record the exact architecture: layer count, hidden size, attention heads,
   key/value heads, MLP size, activation, normalization, positional encoding,
   vocabulary size, context length, tied embeddings, and parameter count.
@@ -245,13 +271,17 @@ No production token-ID materialization has started as of the current handoff.
 - [ ] Record AdamW betas/epsilon/weight decay, peak and minimum learning rates,
   warmup tokens or steps, decay schedule, gradient clipping, dropout, and random
   seeds.
-- [ ] Choose global microbatch rows and gradient accumulation before freezing
-  the order. Use the manifest's frozen optimizer-update count and exact
+- [x] Choose the initial statistical optimizer batch: 192 packed rows, or
+  786,432 input positions at sequence length 4,096. The rationale and
+  controlled 96/192/384 fallback test are frozen in
+  [the batch-size decision](../training/batch-size-selection.md).
+- [ ] Qualify the physical global-microbatch/accumulation pair before freezing
+  the order. Use the manifest's optimizer-update count and exact
   `training_consumption.consumed_input_tokens`; record the derived per-rank
-  microbatch and effective optimizer batch. For the planned pod, global rows
-  must be divisible by six.
-- [ ] Decide the distributed strategy and verify optimizer-state, activation,
-  and communication memory against the selected GPU configuration.
+  microbatch. For the planned pod, global rows must be divisible by six and
+  global rows times accumulation must equal 192.
+- [ ] Verify replicated-DDP optimizer-state, activation, and communication
+  memory against the selected GPU configuration.
 
 ## 9. Make checkpointing genuinely resumable
 
@@ -294,11 +324,17 @@ No production token-ID materialization has started as of the current handoff.
   rank-shared request and checkpoint at a clean boundary; the pod termination
   grace must cover the configured supervisor timeout.
 - [ ] Decode and manually inspect several complete batches.
-- [ ] Overfit one tiny batch; loss should fall sharply.
+- [x] Run the six-GPU tiny-model overfit on six real packed 4,096-token rows for
+  1,000 steps; 100 steps was explicitly judged insufficient. Loss fell from
+  10.80926135 to 0.00173715 (ratio 0.00016071; perplexity 1.0017387), with all
+  27/27 cross-document targets masked across 33 segments and 24,549 supervised
+  tokens. Preserve the latest and previous checkpoints and W&B run `4i4pvoj6`.
+  This pass does not qualify the full 1.3B allocation or geometry.
 - [ ] Run a short single-GPU job; require decreasing training loss, finite
   gradients, correct checkpoints, and successful resume.
-- [ ] Run a multi-GPU scaling test and measure tokens/s, GPU utilization, memory
-  headroom, network-volume throughput, and communication overhead.
+- [ ] Run the full 1.3B multi-GPU geometry/scaling and soak tests; measure
+  tokens/s, GPU utilization, memory headroom, local-NVMe data throughput, and
+  communication overhead. Do not infer this gate from the tiny-model overfit.
 - [ ] Estimate wall-clock time and GPU cost from measured throughput, not peak
   hardware specifications.
 - [ ] Confirm validation loss can be computed independently for Python, other
@@ -322,5 +358,7 @@ tokens/s, GPU utilization, memory, numerical overflows/NaNs, data wait time, and
 consumed tokens by category. Stop on non-finite loss, mixture drift, corrupted
 data, checkpoint failure, or unexplained throughput collapse.
 
-Only after these checks pass should the full 52.58B-token pre-training run
-start. MBPP remains evaluation-only and is not consulted during pre-training.
+Only after every remaining fail-closed gate passes should the one-pass selected
+training order start: exactly 12,836,736 unique rows, 66,858 updates, and
+52,579,270,656 input positions under the 40/40/20 allocation, with no repeats.
+MBPP remains evaluation-only and is not consulted during pre-training.

@@ -1,11 +1,18 @@
 # Production corpus materialization
 
-> **Current generation-v2 boundary:** token-ID materialization has not started.
-> The intended input is an all-eligible identity-v7 keep-bitmap publication,
-> not the stopped v1 exact-quota selection. Packed order v4 will be the only
-> authority for 40/40/20 and final model-input caps. The v5/v6 commands later in
-> this document are retained as tested historical contracts and must not be run
-> for v2. See [fast-generation-v2.md](fast-generation-v2.md).
+> **Current generation-v2 boundary (2026-09-02):** selection-v7, the
+> authenticated raw-token cache, and all nine packed split/domain streams are
+> complete. The packed-only S3 recovery artifact has been restored to six-H100
+> pod-local NVMe. Orders and the top-level production manifest remain pending
+> geometry qualification and portable finalization. The v5/v6 material below
+> is retained only as tested historical contract documentation and must not be
+> run for v2. See the [canonical corpus record](final-corpus-record.md).
+
+The portable copy is
+`s3://transcendent-logic-data-618079239540/coding-llm/pretraining/2026-09-02-packed-v1/`;
+the verified local restore is `/root/transcendent-logic-data`. The S3 copy is a
+recovery source for the completed packed phase, not a final train-order or
+run-authority publication.
 
 `pretrain/materialize.py` and `scripts/materialize_training_corpus.py` are the
 cold-path bridge from immutable raw archives plus completed curation decisions
@@ -16,16 +23,17 @@ those choices; the bridge validates them,
 re-reads the selected raw text, tokenizes it with the pinned tokenizer, packs
 it, and publishes deterministic order-v4 artifacts.
 
-The v7 branch has the same raw-source verification, pinned tokenizer, packing,
+The completed v7 branch has the same raw-source verification, pinned tokenizer, packing,
 boundary-isolation, provenance, restart, and checksum obligations. Its
 selection input differs: an archive bitmap says keep/reject for each complete
 source document, `selected_tokens` must equal `source_tokens`, and observed
 nine-cell totals are supply rather than exact quotas. The optional authenticated
 raw-token-cache adapter replaces UTF-8 decode/tokenizer replay, but no selection,
-split, EOS, packing, boundary, order, or provenance authority. Its local
-multi-archive byte-identity and crash/corruption contracts are green; a frozen
-durable v2 selection, cache inventory, and real-archive benchmark are still
-required before production launch.
+split, EOS, packing, boundary, order, or provenance authority. Its
+multi-archive byte-identity and crash/corruption contracts passed. The durable
+v2 selection, closed-world cache inventory, packed manifests, immutable shards,
+and packed-phase journal now exist; only geometry-bound orders and the final
+top-level corpus manifest remain to be published.
 
 ## Required completed inputs
 
@@ -117,10 +125,11 @@ For every raw archive, in canonical inventory order, the materializer:
 5. Emits immutable `uint16` token shards and packed little-endian start-bit
    shards, with row counts, token accounting, SHA-256 checksums, and the last
    committed source cursor in each packed manifest.
-6. Builds a separate deterministic global order for each split, validates all
-   packed and order manifests, writes source/policy/tokenizer/fingerprint
-   provenance sidecars, and finally publishes the top-level `manifest.json` and
-   `manifest.sha256`.
+6. After geometry is qualified, builds a separate deterministic global order
+   for each split, validates all packed and order manifests, writes
+   source/policy/tokenizer/fingerprint provenance sidecars, and finally
+   publishes the top-level `manifest.json` and `manifest.sha256`. This is the
+   only algorithm step still pending for the current packed artifact.
 
 The output layout is:
 
@@ -141,6 +150,12 @@ packed-v1/
   manifest.json
   manifest.sha256
 ```
+
+For the current portable artifact, the `packed/` payload, packed manifests,
+tokenizer/provenance authorities, and packed journal are complete. The
+`orders/` files and top-level `manifest.json`/`manifest.sha256` shown above are
+future finalization outputs, not contents that may be assumed present in the
+packed-only S3 backup.
 
 ## Token caps and packed surplus
 
@@ -166,6 +181,13 @@ balanced prefix at or below 52.58B input tokens. Validation and test each use
 the largest feasible balanced 40/40/20 whole-row cap at or below 0.5B. A
 held-out split may therefore be smaller than 0.5B when one domain is limiting;
 do not acquire extra raw data solely to fill a language-model held-out cap.
+
+The first-run train choice is now frozen at exactly 12,836,736 unique row
+references: 66,858 complete optimizer updates of 192 rows and
+52,579,270,656 input positions under the 40/40/20 allocation. Order
+construction is without replacement, so no packed row repeats. This is one
+pass through the selected order, not one pass through every surplus packed row.
+The order payload and manifest are still pending geometry-bound finalization.
 
 `rows`, `rows_per_domain`, `input_tokens_per_domain`, and
 `valid_loss_tokens_per_domain` describe only the selected order. The manifest's
@@ -201,10 +223,12 @@ bytes. Never modify or manually merge a live output directory.
 
 ## Commands
 
-Stage 1 is safe to run before choosing GPU batch geometry. It finishes and
-fully validates all nine packed outputs and document-position indexes, leaves a
-durable `phase: packed` journal, and intentionally publishes neither orders nor
-the top-level production manifest:
+Stage 1 has completed for generation v2. It validated all nine packed outputs
+and document-position indexes, left a durable `phase: packed` journal, and
+intentionally published neither orders nor the top-level production manifest.
+The following original command is retained as interface history; do not run it
+against the current restored packed corpus or use its historical v5/v6 paths as
+v2 authority:
 
 ```bash
 /opt/coding-model-venv/bin/python \
@@ -221,13 +245,16 @@ the top-level production manifest:
   --tokenizer-max-document-bytes 67108864
 ```
 
-Re-run that command to resume. The batch controls may be tuned without changing
-output identity. Do not guess global microbatch rows or accumulation at this
-stage.
+During the build, rerunning that command resumed the archive-boundary journal,
+and batch controls could be tuned without changing output identity. The current
+artifact is already packed and must not be retokenized or rewritten.
 
-Next, mount the packed volume on the intended GPU configuration and run the
-memory/throughput smoke. Substitute its measured integer values in this stage-2
-template and rerun the **same output path** without `--stop-after-packing`:
+The remaining stage is geometry-bound order finalization. The packed artifact
+is already restored at `/root/transcendent-logic-data` on the six-H100 pod.
+Qualify the fixed 192-row optimizer batch there, then substitute only accepted
+geometry values in the finalization interface. The historical stage-2 template
+below documents the required semantic inputs; its old server paths are not a
+command to run verbatim:
 
 ```bash
 /opt/coding-model-venv/bin/python \
@@ -248,8 +275,8 @@ the final manifest. Once an order or final manifest is published, a mismatched
 geometry/configuration is rejected. Do not use
 `--diagnostic-allow-observed-mixture` or any zero token cap for the final corpus.
 
-For a bounded end-to-end smoke test, use a distinct disposable output path so
-it cannot be mistaken for the final corpus:
+The historical bounded end-to-end smoke contract used a distinct disposable
+output path so it could not be mistaken for the final corpus:
 
 ```bash
 /opt/coding-model-venv/bin/python \
@@ -268,7 +295,13 @@ selected-stream-token-including-EOS, and raw-MiB rates.
 Re-running it advances from the checkpoint; removing `--max-archives` completes
 packing on that same disposable output. A smoke result is not publishable.
 
-## Performance and capacity planning
+## Historical performance and capacity planning
+
+The estimates below were used before the completed build. Actual packed payload
+identity and size now come from the canonical record: 13,284 packed files and
+129,783,678,021 bytes, carried in a 17,883-object S3 publication totaling
+129,807,857,131 bytes. Do not use the estimates below as current completion or
+storage evidence.
 
 Raw archive reading remains one sequential pass per archive. Selected documents
 are accumulated into bounded batches and passed to tokenizer `encode_batch`;

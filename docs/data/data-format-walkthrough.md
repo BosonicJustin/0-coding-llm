@@ -20,6 +20,31 @@ The stages are deliberately separate. In particular, the SQLite database does
 not contain source text or token arrays, and the training hot path does not
 read Parquet, tar archives, JSONL, SQLite, or raw text.
 
+## Current physical boundary — 2026-09-02
+
+Collection, preprocessing, corpus-wide curation, selection-v7, the closed-world
+raw-token cache, and all nine packed split/domain streams are complete. The
+portable packed-phase recovery artifact is
+`s3://transcendent-logic-data-618079239540/coding-llm/pretraining/2026-09-02-packed-v1/`;
+it has been restored with checksum verification to
+`/root/transcendent-logic-data` on the six-H100 pod.
+
+That S3 artifact is intentionally **packed-only**. In the end-to-end diagram,
+the pipeline has reached `packed token/start shards`; deterministic split-order
+files and the final top-level corpus manifest remain pending geometry
+qualification and finalization. Their documented shapes below describe the
+contract they must satisfy, not files already present in the portable backup.
+Finalization may select and shuffle existing row references only: it may not
+retokenize, rewrite a packed shard, reorder tokens inside a row, or change split
+membership.
+
+The first train-order decision is one pass through 12,836,736 unique selected
+row references under the 40/40/20 allocation. At 192 rows per optimizer update,
+that is 66,858 complete updates and exactly 52,579,270,656 input positions.
+Selection is without replacement, so no row repeats. Fuzzy/semantic near-dedup
+remains a deliberately deferred baseline ablation; completed curation includes
+global exact and normalized-identical canonicalization.
+
 ## 1. Source Parquet
 
 Parquet is a typed, compressed, column-oriented table format. Hugging Face uses
@@ -246,8 +271,8 @@ packed/{train,validation,test}/{python,other_code,english}/
   shard-NNNNNN.starts.bin
   manifest.json
 orders/{train,validation,test}/
-  order.bin
-  manifest.json
+  order.bin       # pending geometry-bound finalization
+  manifest.json   # pending geometry-bound finalization
 provenance/documents/{train,validation,test}/{python,other_code,english}/
   archive-NNNNNN.jsonl.zst
   manifest.json
@@ -257,16 +282,20 @@ provenance/
   tokenizer.json
   fingerprints.json
   raw_token_cache.json  # cache-backed route only
-manifest.json
-manifest.sha256
+manifest.json     # pending top-level finalization
+manifest.sha256   # pending top-level finalization
 ```
 
-`order.bin` stores little-endian `<u8` row references. The high eight bits
-encode the domain ID and the low 56 bits encode the domain-local row ID. It
+When finalized, `order.bin` stores little-endian `<u8` row references. The high
+eight bits encode the domain ID and the low 56 bits encode the domain-local row
+ID. It
 globally shuffles selected physical rows while enforcing the intended 40%
 Python, 40% other-code, and 20% English mixture. Shuffling never changes token
 order inside one physical row, but it can change traversal order between rows,
-including separate row-sized chunks originating from one long document.
+including separate row-sized chunks originating from one long document. The
+current packed-only artifact contains no authoritative `order.bin`; consumers
+must fail closed rather than infer traversal order from shard or directory
+order.
 
 ## 8. Runtime PyTorch tensors
 
