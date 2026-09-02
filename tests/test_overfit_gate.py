@@ -353,6 +353,8 @@ class OverfitGateArtifactTest(unittest.TestCase):
             output = Path(temporary) / "overfit"
             argv = [
                 str(OVERFIT_SCRIPT),
+                "--device",
+                "cpu",
                 "--output-dir",
                 str(output),
                 "--wandb-mode",
@@ -381,6 +383,8 @@ class OverfitGateArtifactTest(unittest.TestCase):
             result_path.write_text('{"status":"passed"}\n', encoding="utf-8")
             argv = [
                 str(OVERFIT_SCRIPT),
+                "--device",
+                "cpu",
                 "--output-dir",
                 str(output),
                 "--wandb-mode",
