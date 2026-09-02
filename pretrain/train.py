@@ -60,6 +60,7 @@ Precision = Literal["float32", "bfloat16"]
 WandbMode = Literal["disabled", "offline", "online"]
 _REQUIRED_BATCH_KEYS = ("input_ids", "position_ids", "document_ids", "labels")
 _DETERMINISTIC_CUBLAS_WORKSPACE_CONFIGS = frozenset((":4096:8", ":16:8"))
+_VALIDATION_AT_START_METADATA_KEY = "validation_at_start_completed"
 
 
 def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -380,6 +381,37 @@ class MetricLogger(Protocol):
     def finish(self) -> None: ...
 
 
+def _validated_metric_payload(
+    metrics: Mapping[str, float | int],
+) -> dict[str, float | int]:
+    """Copy one scalar record after enforcing the JSON/W&B metric contract."""
+
+    payload = dict(metrics)
+    invalid_names = [name for name in payload if not isinstance(name, str) or not name]
+    if invalid_names:
+        raise TypeError("Metric names must be non-empty strings")
+    invalid_types = [
+        name
+        for name, value in payload.items()
+        if isinstance(value, bool) or type(value) not in (int, float)
+    ]
+    if invalid_types:
+        raise TypeError(
+            "Metric values must be plain int or float scalars: "
+            + ", ".join(sorted(invalid_types))
+        )
+    nonfinite = [
+        name
+        for name, value in payload.items()
+        if type(value) is float and not math.isfinite(value)
+    ]
+    if nonfinite:
+        raise ValueError(
+            "Metric values must be finite: " + ", ".join(sorted(nonfinite))
+        )
+    return payload
+
+
 class NullLogger:
     def log(self, metrics: Mapping[str, float | int]) -> None:
         del metrics
@@ -392,7 +424,8 @@ class ConsoleLogger:
     """Emit one machine-readable JSON object per logged optimizer step."""
 
     def log(self, metrics: Mapping[str, float | int]) -> None:
-        print(json.dumps(dict(metrics), sort_keys=True), flush=True)
+        payload = _validated_metric_payload(metrics)
+        print(json.dumps(payload, sort_keys=True, allow_nan=False), flush=True)
 
     def finish(self) -> None:
         pass
@@ -401,6 +434,10 @@ class ConsoleLogger:
 class CompositeLogger:
     def __init__(self, *loggers: MetricLogger) -> None:
         self.loggers = list(loggers)
+        # Failed loggers stop receiving records, but still need one final
+        # lifecycle call so buffered W&B records and local run state are not
+        # abandoned when the surrounding training run exits.
+        self._finish_loggers = list(loggers)
 
     def log(self, metrics: Mapping[str, float | int]) -> None:
         healthy: list[MetricLogger] = []
@@ -418,7 +455,7 @@ class CompositeLogger:
         self.loggers = healthy
 
     def finish(self) -> None:
-        for logger in self.loggers:
+        for logger in self._finish_loggers:
             try:
                 logger.finish()
             except Exception as exc:
@@ -500,7 +537,7 @@ class WandbLogger:
 
     def log(self, metrics: Mapping[str, float | int]) -> None:
         if self._run is not None:
-            self._run.log(dict(metrics))
+            self._run.log(_validated_metric_payload(metrics))
 
     def log_evidence_artifact(
         self,
@@ -1346,17 +1383,96 @@ class ValidationRunner:
             rows_value,
             model_loss_tokens_value,
         ) = values[:5]
+        reduced_counters = {
+            "supervised tokens": loss_tokens_value,
+            "input tokens": input_tokens_value,
+            "rows": rows_value,
+            "model supervised tokens": model_loss_tokens_value,
+        }
+        if any(
+            not math.isfinite(value) or value < 0 or not value.is_integer()
+            for value in reduced_counters.values()
+        ):
+            raise ValueError(
+                "Validation reduced counters must be finite non-negative integers"
+            )
         loss_tokens = int(loss_tokens_value)
         input_tokens = int(input_tokens_value)
         rows = int(rows_value)
         if completed_batches != self.max_batches or loss_tokens < 1:
             raise RuntimeError("Validation did not produce the configured complete sample")
+        expected_rows = self.max_batches * self.sampler.global_microbatch_rows
+        expected_input_tokens = (
+            expected_rows * int(self.sampler.manifest["sequence_length"])
+        )
+        if rows != expected_rows or input_tokens != expected_input_tokens:
+            raise ValueError(
+                "Validation global row/input-token accounting disagrees with the "
+                "configured immutable prefix"
+            )
+        if loss_tokens > input_tokens:
+            raise ValueError("Validation supervised tokens exceed input tokens")
         if int(model_loss_tokens_value) != loss_tokens:
             raise ValueError(
                 "Model validation-token counter disagrees with packed batches"
             )
         if not math.isfinite(loss_sum):
             raise FloatingPointError("Non-finite validation loss")
+        width = len(DOMAIN_ORDER)
+        cursor = 5
+        domain_loss_sums = [
+            float(value) for value in values[cursor : cursor + width]
+        ]
+        cursor += width
+        raw_domain_loss_tokens = values[cursor : cursor + width]
+        cursor += width
+        raw_domain_input_tokens = values[cursor : cursor + width]
+        cursor += width
+        raw_domain_rows = values[cursor : cursor + width]
+        domain_counter_values = (
+            raw_domain_loss_tokens
+            + raw_domain_input_tokens
+            + raw_domain_rows
+        )
+        if any(
+            not math.isfinite(value) or value < 0 or not value.is_integer()
+            for value in domain_counter_values
+        ):
+            raise ValueError(
+                "Validation per-domain counters must be finite non-negative integers"
+            )
+        if any(not math.isfinite(value) for value in domain_loss_sums):
+            raise FloatingPointError("Non-finite validation per-domain loss")
+        domain_loss_tokens = [int(value) for value in raw_domain_loss_tokens]
+        domain_input_tokens = [int(value) for value in raw_domain_input_tokens]
+        domain_rows = [int(value) for value in raw_domain_rows]
+        sequence_length = int(self.sampler.manifest["sequence_length"])
+        if (
+            sum(domain_rows) != rows
+            or sum(domain_input_tokens) != input_tokens
+            or sum(domain_loss_tokens) != loss_tokens
+            or any(
+                domain_input_tokens[index]
+                != domain_rows[index] * sequence_length
+                for index in range(width)
+            )
+            or any(
+                domain_loss_tokens[index] > domain_input_tokens[index]
+                for index in range(width)
+            )
+        ):
+            raise ValueError(
+                "Validation per-domain counters do not match global totals"
+            )
+        if not math.isclose(
+            math.fsum(domain_loss_sums),
+            loss_sum,
+            rel_tol=1e-5,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                "Validation per-domain loss sums do not match the global loss sum"
+            )
         elapsed = time.perf_counter() - started
         if self.world_size > 1:
             elapsed_tensor = torch.tensor(
@@ -1364,6 +1480,8 @@ class ValidationRunner:
             )
             dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
             elapsed = float(elapsed_tensor)
+        if not math.isfinite(elapsed) or elapsed <= 0:
+            raise RuntimeError("Validation elapsed time must be finite and positive")
         token_loss = loss_sum / loss_tokens
         metrics: dict[str, float | int] = {
             "train/step": int(train_step),
@@ -1380,29 +1498,18 @@ class ValidationRunner:
             "validation/input_tokens_per_second": input_tokens / elapsed,
             "validation/supervised_tokens_per_second": loss_tokens / elapsed,
         }
-        width = len(DOMAIN_ORDER)
-        cursor = 5
-        domain_loss_sums = values[cursor : cursor + width]
-        cursor += width
-        domain_loss_tokens = values[cursor : cursor + width]
-        cursor += width
-        domain_input_tokens = values[cursor : cursor + width]
-        cursor += width
-        domain_rows = values[cursor : cursor + width]
         for index, domain in enumerate(DOMAIN_ORDER):
-            tokens = int(domain_loss_tokens[index])
+            tokens = domain_loss_tokens[index]
             metrics.update(
                 {
-                    f"validation/{domain}/rows": int(domain_rows[index]),
-                    f"validation/{domain}/input_tokens": int(
-                        domain_input_tokens[index]
-                    ),
+                    f"validation/{domain}/rows": domain_rows[index],
+                    f"validation/{domain}/input_tokens": domain_input_tokens[index],
                     f"validation/{domain}/supervised_tokens": tokens,
                     f"validation/{domain}/row_fraction": (
-                        int(domain_rows[index]) / rows
+                        domain_rows[index] / rows
                     ),
                     f"validation/{domain}/input_token_fraction": (
-                        int(domain_input_tokens[index]) / input_tokens
+                        domain_input_tokens[index] / input_tokens
                     ),
                     f"validation/{domain}/supervised_token_fraction": (
                         tokens / loss_tokens
@@ -1549,6 +1656,7 @@ class Trainer:
                 "eval_at_start": config.eval_at_start,
             }
         )
+        self._validate_validation_at_start_metadata(self.checkpoint_metadata)
         self.stop_controller = stop_controller
         self.stop_signal = 0
         self._preserve_previous_on_next_save = False
@@ -1573,6 +1681,33 @@ class Trainer:
     @property
     def raw_model(self) -> torch.nn.Module:
         return _raw_model(self.model)
+
+    def _validate_validation_at_start_metadata(
+        self,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        completed = metadata.get(_VALIDATION_AT_START_METADATA_KEY, False)
+        if type(completed) is not bool:
+            raise ValueError(
+                "Checkpoint validation-at-start completion marker must be boolean"
+            )
+        if completed and (
+            self.validation_runner is None or not self.config.eval_at_start
+        ):
+            raise ValueError(
+                "Checkpoint records validation-at-start without matching runtime "
+                "authority"
+            )
+
+    def _validation_at_start_due(self) -> bool:
+        return bool(
+            self.validation_runner is not None
+            and self.config.eval_at_start
+            and self.state.completed_steps == 0
+            and not self.checkpoint_metadata.get(
+                _VALIDATION_AT_START_METADATA_KEY, False
+            )
+        )
 
     def _model_config(self) -> dict[str, Any]:
         config = getattr(self.raw_model, "config", None)
@@ -1867,6 +2002,7 @@ class Trainer:
             not isinstance(key, str) for key in metadata
         ):
             raise ValueError("Checkpoint metadata must be a string-keyed dictionary")
+        self._validate_validation_at_start_metadata(metadata)
         if candidate_state.completed_steps > self.config.max_steps:
             raise ValueError("Checkpoint is beyond max_steps")
         if self.validation_runner is None:
@@ -2157,6 +2293,33 @@ class Trainer:
         dist.all_reduce(signal_tensor, op=dist.ReduceOp.MAX)
         return int(signal_tensor)
 
+    def _honor_stop_request(
+        self,
+        requested_signal: int,
+        *,
+        checkpoint_already_committed: bool = False,
+    ) -> bool:
+        """Checkpoint and report one all-rank stop request at a safe boundary."""
+
+        if not requested_signal:
+            return False
+        if self.checkpoint_path is None:
+            raise RuntimeError(
+                "A graceful stop was requested but no checkpoint path is configured"
+            )
+        already_reported = bool(self.stop_signal)
+        self.stop_signal = int(requested_signal)
+        if not checkpoint_already_committed:
+            self.save_checkpoint()
+        if not already_reported:
+            self._log_metrics(
+                {
+                    "train/step": self.state.completed_steps,
+                    "system/graceful_stop_signal": self.stop_signal,
+                }
+            )
+        return True
+
     def evaluate_validation(self) -> dict[str, float | int]:
         if self.validation_runner is None:
             raise RuntimeError("No validation runner is configured")
@@ -2165,8 +2328,17 @@ class Trainer:
             train_step=self.state.completed_steps,
         )
         self._log_metrics(metrics)
-        if self.state.completed_steps > self.state.last_validated_step:
+        validation_progress_changed = False
+        if self.state.completed_steps == 0 and self.config.eval_at_start:
+            if not self.checkpoint_metadata.get(
+                _VALIDATION_AT_START_METADATA_KEY, False
+            ):
+                self.checkpoint_metadata[_VALIDATION_AT_START_METADATA_KEY] = True
+                validation_progress_changed = True
+        elif self.state.completed_steps > self.state.last_validated_step:
             self.state.last_validated_step = self.state.completed_steps
+            validation_progress_changed = True
+        if validation_progress_changed:
             # Validation progress is checkpoint authority even though it does
             # not alter weights/RNG. Force the next save at this same step to
             # publish the newly completed evaluation cursor.
@@ -2202,14 +2374,12 @@ class Trainer:
         if not self.state.completed_steps <= target_step <= self.config.max_steps:
             raise ValueError("until_step must be between current progress and max_steps")
         initial_stop = self._distributed_stop_signal()
-        if initial_stop:
-            if self.checkpoint_path is None:
-                raise RuntimeError(
-                    "A graceful stop was requested but no checkpoint path is configured"
-                )
-            self.stop_signal = initial_stop
-            self.save_checkpoint()
+        if self._honor_stop_request(initial_stop):
             return {}
+        if self._validation_at_start_due():
+            self.evaluate_validation()
+            if self._honor_stop_request(self._distributed_stop_signal()):
+                return {}
         # A preemption checkpoint deliberately wins over a potentially long
         # held-out pass. Catch up that evaluation on resume before another
         # optimizer update (or before returning from an already-final state).
@@ -2217,6 +2387,8 @@ class Trainer:
             self.evaluate_validation()
             if self.checkpoint_path is not None:
                 self.save_checkpoint()
+            if self._honor_stop_request(self._distributed_stop_signal()):
+                return {}
         if target_step == self.state.completed_steps:
             return {}
         self._validate_batch_source(batches)
@@ -2376,6 +2548,18 @@ class Trainer:
                 raise ValueError(
                     "Per-domain optimizer-window counters do not match global totals"
                 )
+            if domain_stats is not None and not math.isclose(
+                math.fsum(
+                    float(values["loss_sum"])
+                    for values in domain_stats.values()
+                ),
+                global_loss_sum,
+                rel_tol=1e-5,
+                abs_tol=1e-6,
+            ):
+                raise ValueError(
+                    "Per-domain optimizer-window loss sums do not match global loss"
+                )
             if self.training_geometry is not None:
                 expected_window_inputs = (
                     update_rows * self.training_geometry["sequence_length"]
@@ -2446,6 +2630,15 @@ class Trainer:
                 time.perf_counter() - started,
                 local_data_wait_seconds,
             )
+            if not math.isfinite(elapsed) or elapsed <= 0:
+                raise RuntimeError("Training step time must be finite and positive")
+            if (
+                not math.isfinite(data_wait_seconds)
+                or data_wait_seconds < 0
+                or not math.isfinite(data_wait_fraction)
+                or not 0 <= data_wait_fraction <= 1
+            ):
+                raise RuntimeError("Training data-wait timing is invalid")
             token_loss = global_loss_sum / global_loss_tokens
             input_throughput = global_input_tokens / elapsed
             loss_throughput = global_loss_tokens / elapsed
@@ -2594,19 +2787,7 @@ class Trainer:
             if self.state.completed_steps % self.config.log_every == 0:
                 self._log_metrics(last_metrics)
             requested_stop = self._distributed_stop_signal()
-            if requested_stop:
-                if self.checkpoint_path is None:
-                    raise RuntimeError(
-                        "A graceful stop was requested but no checkpoint path is configured"
-                    )
-                self.stop_signal = requested_stop
-                self.save_checkpoint()
-                self._log_metrics(
-                    {
-                        "train/step": self.state.completed_steps,
-                        "system/graceful_stop_signal": requested_stop,
-                    }
-                )
+            if self._honor_stop_request(requested_stop):
                 break
             if self._validation_due():
                 self.evaluate_validation()
@@ -2619,19 +2800,7 @@ class Trainer:
             # A signal received during validation or checkpoint I/O is handled
             # without waiting for another optimizer update.
             requested_stop = self._distributed_stop_signal()
-            if requested_stop:
-                if self.checkpoint_path is None:
-                    raise RuntimeError(
-                        "A graceful stop was requested but no checkpoint path is configured"
-                    )
-                self.stop_signal = requested_stop
-                self.save_checkpoint()
-                self._log_metrics(
-                    {
-                        "train/step": self.state.completed_steps,
-                        "system/graceful_stop_signal": requested_stop,
-                    }
-                )
+            if self._honor_stop_request(requested_stop):
                 break
         if (
             self.training_geometry is not None
@@ -2844,18 +3013,12 @@ def _finalize_training_run(trainer: Trainer) -> int:
     caller restoring the process signal handlers.
     """
 
-    stop_already_reported = bool(trainer.stop_signal)
     trainer.save_checkpoint()
     requested_stop = trainer._distributed_stop_signal()
-    if requested_stop:
-        trainer.stop_signal = requested_stop
-        if not stop_already_reported:
-            trainer._log_metrics(
-                {
-                    "train/step": trainer.state.completed_steps,
-                    "system/graceful_stop_signal": requested_stop,
-                }
-            )
+    if trainer._honor_stop_request(
+        requested_stop,
+        checkpoint_already_committed=True,
+    ):
         return 128 + requested_stop
     return 0
 
@@ -3303,12 +3466,6 @@ def _run_initialized_training(
         assert loader is not None and sampler is not None
 
         with stop_controller:
-            if (
-                trainer.validation_runner is not None
-                and train_config.eval_at_start
-                and trainer.state.completed_steps == 0
-            ):
-                trainer.evaluate_validation()
             trainer.train(loader)
             exit_code = _finalize_training_run(trainer)
         return exit_code

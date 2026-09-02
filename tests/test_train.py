@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import dataclasses
 import importlib
+import io
+import json
 import random
 import signal
 import sys
@@ -22,6 +25,8 @@ from pretrain.model import CausalLM
 from pretrain.data import create_training_dataloader, frozen_training_geometry
 from pretrain.train import (
     CheckpointLease,
+    CompositeLogger,
+    ConsoleLogger,
     FixedBatchStream,
     GracefulStopController,
     TrainConfig,
@@ -114,6 +119,21 @@ class StopAtStepLogger:
 
     def log(self, metrics) -> None:
         if metrics.get("train/step") == self.step and "train/loss" in metrics:
+            self.controller.request(int(signal.SIGTERM))
+
+    def finish(self) -> None:
+        pass
+
+
+class StopOnValidationLogger:
+    def __init__(self, controller: GracefulStopController) -> None:
+        self.controller = controller
+        self.metrics: list[dict[str, float | int]] = []
+
+    def log(self, metrics) -> None:
+        payload = dict(metrics)
+        self.metrics.append(payload)
+        if "validation/loss" in payload:
             self.controller.request(int(signal.SIGTERM))
 
     def finish(self) -> None:
@@ -370,6 +390,35 @@ class TrainingHarnessTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "requirements-wandb"):
                 WandbLogger(mode="offline")
 
+    def test_console_logger_emits_strict_finite_json(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            ConsoleLogger().log({"train/step": 3, "train/loss": 1.25})
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {"train/step": 3, "train/loss": 1.25},
+        )
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "must be finite"
+            ):
+                ConsoleLogger().log({"train/step": 3, "train/loss": value})
+
+    def test_composite_finishes_a_logger_disabled_after_log_failure(self) -> None:
+        failed = mock.Mock()
+        failed.log.side_effect = OSError("tracker write failed")
+        healthy = mock.Mock()
+        logger = CompositeLogger(failed, healthy)
+
+        logger.log({"train/step": 1, "train/loss": 2.0})
+        logger.log({"train/step": 2, "train/loss": 1.0})
+        logger.finish()
+
+        failed.log.assert_called_once()
+        self.assertEqual(healthy.log.call_count, 2)
+        failed.finish.assert_called_once()
+        healthy.finish.assert_called_once()
+
     def test_optional_tracking_initialization_falls_back_without_rng_or_failure(self) -> None:
         before = capture_rng_state()
 
@@ -404,6 +453,8 @@ class TrainingHarnessTest(unittest.TestCase):
         self.assertEqual(wandb.init.call_args.kwargs["resume"], "allow")
         logger.log({"train/step": 3, "train/loss": 1.0})
         logger.log({"train/step": 3, "validation/loss": 1.1})
+        with self.assertRaisesRegex(ValueError, "must be finite"):
+            logger.log({"train/step": 3, "validation/loss": float("nan")})
         run.define_metric.assert_has_calls(
             [
                 mock.call("train/step"),
@@ -1061,12 +1112,167 @@ class TrainingHarnessTest(unittest.TestCase):
                         for domain in ("python", "other_code", "english")
                     ),
                 )
+                self.assertEqual(
+                    first["validation/rows"],
+                    sum(
+                        int(first[f"validation/{domain}/rows"])
+                        for domain in ("python", "other_code", "english")
+                    ),
+                )
+                self.assertEqual(
+                    first["validation/supervised_tokens"],
+                    sum(
+                        int(first[f"validation/{domain}/supervised_tokens"])
+                        for domain in ("python", "other_code", "english")
+                    ),
+                )
+                reconstructed_loss_sum = sum(
+                    float(first.get(f"validation/{domain}/loss", 0.0))
+                    * int(first[f"validation/{domain}/supervised_tokens"])
+                    for domain in ("python", "other_code", "english")
+                )
+                self.assertTrue(
+                    torch.isclose(
+                        torch.tensor(reconstructed_loss_sum),
+                        torch.tensor(float(first["validation/loss_sum"])),
+                        rtol=1e-6,
+                        atol=1e-6,
+                    )
+                )
                 self.assertEqual(before["python"], after["python"])
                 np.testing.assert_array_equal(before["numpy"][1], after["numpy"][1])
                 self.assertTrue(torch.equal(before["torch_cpu"], after["torch_cpu"]))
             finally:
                 sampler.close()
                 loader.dataset.close()
+
+    def test_validation_rejects_divergent_per_domain_loss_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            order = build_synthetic_order(
+                Path(temporary),
+                sequence_length=8,
+                vocab_size=64,
+                split="validation",
+            )
+            loader, sampler = create_training_dataloader(
+                order,
+                global_microbatch_rows=2,
+                gradient_accumulation_steps=1,
+                num_workers=0,
+                pin_memory=False,
+            )
+            try:
+                runner = ValidationRunner(
+                    loader,
+                    device="cpu",
+                    precision="float32",
+                    max_batches=1,
+                )
+                model = CausalLM(self.model_config, dtype=torch.float32)
+                original_forward = model.forward
+
+                def divergent_forward(*args, **kwargs):
+                    output = original_forward(*args, **kwargs)
+                    assert output.loss_sums_per_row is not None
+                    return output._replace(
+                        loss_sums_per_row=output.loss_sums_per_row + 1.0
+                    )
+
+                with (
+                    mock.patch.object(model, "forward", side_effect=divergent_forward),
+                    self.assertRaisesRegex(ValueError, "domain loss sums"),
+                ):
+                    runner.evaluate(model, train_step=0)
+            finally:
+                sampler.close()
+                loader.dataset.close()
+
+    def test_step_zero_validation_is_checkpointed_and_not_repeated_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            validation_order = build_synthetic_order(
+                root / "validation",
+                sequence_length=8,
+                vocab_size=64,
+                split="validation",
+            )
+            validation_loader, validation_sampler = create_training_dataloader(
+                validation_order,
+                global_microbatch_rows=1,
+                gradient_accumulation_steps=1,
+                num_workers=0,
+                pin_memory=False,
+            )
+            checkpoint = root / "last.pt"
+            controller = GracefulStopController()
+            logger = StopOnValidationLogger(controller)
+            config = dataclasses.replace(
+                self.train_config(max_steps=1),
+                eval_at_start=True,
+            )
+            runner = ValidationRunner(
+                validation_loader,
+                device="cpu",
+                precision="float32",
+                max_batches=1,
+            )
+            stream = FixedBatchStream(make_batch())
+            trainer = Trainer(
+                CausalLM(self.model_config, dtype=torch.float32),
+                config,
+                device="cpu",
+                data_identity=stream.identity,
+                logger=logger,
+                checkpoint_path=checkpoint,
+                validation_runner=runner,
+                stop_controller=controller,
+            )
+            try:
+                self.assertEqual(trainer.train(stream), {})
+                self.assertEqual(trainer.state.completed_steps, 0)
+                self.assertEqual(trainer.stop_signal, int(signal.SIGTERM))
+                validation_records = [
+                    metrics
+                    for metrics in logger.metrics
+                    if "validation/loss" in metrics
+                ]
+                self.assertEqual(len(validation_records), 1)
+                checkpoint_index = next(
+                    index
+                    for index, metrics in enumerate(logger.metrics)
+                    if metrics.get("checkpoint/completed") == 1
+                )
+                stop_index = next(
+                    index
+                    for index, metrics in enumerate(logger.metrics)
+                    if "system/graceful_stop_signal" in metrics
+                )
+                self.assertLess(checkpoint_index, stop_index)
+                payload = torch.load(checkpoint, weights_only=False)
+                self.assertIs(
+                    payload["metadata"]["validation_at_start_completed"],
+                    True,
+                )
+
+                resume_logger = MemoryLogger()
+                resumed = Trainer(
+                    CausalLM(self.model_config, dtype=torch.float32),
+                    config,
+                    device="cpu",
+                    data_identity=stream.identity,
+                    logger=resume_logger,
+                    checkpoint_path=checkpoint,
+                    validation_runner=runner,
+                )
+                resumed.load_checkpoint(checkpoint)
+                self.assertFalse(resumed._validation_at_start_due())
+                self.assertEqual(resumed.train(stream, until_step=0), {})
+                self.assertFalse(
+                    any("validation/loss" in metrics for metrics in resume_logger.metrics)
+                )
+            finally:
+                validation_sampler.close()
+                validation_loader.dataset.close()
 
     def test_validation_runs_on_schedule_and_is_checkpoint_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1343,6 +1549,42 @@ class TrainingHarnessTest(unittest.TestCase):
                 self,
                 full.optimizer.state_dict(),
                 resumed.optimizer.state_dict(),
+            )
+
+    def test_pending_stop_is_checkpointed_then_reported_before_any_update(self) -> None:
+        stream = FixedBatchStream(make_batch())
+        controller = GracefulStopController()
+        controller.request(int(signal.SIGTERM))
+        logger = MemoryLogger()
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "last.pt"
+            trainer = Trainer(
+                CausalLM(self.model_config, dtype=torch.float32),
+                self.train_config(max_steps=1),
+                device="cpu",
+                data_identity=stream.identity,
+                logger=logger,
+                checkpoint_path=checkpoint,
+                stop_controller=controller,
+            )
+            self.assertEqual(trainer.train(stream), {})
+            self.assertEqual(trainer.state.completed_steps, 0)
+            self.assertEqual(
+                torch.load(checkpoint, weights_only=False)["train_state"][
+                    "completed_steps"
+                ],
+                0,
+            )
+            self.assertEqual(
+                [
+                    metrics.get("checkpoint/completed", 0)
+                    for metrics in logger.metrics
+                ],
+                [1, 0],
+            )
+            self.assertEqual(
+                logger.metrics[-1]["system/graceful_stop_signal"],
+                int(signal.SIGTERM),
             )
 
     def test_external_supervisor_stop_request_and_finalization_window(self) -> None:
