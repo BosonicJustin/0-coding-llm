@@ -1,12 +1,26 @@
 # Stack v3 raw-code collector
 
-> **Current generation-v2 override (2026-09-01):** the 25.7184B targets below
-> describe the frozen first acquisition generation. The audited eligible
-> other-code train supply was only 16.527B tokens, so a selectively hard-linked
-> v2 generation is being created at
-> `/workspace/dataset-other-code-topup-v2`. Its versioned configuration raises
-> only cumulative raw other code to 35B; Python and English stay frozen. See
-> [fast-generation-v2.md](fast-generation-v2.md) for current state and commands.
+> **Current outcome — 2026-09-02**
+>
+> Collection is complete and closed. The 25.7184B targets below describe the
+> frozen first acquisition generation. Its audited eligible other-code train
+> supply motivated the selectively hard-linked v2 generation at
+> `/workspace/dataset-other-code-topup-v2`; that top-up completed at more than
+> 35B cumulative raw other-code tokens while Python and English stayed frozen.
+> Per-archive preprocessing, curation, selection-v7, the closed-world token
+> cache, and all nine packed split/domain streams are also complete. No
+> collector or preprocessing job should be restarted.
+>
+> The packed-only S3 backup at
+> `s3://transcendent-logic-data-618079239540/coding-llm/pretraining/2026-09-02-packed-v1/`
+> has been checksum-verified onto six-H100 pod-local NVMe at
+> `/root/transcendent-logic-data`. Deterministic train, validation, and test
+> orders and the final top-level corpus manifest remain pending geometry
+> qualification. The selected first run is 12,836,736 unique packed rows,
+> 66,858 complete updates at 192 rows per update, and exactly 52,579,270,656
+> input positions under 40/40/20, without replacement. See the
+> [pre-training corpus record](final-corpus-record.md) for current authority and
+> [fast-generation-v2.md](fast-generation-v2.md) for build history.
 
 This pipeline streams the pinned `HuggingFaceCode/stack-v3-train` dataset and
 saves only an explicit allowlist of programming languages. It maintains two
@@ -38,10 +52,10 @@ Retained source files are stored byte-for-byte in lossless `.tar.zst` archives:
     COLLECTION_COMPLETE.json
 ```
 
-Every archive contains an `_manifest.jsonl` member with repository, commit,
+Every raw archive contains an `_manifest.jsonl` member with repository, commit,
 original file path, language, license, content ID, byte count, and exact token
-count for every retained file. No token IDs are stored and no training format is
-chosen yet.
+count for every retained file. This raw-archive format stores no token IDs; the
+completed downstream cache and packed shards are separate artifacts.
 
 ## Upstream deduplication boundary
 
@@ -63,18 +77,18 @@ source revision. Validate it against the downloaded source manifest with:
 ```
 
 FineWeb-Edu and Wikipedia remain a possible separate local near-deduplication
-domain; their overlap is not covered by Stack v3's upstream processing.
-Baseline v1 deliberately defers that expensive pass because both sources are
-already curated. The fast production profile deterministically keeps one
-global exact-hash canonical and then one global normalized-hash canonical;
+domain; their overlap is not covered by Stack v3's upstream processing. The
+production baseline deliberately deferred that expensive pass because both
+sources were already curated. The fast production profile deterministically
+keeps one global exact-hash canonical and then one global normalized-hash canonical;
 these same hashes propagate contamination. It does not perform fuzzy semantic
 near-deduplication. The raw inputs are preserved so the
 implemented cross-source English pass can be tested later as a controlled
 corpus ablation.
 
-Final generation v2 also skips exact token-quota selection in SQLite. It keeps
-every eligible canonical full document and delegates mixture/budget selection
-to deterministic packed order v4. This does not weaken benchmark filtering,
+Generation v2 skipped exact token-quota selection in SQLite. It kept every
+eligible canonical full document and delegates mixture/budget selection to the
+pending deterministic packed order v4. This did not weaken benchmark filtering,
 exact/normalized canonicalization, or leakage-safe group splitting.
 
 Stack v3 itself is hosted in Parquet source shards, so the Hugging Face reader
@@ -99,8 +113,9 @@ files, embedded solution line pairs, benchmark problem/test lines, and obvious
 MBPP payloads before tokenization or archiving. The denylist SHA-256 is pinned
 in every source manifest and checkpoint, so a changed or missing policy fails
 closed on resume. Run `scripts/audit_mbpp.py` against saved Python archives as
-an independent verification step. Other evaluation suites still need deeper
-content-based decontamination before final training selection.
+an independent verification step. The completed curation pass applied its
+frozen benchmark guard. Any broader suite-specific decontamination is a future
+corpus revision, not unfinished baseline collection work.
 
 ## RunPod installation
 
@@ -142,10 +157,11 @@ find /workspace/dataset-pilot/raw -type f -maxdepth 2 -ls
   --root /workspace/dataset-pilot status --phase collection
 ```
 
-## Parallel production run
+## Historical parallel production run
 
-Use the included launcher inside `tmux` so an SSH disconnect does not terminate
-it and every progress record is retained in a log:
+The completed acquisition used the included launcher inside `tmux` so an SSH
+disconnect would not terminate it and every progress record was retained in a
+log. The command is build history, not an instruction to restart collection:
 
 ```bash
 tmux new-session -d -s stack-v3 \
@@ -171,7 +187,7 @@ worker from its exact cursor. `SIGINT`, `SIGTERM`, and `SIGHUP` ask every worker
 to finish its current repository, close and fsync its archives, checkpoint, and
 exit.
 
-## Progress and completion
+## Historical progress and completion contract
 
 ```bash
 tail -n 20 /workspace/dataset/logs/collector.log
@@ -208,7 +224,7 @@ configured collection targets, exact quota-ledger/raw archive equality, and no
 hidden `.part-*` archive left by a live collector. These checks are exposed as
 `STATUS.json.collection_closure` and are mandatory in `run_preprocess.sh`.
 
-Before deleting the CPU pod, verify:
+Before the historical CPU collection pod was deleted, operators verified:
 
 ```bash
 df -h /workspace
@@ -220,9 +236,8 @@ The `/tmp/huggingface-cache` directory is disposable. The raw archives,
 manifests, tokenizer, checkpoints, and quota records under `/workspace/dataset`
 must remain on the network volume.
 
-The required processing, audit, split, packing, smoke-test, and training
-readiness steps after collection are specified in
-[pretraining-checklist.md](../operations/pretraining-checklist.md).
-Finalized archives are already being validated and fingerprinted concurrently
-with acquisition as described in
-[streaming-preprocess.md](streaming-preprocess.md).
+The required remaining geometry, order-finalization, smoke-test, and training
+readiness steps are specified in
+[pretraining-checklist.md](../operations/pretraining-checklist.md). The
+completed concurrent archive validation and fingerprinting contract is
+described in [streaming-preprocess.md](streaming-preprocess.md).

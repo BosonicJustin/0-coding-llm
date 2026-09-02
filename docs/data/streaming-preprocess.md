@@ -1,11 +1,30 @@
 # Streaming audit and fingerprint preprocessing
 
-`scripts/preprocess_raw_stream.py` performs safe work while raw acquisition is
-still running. It never changes a raw archive and never opens a hidden
-`.part-*` file. An archive becomes eligible only when it has its final
+> **Current outcome — 2026-09-02**
+>
+> Streaming preprocessing is complete for the closed generation-v2 collection:
+> every one of the 4,568 finalized raw archives has its authoritative report and
+> fingerprint shard, and there are zero archive error records. Corpus curation,
+> selection-v7, the closed-world token cache, and all nine packed split/domain
+> streams are also complete. No watcher or incremental preprocessing job is
+> active or required for this corpus.
+>
+> The packed-only S3 backup at
+> `s3://transcendent-logic-data-618079239540/coding-llm/pretraining/2026-09-02-packed-v1/`
+> is restored at `/root/transcendent-logic-data` on the six-H100 pod.
+> Geometry-bound orders and the final top-level corpus manifest remain pending;
+> preprocessing must not be restarted to create them. The selected train
+> decision is 12,836,736 unique rows, 66,858 complete 192-row updates, and
+> exactly 52,579,270,656 input positions under 40/40/20, without replacement
+> or repeats. See the
+> [pre-training corpus record](final-corpus-record.md) for current authority.
+
+`scripts/preprocess_raw_stream.py` was designed to perform safe work while raw
+acquisition was still running. It never changes a raw archive and never opens a
+hidden `.part-*` file. An archive becomes eligible only when it has its final
 `part-NNNNNN.tar.zst` name and a matching committed quota record.
 
-## Work performed now
+## Work performed per finalized archive
 
 For every finalized archive, the pipeline:
 
@@ -29,16 +48,17 @@ For every finalized archive, the pipeline:
    curation and, optionally, batched ingestion into the rebuildable SQLite
    telemetry index.
 
-No quality flag currently deletes or rewrites a document. The final selection
-policy remains explicit and can be evaluated from these metrics after source
-composition is known. The final selector independently rebuilds exact and
-normalized groups and removes residual collisions in every
-bucket and perform local near-duplicate clustering only for FineWeb-Edu and
-Wikipedia. It must never feed Stack v3 Train code sketches into a second LSH
-pass because that pinned source is already near-deduplicated upstream.
+No preprocessing quality flag deleted or rewrote a document. The completed
+selection policy remained explicit and was evaluated from these metrics after
+source composition was known. Curation independently rebuilt exact and
+normalized groups and removed residual collisions in every bucket. The
+baseline deliberately deferred fuzzy/semantic near-duplicate clustering for
+FineWeb-Edu and Wikipedia, and it did not feed Stack v3 Train code sketches
+into a second LSH pass because that pinned source is already near-deduplicated
+upstream.
 
-The current watcher remains byte-for-byte compatible with already completed
-fingerprint shards. Omitting code sketches mid-run would change the pinned
+The processor remained byte-for-byte compatible with completed fingerprint
+shards. Omitting code sketches mid-run would have changed the pinned
 fingerprint policy for a small CPU saving and would invalidate resumability.
 The routing decision therefore lives in `configs/curation_policy.json`, not in
 this immutable v1 fingerprint format.
@@ -99,16 +119,17 @@ optional indexing is skipped and are not evidence of an incomplete corpus. Engli
 near-deduplication and final curation enforce the report-versus-ledger gate
 again before freezing their own inventories.
 
-## Production operation
+## Historical production operation
 
-Start the low-priority watcher in a detached session:
+During acquisition, operators started the low-priority watcher in a detached
+session. The completed corpus must not restart this command:
 
 ```bash
 tmux new-session -d -s preprocess \
   /workspace/coding_model_from_scratch/scripts/run_preprocess.sh
 ```
 
-Monitor logs and structured status:
+Historical log and structured-status monitoring used:
 
 ```bash
 tail -f /workspace/dataset/logs/preprocess.log
@@ -118,12 +139,12 @@ tail -f /workspace/dataset/logs/preprocess.log
   --root /workspace/dataset --status
 ```
 
-The audit worker count is pinned at 24 in `run_preprocess.sh` after an exact
-server benchmark, and it runs at lower CPU scheduling priority than collectors.
-Before starting or resuming, the launcher validates that the network volume's
-Stack source manifest exactly matches the trusted deduplicated revision in
-`configs/curation_policy.json`; a mismatch fails closed without touching raw or
-staged data.
+The audit worker count was pinned at 24 in `run_preprocess.sh` after an exact
+server benchmark, and it ran at lower CPU scheduling priority than collectors.
+Before starting or resuming during the build, the launcher validated that the
+network volume's Stack source manifest exactly matched the trusted deduplicated
+revision in `configs/curation_policy.json`; a mismatch failed closed without
+touching raw or staged data.
 Documents are sent to those workers in ordered batches of at most 64, avoiding
 one multiprocessing round trip per document while producing byte-identical
 fingerprint shards. Count alone is not a memory bound, so three byte limits now

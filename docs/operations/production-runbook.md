@@ -1,29 +1,45 @@
 # Production pre-training runbook
 
-This is the operator sequence for turning the frozen raw collection into the
-first 1.3B pre-training run. Follow it in order. A stage is immutable once its
-published checksum has been accepted; any policy, source, code, or configuration
-change starts a new versioned output directory.
+This is the operator sequence for turning a frozen raw collection into the
+first 1.3B pre-training run. A new build follows it in order; the current
+generation-v2 handoff starts at the first pending stage identified below. A
+stage is immutable once its published checksum has been accepted; any policy,
+source, code, or configuration change starts a new versioned output directory.
 
 The current harness is **not yet approved for the 52.58B-token launch**. The
-CUDA FlexAttention isolation gate, the chosen topology's memory gate, exact CUDA
-resume/DDP gates, and a contamination-clean validation loop are mandatory below.
-MBPP and the final test order are never used to choose hyperparameters or
-checkpoints.
+chosen six-H100 geometry, geometry-bound orders, final top-level corpus
+manifest, full-model memory/throughput gates, and contamination-clean
+validation loop remain mandatory below. Exact CUDA restart equality plus
+validation/telemetry smoke have already passed as recorded in Stage 9. MBPP and
+the final test order are never used to choose hyperparameters or checkpoints.
 
-> **Generation-v2 override (2026-09-01):** the v1 acquisition root is frozen,
-> exact curation-quota selection has been abandoned, and neither a curator nor
-> a token-ID materializer is running. The selective hard-link clone to
-> `/workspace/dataset-other-code-topup-v2` completed successfully. An
-> other-code-only collector is running eight workers toward a 35B cumulative
-> raw-token target, and low-priority incremental preprocessing is active. Stable
-> progress and unchanged Python accounting were proven at 06:40 UTC. The
-> current state and ordered commands are in
-> [fast-generation-v2.md](../data/fast-generation-v2.md). Stage 4 exact-selector
-> and Stage 5 v5/v6 materializer commands below are retained as historical
-> tested contracts; do **not** execute them for v2. The v2 publisher keeps all
-> eligible canonical documents, and packed order v4 owns the 40/40/20 mixture
-> and input-token caps.
+> **Current handoff — 2026-09-02**
+>
+> Collection, per-archive preprocessing, corpus-wide curation, selection-v7,
+> the closed-world raw-token cache, and packing of all nine split/domain cells
+> are complete. The packed-phase backup at
+> `s3://transcendent-logic-data-618079239540/coding-llm/pretraining/2026-09-02-packed-v1/`
+> was restored directly, with checksum verification, to six-H100 pod-local
+> NVMe at `/root/transcendent-logic-data`; it did not transit through the
+> laptop. This is intentionally a **packed-only** restore. Deterministic train,
+> validation, and test orders and the final top-level corpus manifest remain
+> pending six-GPU geometry qualification and finalization.
+>
+> The selected first-run train decision is one pass through 12,836,736 unique
+> packed-row references under the 40/40/20 allocation: 66,858 complete updates
+> at 192 rows per update and exactly 52,579,270,656 input positions, without
+> replacement or repeats. Geometry qualification chooses only the physical
+> microbatch/accumulation decomposition. It does not authorize retokenization,
+> packed-shard rewrites, split changes, or use of packed-surplus rows.
+
+Stages 1–5 below retain the completed build path's validation, deliberate
+deferral, and recovery contracts; do not restart collection, preprocessing,
+curation, selection, caching, or packing against the restored corpus. Current
+status and corpus identity are authoritative in the
+[pre-training corpus record](../data/final-corpus-record.md). The current
+fail-closed work begins with Stage 6; Stages 7–8 and 10 remain pending, while
+Stage 9 records already accepted runtime evidence and the explicit waiver of
+the duplicate soak.
 
 Canonical contracts live in
 [pretraining-checklist.md](pretraining-checklist.md),
@@ -39,8 +55,11 @@ does not replace them.
 
 ## 0. Conventions and storage boundary
 
-Run production commands under Bash and retain their stdout/stderr with the run
-record. Set an explicit, never-reused `RUN_ID`:
+The setup block below records the original `/workspace` build layout. Do not run
+it against `/root/transcendent-logic-data` or use it to restart a completed
+stage. For a historical rebuild or a new versioned corpus, run production
+commands under Bash, retain stdout/stderr with the run record, and set an
+explicit, never-reused `RUN_ID`:
 
 ```bash
 set -Eeuo pipefail
@@ -58,15 +77,19 @@ test -d "$DATA_ROOT"
 mkdir -p "$DATA_ROOT/audits/$RUN_ID" "$DATA_ROOT/logs/$RUN_ID"
 ```
 
-Storage ownership is strict:
+The current storage boundary is strict. The `/workspace` and `/local-nvme`
+paths used in later command blocks record the original build/runbook layout;
+they are not evidence that the present H100 restore lives there.
 
 | Location | Contents | Authority |
 | --- | --- | --- |
-| Network volume, `/workspace/dataset` | frozen v1 raw archives; quota ledgers and completion markers; source, tokenizer, preprocessing, stopped curation evidence, and audits | Durable frozen v1 authority |
-| Network volume, `/workspace/dataset-other-code-topup-v2` | v2 hard-link clone after atomic publication; new other-code archives, incremental preprocessing, fresh curation, packed data, and orders | Planned durable v2 authority |
-| CPU pod local NVMe, `/local-nvme` | optional rebuildable scratch for a separately qualified future run | Never the sole copy of state required for the current network-volume run |
+| S3, `s3://transcendent-logic-data-618079239540/coding-llm/pretraining/2026-09-02-packed-v1/` | authenticated packed-phase portable backup | Durable recovery authority; deliberately contains no final orders or top-level manifest |
+| H100 pod local NVMe, `/root/transcendent-logic-data` | checksum-verified packed-only restore | Current qualification and finalization hot path |
+| H100 checkout, `/root/0-coding-llm` | code used to authenticate and consume the restore | Current code location |
+| Network volume, `/workspace/dataset` | frozen v1 raw archives and historical build evidence | Durable frozen v1 authority; do not resume jobs here |
+| Network volume, `/workspace/dataset-other-code-topup-v2` | closed v2 build origin | Collection, preprocessing, curation, selection-v7, cache, and packing are complete |
+| CPU pod local NVMe, `/local-nvme` | optional rebuildable scratch for a separately qualified future run | Never the sole copy of state required for a corpus publication |
 | Preprocessor `/tmp/coding-model-preprocess` | rebuildable uncompressed spool | Disposable |
-| GPU pod local NVMe, `/local-nvme/packed-v1` | verified, read-only hot copy of the finalized packed corpus and orders | Performance copy only |
 
 Never copy a directory while its writer is running. Never copy SQLite, `-wal`,
 `-shm`, `.work`, `.part`, lock, or live journal files to make a checkpoint.
@@ -381,12 +404,13 @@ The complete sibling-manifest consumer contract—not merely these two hashes—
 in [english-near-dedup.md](../data/english-near-dedup.md); curation enforces it
 before reading a mapping row.
 
-## 4. Curate and select — GO/NO-GO 4
+## 4. Curate and select — completed historical record
 
 The preserved `selection-fast-v1` rollback generation ran directly on the
 durable network volume. That path is restart-safe but slow; explicit DELETE
-journaling avoids WAL on NFS. Do not modify or delete it until the accelerated
-generation has completed final certification.
+journaling avoids WAL on NFS. The accelerated generation and selection-v7
+publication are now complete; preserve this rollback generation as audit
+history, not as current selection authority.
 
 An accelerated, crash-safe local-WAL path is implemented for a **fresh output**
 and documented in
@@ -395,14 +419,17 @@ exact local-capacity admission gate at first startup with the 100,000-row batch
 contract, keeps SQLite/WAL/temp state on pod-local storage, and periodically
 publishes verified recovery snapshots to the network volume. The CLI refuses
 same-filesystem "durable" storage and refuses converting or overwriting the
-baseline canonical database. The now-stopped `selection-fast-local-v2`
+baseline canonical database. The stopped `selection-fast-local-v2`
 generation passed the controlled snapshot/integrity qualification and minimum
 3x performance gate. Its canonical and group state fed the exact supply audit,
 but its incomplete exact-quota rows are not publication authority. Current
 state is recorded in [handoff.md](handoff.md).
 
-First certify rollback-journal locking, abrupt-process recovery, and a minimum
-write rate on this exact mounted filesystem:
+The commands and incident procedures in this stage are retained for provenance
+and recovery testing. No curator is active or required for the completed v2
+corpus; do not restart these commands against it. The historical build first
+certified rollback-journal locking, abrupt-process recovery, and a minimum write
+rate on its exact mounted filesystem:
 
 ```bash
 CURATION_WORK="$DATA_ROOT/curated/selection-fast-v1"
@@ -545,7 +572,7 @@ the canonical owner, and atomically archives the old record under
 recovery when the recorded same-host PID is alive. An existing claim for that
 token is a manual-review stop, never something to delete automatically.
 
-### Controlled restart of the local-WAL curator
+### Historical controlled restart of the local-WAL curator
 
 Use this procedure when the accelerated curator is blocked inside a long
 SQLite snapshot integrity scan and a same-pod restart is preferable to waiting
@@ -636,12 +663,13 @@ both observations. Confirm independently that no curator on another pod mounts
 this output before recovering the NFS-visible lease; a local `pgrep` cannot
 prove that cross-pod condition.
 
-Restart from the same checkout, Python environment, source/policy paths, output,
-local work root, batch size, journal mode, snapshot retention, and integrity
-policy. For the qualified live generation, the only operational change is the
+The historical restart used the same checkout, Python environment,
+source/policy paths, output, local work root, batch size, journal mode, snapshot
+retention, and integrity policy. For that qualified generation, the only
+operational change was the
 snapshot interval from one hour to six hours (`21600` seconds). The interval is
 not part of the frozen database/store identity; retention is and remains two.
-Pass the captured stale token exactly once:
+It passed the captured stale token exactly once:
 
 ```bash
 tmux new-session -d -s curation-fast-local-v2 -c "$PROJECT_ROOT" \
@@ -671,12 +699,12 @@ has actually been lost, only the last complete manifest-bound network snapshot
 is eligible for restore; a manifestless partial copy is never recovery
 authority.
 
-On the current NFS, validating a tens-of-gigabytes complete snapshot and hashing
-the larger local database can take tens of minutes to roughly an hour, and may
-take longer under contention. No checkpoint advance during that preparation is
-expected. Observe the exact process, its file descriptors, CPU/I/O state, the
-unchanged local files, and the new lease instead of treating the old checkpoint
-mtime alone as a hang.
+On the historical NFS mount, validating a tens-of-gigabytes complete snapshot
+and hashing the larger local database could take tens of minutes to roughly an
+hour, and could take longer under contention. No checkpoint advance during
+that preparation was expected. Operators observed the exact process, its file
+descriptors, CPU/I/O state, unchanged local files, and new lease instead of
+treating the old checkpoint mtime alone as a hang.
 
 Wait until preparation has completed and the checkpoint/journal projection has
 advanced coherently, then run one health inspection before starting the
@@ -713,12 +741,13 @@ until the next complete snapshot—or the final certified publication—is durab
 
 The historical command above wrote directly to the durable network publication
 `$DATA_ROOT/curated/selection-fast-v1`; no second copy or rename was needed.
-Only `manifest.json`, `manifest.sha256`, and `decisions/` are closed inputs to
-the next stage. The live `.work/` tree remains restart state and must not be
-copied or used as materializer input.
+For that v5/v6 route, only `manifest.json`, `manifest.sha256`, and `decisions/`
+were closed inputs to the next stage. They are not the current selection-v7
+authority. The live `.work/` tree was restart state and must never be copied or
+used as materializer input.
 
-The materializer independently takes the strict curation-v6 fast-profile
-branch: it revalidates the exact profile/status/limitation/audit schema,
+The historical materializer route used the strict curation-v6 fast-profile
+branch, which revalidates the exact profile/status/limitation/audit schema,
 collection authority, every decision and immutable input, and requires both
 near-artifact identity fields to be null. The separate full-near branch accepts
 only the curation-v5 five-file English publication contract. Its acceptance is
@@ -729,12 +758,13 @@ version equal the materializer consumer's accepted version. If they differ,
 this is **NO-GO** even when their isolated unit tests pass; resolve the contract
 and rerun curation under a new output identity before Stage 5.
 
-## 5. Pack first, without guessing GPU geometry — GO/NO-GO 5
+## 5. Pack first, without guessing GPU geometry — completed build record
 
-Optionally run the one-archive measurement from
-[materialization.md](../data/materialization.md) in a
-distinct disposable output. Then run production Stage 1 directly to the
-network volume so an overnight pod loss does not lose the only checkpoint:
+Generation v2 completed this gate for all nine split/domain cells and closed a
+`phase: packed` journal for all 4,568 archives. The command below is the
+historical v5/v6 interface contract; do not run it against the current
+selection-v7/cache-backed restore. The current packed identity is frozen in the
+[pre-training corpus record](../data/final-corpus-record.md).
 
 ```bash
 PACKED_NETWORK="$DATA_ROOT/final/packed-v1"
@@ -759,27 +789,34 @@ test ! -e "$PACKED_NETWORK/manifest.json"
 test ! -e "$PACKED_NETWORK/manifest.sha256"
 ```
 
-The missing top manifest is intentional: all nine packed manifests and
-document indexes are complete and fully validated, but no order exists yet.
-Rerun the exact command to resume. Batch sizes may change after measurement
-without changing identity. An unhandled stop may replay the current raw archive
-into lagging writers; committed archive cursors remain authoritative. Never
-manually merge output directories.
+The missing top manifest remains intentional: all nine packed manifests and
+document indexes are complete and fully validated, but no authoritative order
+exists yet. During the build, rerunning the exact command resumed at the
+archive boundary and an unhandled stop could replay the current raw archive
+into lagging writers. The restored corpus is past that boundary: do not rerun
+packing, manually merge outputs, retokenize documents, or rewrite shards.
 
-At 4,096 input tokens, a packed row is 8,707 bytes. The selected 53.58B-token
-budget is about 114 GB (106 GiB) of row payload plus about 0.105 GB of order
+At 4,096 input tokens, a packed row is 8,707 bytes. The selected
+52,579,270,656-position run is about 112 GB (104 GiB) of row payload plus about
+0.103 GB of order
 references, compressed document indexes, packed surplus, and headroom. Reserve
 20–30% beyond the measured complete output. Plan at least 8 GiB RAM; 16 GiB is
 safer. If the measured tokenization rate is `R` input tokens/s, the lower-bound
-packing ETA is `53.58e9 / R`: about 59.5 h at 0.25M/s, 29.8 h at 0.5M/s,
-14.9 h at 1M/s, or 7.44 h at 2M/s, before startup/final validation and stalls.
+historical packing ETA is `52.579270656e9 / R`: about 58.4 h at 0.25M/s,
+29.2 h at 0.5M/s, 14.6 h at 1M/s, or 7.30 h at 2M/s, before startup/final
+validation and stalls.
 
 ## 6. GPU smoke and immutable geometry — GO/NO-GO 6
 
-Mount the network volume on the exact intended GPU type/count. Do not choose
-geometry from a different topology. For each candidate, build a small,
-disposable order from the completed packed manifests. Values below come from
-the candidate record; they are deliberately not recommendations:
+> **Current status:** pending on the restored six-H100 pod. Authenticate
+> `/root/transcendent-logic-data` and its readiness marker before constructing
+> any disposable order. The old `$PACKED_NETWORK` path in the template below
+> must not be interpreted as the location of the current restore.
+
+Use the exact intended GPU type/count. Do not choose geometry from a different
+topology. For each candidate, build a small, disposable order from the completed
+packed manifests. Values below come from the candidate record; they are
+deliberately not recommendations:
 
 The planned first training topology is a single RunPod pod with six local GPUs,
 so set `GPU_COUNT=6` for that experiment. A different count or GPU type is a new
@@ -883,8 +920,14 @@ precision.
 
 ## 7. Construct final orders and validate on the network volume — GO/NO-GO 7
 
-Read, do not retype, the accepted geometry. Resume the same production output
-without `--stop-after-packing`:
+> **Current status:** pending geometry. Finalization must select and shuffle
+> existing row references only. It may not rebuild the cache, retokenize source
+> documents, change split membership, reorder tokens within a row, or rewrite
+> any packed shard. The historical paths in the template below are not current
+> selection-v7/cache authority.
+
+Read, do not retype, the accepted geometry. The historical stage-2 interface
+continued the same production output without `--stop-after-packing`:
 
 ```bash
 CANDIDATE_GEOMETRY_RECORD="$DATA_ROOT/audits/$RUN_ID/candidate-geometry.json"
@@ -942,8 +985,15 @@ consumed/dropped input and supervised tokens.
 
 ## 8. Stage and revalidate the GPU-local hot copy — GO/NO-GO 8
 
-Stop the materializer first. The network corpus remains immutable and durable.
-Copy only its published tree into a new local incoming directory:
+> **Current status:** the packed-only S3 artifact is already checksum-verified
+> at `/root/transcendent-logic-data`; it contains no final orders or top-level
+> corpus manifest. The network-to-`/local-nvme` block below is retained as a
+> historical publication pattern, not as a description of the completed S3
+> restore and not as permission to overwrite it.
+
+For a future transfer of a fully finalized corpus, stop its publisher first.
+Keep the durable corpus immutable and copy only its closed published tree into
+a new local incoming directory:
 
 ```bash
 GPU_PACKED=/local-nvme/packed-v1
@@ -985,19 +1035,51 @@ new destination—do not overwrite it. Copy ETA is
 local checksum scan of roughly the same byte count. Benchmark both rather than
 assuming network-volume throughput.
 
-## 9. Overfit, resume, and DDP gates — GO/NO-GO 9
+## 9. Accepted runtime evidence; redundant rerun waived
 
-Use the finalized local train order and execute the exact three-phase
-single-GPU and six-GPU procedure in the
-[one-chunk overfit and exact-resume runbook](one-chunk-overfit-qualification.md).
-GO requires a boundary-bearing packed batch, final loss at most 0.5, at least a
-10x loss reduction, and exact semantic equality of the resumed final model,
-optimizer, counters, all rank RNG states, trajectory, data/tokenizer identities,
-and world size against an uninterrupted reference. A CPU pass qualifies only
-the harness, not CUDA.
+> **Current decision — 2026-09-02:** the real packed-data six-H100
+> qualification already ran for 1,000 steps, proved exact 500-to-1,000
+> checkpoint/restart equality, and passed validation and telemetry smoke. That
+> evidence is accepted. Do **not** run another separate final-order
+> checkpoint/resume plus validation/W&B verification soak before full
+> pre-training. The six-H100 geometry grid and full-model memory/throughput
+> qualification remain mandatory.
+>
+> This waiver removes only a redundant prelaunch run. It does not disable or
+> weaken production checkpointing, restart support, validation, telemetry, or
+> failure handling. The full run must enable normal durable checkpoint rotation
+> and resume capability, run validation on its frozen cadence from the start,
+> and publish rich **online** W&B telemetry from step 1. Treat the opening full
+> run as an attended live proving period through at least its first successful
+> validation and durable checkpoint; stop on any numerical, identity, data,
+> validation, checkpoint, resume-readiness, telemetry, or throughput failure.
+>
+> Launch remains **NO-GO** until an implemented, tested authority producer and
+> validator publish `accepted-geometry-with-waiver.json`. That derived receipt
+> must bind the exact geometry `GRID-RESULT`, the prior real six-H100
+> overfit/restart/validation/telemetry evidence, final train and validation
+> order hashes, the waiver rationale, and `final_soak_waived: true`. A
+> `GRID-RESULT`, candidate record, prose waiver, or legacy final-soak receipt by
+> itself cannot authorize launch.
 
-Next build a new bounded diagnostic order from the GPU-local packed manifests,
-using the accepted geometry exactly. Keep it outside the immutable hot copy:
+The accepted evidence used real boundary-bearing packed rows on CUDA and the
+six-rank topology. Its 1,000-step loss result and exact 500-to-1,000 resume
+comparison supersede the need to replay the three-phase procedure in the
+[one-chunk overfit and exact-resume runbook](one-chunk-overfit-qualification.md)
+solely as another launch blocker. Geometry qualification still has to select a
+safe physical decomposition of the fixed 192-row optimizer batch and prove the
+full 1.3B allocation fits with operational headroom.
+
+### Superseded duplicate-gate contract
+
+The remainder of this section records the stricter duplicate diagnostic and
+final-order-soak contract for provenance and future investigations. It is not
+part of the current launch sequence and must not be run merely to reproduce
+already accepted checkpoint/resume, validation, or telemetry evidence.
+
+The superseded procedure built a new bounded diagnostic order from GPU-local
+packed manifests, used the accepted geometry exactly, and kept it outside the
+immutable hot copy:
 
 ```bash
 export DDP_DIAGNOSTIC_UPDATES="${DDP_DIAGNOSTIC_UPDATES:?set bounded update count}"
@@ -1041,13 +1123,15 @@ test "$(jq -er '.training_consumption.optimizer_updates' \
   "$LOCAL_DIAGNOSTIC_ORDER/manifest.json")" -ge "$DDP_DIAGNOSTIC_UPDATES"
 ```
 
-Run both single-GPU and `torchrun` smokes through `pretrain.train`. Do not pass
-`--steps`, microbatch, or accumulation to the trainer; it must read all three
-from that diagnostic order.
+The superseded procedure ran both single-GPU and `torchrun` smokes through
+`pretrain.train`. It did not pass `--steps`, microbatch, or accumulation to the
+trainer; all three came from that diagnostic order.
 
-Run an uninterrupted control and a forced-stop/resume DDP run with the same
-topology and trajectory. The trainer handles `SIGHUP`, `SIGINT`, `SIGTERM`, and
-`SIGUSR1`: every rank observes the request at a safe optimizer-step boundary,
+It compared an uninterrupted control with a forced-stop/resume DDP run using
+the same topology and trajectory. Although that duplicate invocation is
+waived, the following signal and atomic-checkpoint behavior remains part of the
+production safety contract. The trainer handles `SIGHUP`, `SIGINT`, `SIGTERM`,
+and `SIGUSR1`: every rank observes the request at a safe optimizer-step boundary,
 participates in the required collectives, and rank zero atomically publishes a
 graceful-stop checkpoint before exiting with `128 + signal`. Do not use
 `SIGKILL`, and do not interrupt an in-progress checkpoint write. The atomic
@@ -1094,12 +1178,13 @@ checkpoint leases.
 # --resume "$DATA_ROOT/checkpoints/ddp-gate-$RUN_ID/last.pt"
 ```
 
-**GO only if:** tiny and 1.3B loss fall materially; CUDA document isolation and
-backward pass pass; single-GPU and DDP losses/gradients are finite; rank row
-ownership is disjoint; uninterrupted versus resumed model/optimizer/cursor/RNG
-states match under the documented deterministic gate; checkpoint rollback from
-a deliberately interrupted write works; and measured data/communication/
-checkpoint performance is acceptable. One mature replicated 1.284B FP32 AdamW
+The superseded gate required tiny and 1.3B loss to fall materially; CUDA
+document isolation and the backward pass to succeed; single-GPU and DDP
+losses/gradients to remain finite; rank row ownership to be disjoint;
+uninterrupted versus resumed model/optimizer/cursor/RNG states to match under
+the documented deterministic gate; checkpoint rollback from a deliberately
+interrupted write to work; and measured data/communication/checkpoint
+performance to be acceptable. One mature replicated 1.284B FP32 AdamW
 checkpoint is about 15.4 GB. Atomic rotation retains latest and previous while
 writing the next temporary generation, so a fresh lineage must have room for
 three mature generations (about 46.2 GB), plus at least the launcher's explicit
@@ -1109,20 +1194,19 @@ per GPU before activations and workspaces. The launcher rejects the 1.3B path
 below 32 GiB/device and heterogeneous visible GPUs; still require the measured
 full-topology memory smoke because 32 GiB is only an admission floor.
 
-After the final train and validation orders exist, run a separate bounded soak
-against those exact manifests with the accepted geometry and production flags.
-Time it with an external monotonic wall clock after compiler warm-up; record the
-starting and ending authoritative consumed-input-token counters and include at
-least one validation, mature checkpoint, offline-W&B log interval, graceful
-stop, and exact six-rank resume. The accepted receipt's throughput must be the
-counter delta divided by this end-to-end elapsed time—not the trainer's
-per-step `perf/input_tokens_per_second`, which intentionally excludes
-validation and checkpoint pauses. Publish the fresh write-once receipt as
-`$DATA_ROOT/audits/$RUN_ID/accepted-geometry.json`, bound to the final train and
-validation manifest SHA-256 values. Never relabel or copy the earlier candidate
-record: the immutable run-authority builder rejects different order hashes.
+The superseded plan would have run a separate bounded soak against the final
+train and validation manifests with the accepted geometry and production flags.
+It would have used an external monotonic wall clock after compiler warm-up,
+recorded the starting and ending authoritative consumed-input-token counters,
+and included at least one validation, mature checkpoint, offline-W&B log
+interval, graceful stop, and exact six-rank resume. Its receipt would have used
+the counter delta divided by end-to-end elapsed time—not the trainer's per-step
+`perf/input_tokens_per_second`, which intentionally excludes validation and
+checkpoint pauses—and would have been bound to the final train and validation
+manifest SHA-256 values. That duplicate receipt is not required by the current
+launch decision.
 
-The final receipt must contain this exact object under
+That superseded final-soak receipt contained this object under
 `measurements.throughput_measurement` (the integers shown are a coherent
 6-row, accumulation-2, 4096-token, 100-update example):
 
@@ -1141,24 +1225,32 @@ The final receipt must contain this exact object under
 }
 ```
 
-The launcher independently re-hashes that receipt and rejects execute unless
-the soak is at least 100 optimizer updates, the counter delta equals
-`soak_steps * global_microbatch_rows * gradient_accumulation_steps *
-sequence_length`, and reported tokens/s matches delta divided by elapsed wall
-time within one part per million. It also requires scaling efficiency at least
-0.70, data-wait fraction at most 0.05, and minimum free memory per GPU of at
-least `max(8 GiB, 10% of physical memory)`.
+The legacy strict-soak path independently re-hashed that receipt and rejected
+execute unless the soak was at least 100 optimizer updates, the counter delta
+equaled `soak_steps * global_microbatch_rows *
+gradient_accumulation_steps * sequence_length`, and reported tokens/s matched
+delta divided by elapsed wall time within one part per million. It also
+required scaling efficiency of at least 0.70, data-wait fraction of at most
+0.05, and minimum free memory per GPU of at least
+`max(8 GiB, 10% of physical memory)`.
 
 ## 10. Final launch record and launch — GO/NO-GO 10
 
 Before launch, publish one checksummed immutable run manifest containing the
 code/container/runtime hashes, all source/corpus/tokenizer/order hashes, GPU
 topology, accepted geometry, optimizer/scheduler/precision/seeds, loader and
-compile choices, checkpoint and validation cadence, W&B mode, measured
+compile choices, checkpoint and validation cadence, online W&B mode, measured
 tokens/s, ETA, and cost. It must also pin the train/validation certification
 receipts and sidecars, launch preflight reports, launcher/certifier hashes, and
 the deterministic-algorithm/CUBLAS workspace contract. Read geometry and
 optimizer update count from the final train order:
+
+Before executing this stage, require the code-produced and code-validated
+`accepted-geometry-with-waiver.json` described in Stage 9. Until that exact
+producer/validator contract exists and passes its tests, stop at NO-GO. Do not
+substitute the geometry `GRID-RESULT` or `candidate-geometry.json`, and do not
+add the waived duplicate final-order checkpoint/resume plus validation/W&B
+soak back as a launch prerequisite.
 
 ```bash
 jq '{
@@ -1173,12 +1265,23 @@ sha256sum "$DATA_ROOT/audits/$RUN_ID/final-training-authority.json" \
   > "$DATA_ROOT/audits/$RUN_ID/final-training-authority.json.sha256"
 ```
 
-The trainer now consumes the distinct immutable validation order on a pinned
-cadence, all-reduces summed loss and supervised-token count, and reports
-Python, other-code, and English validation separately without advancing the
-training sampler or RNG. The final test order and MBPP remain untouched. Final
-training must go through `scripts/launch_pretraining.py`; invoking
-`pretrain.train` or `torchrun` directly is not an approved production launch.
+The trainer consumes the distinct immutable validation order from the start on
+a pinned cadence, all-reduces summed loss and supervised-token count, and
+reports Python, other-code, and English validation separately without
+advancing the training sampler or RNG. The frozen cadence is:
+
+- validation at start, every 500 optimizer updates, and automatically at the
+  final update;
+- 64 fixed immutable-prefix global microbatches per validation event;
+- a durable checkpoint every 1,000 optimizer updates; and
+- training metrics plus online W&B logging every optimizer update.
+
+For the 66,858-update trajectory, start + 133 periodic + final yields 135
+validation points. The 64-batch fixed prefix is expected to keep validation
+overhead below 1% while preserving a stable comparison series. The final test
+order and MBPP remain untouched. Final training must go through
+`scripts/launch_pretraining.py`; invoking `pretrain.train` or `torchrun`
+directly is not an approved production launch.
 
 Expose the final local copy through a read-only bind mount, certify both exact
 orders and all referenced payloads once, and preserve the receipts plus their
@@ -1194,24 +1297,24 @@ export TRAIN_WARMUP_STEPS="${TRAIN_WARMUP_STEPS:?read from the frozen run manife
 export TRAIN_WEIGHT_DECAY="${TRAIN_WEIGHT_DECAY:?read from the frozen run manifest}"
 export TRAIN_MAX_GRAD_NORM="${TRAIN_MAX_GRAD_NORM:?read from the frozen run manifest}"
 export TRAIN_SEED="${TRAIN_SEED:?read from the frozen run manifest}"
-export ACCEPTED_GEOMETRY_RECORD="$DATA_ROOT/audits/$RUN_ID/accepted-geometry.json"
-test -f "$ACCEPTED_GEOMETRY_RECORD"
+export GEOMETRY_WAIVER_RECORD="$DATA_ROOT/audits/$RUN_ID/accepted-geometry-with-waiver.json"
+test -f "$GEOMETRY_WAIVER_RECORD"
 (
-  cd "$(dirname "$ACCEPTED_GEOMETRY_RECORD")"
-  sha256sum -c "$(basename "$ACCEPTED_GEOMETRY_RECORD").sha256"
+  cd "$(dirname "$GEOMETRY_WAIVER_RECORD")"
+  sha256sum -c "$(basename "$GEOMETRY_WAIVER_RECORD").sha256"
 )
-export TRAIN_WORKERS="$(jq -er '.accepted.workers' "$ACCEPTED_GEOMETRY_RECORD")"
-ACCEPTED_COMPILE="$(jq -er '.accepted.compile_model' "$ACCEPTED_GEOMETRY_RECORD")"
+export TRAIN_WORKERS="${TRAIN_WORKERS:?read from the validated run authority}"
+ACCEPTED_COMPILE="${ACCEPTED_COMPILE:?read from the validated run authority}"
 PRODUCTION_COMPILE_ARGS=()
 case "$ACCEPTED_COMPILE" in
   true) PRODUCTION_COMPILE_ARGS+=(--compile) ;;
   false) ;;
   *) echo "accepted compile decision must be boolean" >&2; exit 2 ;;
 esac
-export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:?read from measured network checkpoint policy}"
-export EVAL_EVERY="${EVAL_EVERY:?read from the frozen run manifest}"
-export EVAL_BATCHES="${EVAL_BATCHES:?read from the frozen run manifest}"
-export TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:?read from the frozen run manifest}"
+export CHECKPOINT_EVERY=1000
+export EVAL_EVERY=500
+export EVAL_BATCHES=64
+export TRAIN_LOG_EVERY=1
 export CHECKPOINT_GENERATION_BYTES="${CHECKPOINT_GENERATION_BYTES:?measured conservative mature-generation bound}"
 
 GPU_PACKED_SOURCE="$GPU_PACKED"
@@ -1260,7 +1363,7 @@ LAUNCH_COMMON=(
   --eval-every "$EVAL_EVERY"
   --eval-batches "$EVAL_BATCHES"
   --eval-at-start
-  --wandb-mode offline
+  --wandb-mode online
   --wandb-project coding-model-from-scratch
   --wandb-run-name "$RUN_ID"
   --train-data-evidence "$TRAIN_DATA_EVIDENCE"
@@ -1303,15 +1406,20 @@ generation itself fails. A new run never resumes implicitly. Preserve the two
 certification receipts, their sidecars, and both launch reports in the
 immutable run record.
 
-W&B offline files live beside the durable checkpoint. Uploading them later is
-optional and must not affect training. Monitor global and per-domain training
-and validation loss, LR, gradient norm, input/supervised tokens, exact mixture,
-tokens/s, GPU memory/utilization, data wait, collectives, checkpoint health, and
-remaining authorized tokens. Stop on non-finite values, identity/mixture drift,
-corruption, failed durable checkpointing, failed validation, or unexplained
-throughput collapse.
+Online W&B is mandatory from step 1 of the full run; validate credentials and
+network access during launch preflight, and permit only rank zero to create or
+resume the run. Monitor global and per-domain training and validation loss, LR,
+gradient norm, input/supervised tokens, exact mixture, tokens/s, GPU
+memory/utilization, data wait, collectives, checkpoint health, and remaining
+authorized tokens. Keep the opening run attended through at least its first
+successful validation and durable checkpoint. Stop on non-finite values,
+identity/mixture drift, corruption, failed durable checkpointing, unavailable
+resume state, failed validation, missing/stale telemetry, or unexplained
+throughput collapse. This monitored proving period is part of the real run; it
+does not consume a disposable duplicate trajectory.
 
-The training ETA is conditional: `52.58e9 / measured_aggregate_input_tokens_s`.
-Use the slow sustained post-warmup rate from the accepted full-topology smoke,
-then add measured validation and checkpoint downtime. Do not estimate from GPU
-marketing throughput.
+The training ETA is conditional:
+`52,579,270,656 / measured_aggregate_input_tokens_s`. Use the slow sustained
+post-warmup rate from the accepted full-topology geometry run, then add the
+expected sub-1% validation overhead and measured checkpoint downtime. Do not
+estimate from GPU marketing throughput.

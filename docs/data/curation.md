@@ -1,14 +1,30 @@
 # Final corpus curation and selection
 
-> **Generation-v2 route:** exact quota selection in `curate_corpus.py` is no
-> longer the intended final publication path. After the other-code top-up, v2
-> must rebuild inventory, reasons, global exact/normalized canonicalization,
-> and leakage-safe groups from all old plus new inputs. A separate v7 publisher
-> then keeps every eligible canonical full document with per-archive bitmaps;
-> packed order v4 becomes the only 40/40/20 and token-budget authority. See
-> [fast-generation-v2.md](fast-generation-v2.md). The v5/v6 quota-selection
-> algorithm below remains the historical implementation contract and must not
-> be mistaken for the v2 launch procedure.
+> **Current outcome — 2026-09-02**
+>
+> Generation-v2 curation is complete. It rebuilt inventory, reasons, global
+> exact/normalized canonicalization, and leakage-safe groups across all old and
+> top-up inputs. Selection-v7 then published one authenticated keep/reject
+> bitmap per raw archive and kept every eligible canonical document at full
+> length. The authenticated selection-v7 authority and cache-backed
+> materializer contract are complete.
+>
+> The closed-world raw-token cache and all nine packed split/domain streams are
+> also complete. Their portable packed-only S3 backup was restored with
+> checksum verification to six-H100 pod-local NVMe at
+> `/root/transcendent-logic-data`. Deterministic order v4 and the final
+> top-level corpus manifest remain pending six-H100 geometry qualification.
+> They must be built only from existing packed row references. The selected
+> train decision is 12,836,736 unique rows, 66,858 complete 192-row updates,
+> and exactly 52,579,270,656 input positions under the 40/40/20 allocation,
+> without replacement or repeats.
+> See the [pre-training corpus record](final-corpus-record.md) for current
+> identity and [fast-generation-v2.md](fast-generation-v2.md) for build history.
+>
+> Exact quota selection in `curate_corpus.py` was not the generation-v2
+> publication path. The v5/v6 quota-selection algorithm and command below are
+> retained as historical implementation contracts; do not run them against the
+> completed v2 corpus.
 
 `scripts/curate_corpus.py` is the immutable boundary between the streaming raw
 audit and the later raw-text reader/tokenizer/packer. It consumes the finalized
@@ -21,7 +37,7 @@ but its tar members are not parsed by curation. The
 manifest records both facts explicitly; legacy `raw_archives_opened: false`
 continues to mean "not opened as selection/content input."
 
-Production selection now fails closed while collection or preprocessing is
+The selection implementation fails closed while collection or preprocessing is
 incomplete. Before freezing the report inventory, it requires all four
 collection targets and completion markers, exactly one canonical quota record,
 raw archive, report, and fingerprint shard per archive, no extra raw/report/
@@ -156,20 +172,27 @@ manifest reports `selected_totals` as observed supply and keeps reference
 quotas informational. The materializer preserves separate split/domain packed
 streams, and deterministic order v4 later selects the actual 40/40/20 rows.
 
-Publisher/materializer v7 qualification is still in progress. No production
-command should be frozen until the fresh v2 canonical/group snapshot exists
-and the producer/consumer contract suite passes.
+The v7 publisher and cache-backed materializer contracts passed, the complete
+v2 canonical/group snapshot exists, and the selection-v7 manifest, cache
+inventory, and packed-phase outputs are authenticated. This completion does not
+imply that geometry-bound orders or the top-level corpus manifest exist; those
+remain pending.
 
 ## Token accounting boundary
 
-The curation quotas are exact **pre-packing StarCoder2 content tokens**. They
-are not the Chinchilla training-input count. EOS document boundaries add tokens
-and incomplete packing tails can drop tokens. The final packed order v4
-manifest's full-optimizer-update-prefix `consumed_input_tokens` is the
-authoritative train/validation/test model-input budget and must be checked
+The historical curation quotas are exact **pre-packing StarCoder2 content
+tokens**. They are not the Chinchilla training-input count. EOS document
+boundaries add tokens and incomplete packing tails can drop tokens. The pending
+packed order v4 manifest must reproduce the selected 52,579,270,656-position
+train decision; its full-optimizer-update-prefix `consumed_input_tokens` will
+be the final train/validation/test model-input authority and must be checked
 before launching training.
 
-## Restart and integrity model
+## Historical v5/v6 restart and integrity model
+
+This section documents the quota-selector implementation and its recovery
+properties. It does not describe an active curation job or the completed
+selection-v7 publication state.
 
 `OUTPUT/.work/curation.sqlite3` is authoritative. SQLite uses full synchronous
 commits; archive ingestion, each later bulk write, and every phase transition
@@ -255,10 +278,11 @@ database copied to NFS is deliberately rejected for resume rather than silently
 converted. If network-volume execution is unavoidable, auto mode selects
 rollback journaling; expect substantially lower SQLite throughput.
 
-## Fast-baseline production command
+## Historical fast-baseline production command
 
-After all fingerprint reports finish, the initial speed-focused baseline skips
-the separate fuzzy English near-dedup job and runs the versioned fast policy:
+After all fingerprint reports finished, the initial speed-focused baseline
+skipped the separate fuzzy English near-dedup job and used the versioned fast
+policy. This v5/v6 command is retained for provenance and interface history:
 
 ```bash
 /opt/coding-model-venv/bin/python \
@@ -277,9 +301,9 @@ survivors by repository/stable English source, and does not consume an English
 near-map artifact. Its manifest is format v6 and explicitly records that fuzzy
 near-deduplication was not performed.
 
-Because this command runs on the network volume, its SQLite checkpoint and
-closed publication are already durable. Never copy or move the live directory
-while curation is running.
+During that historical network-volume run, its SQLite checkpoint and closed
+publication were durable. Never copy or move a live curation directory while
+its writer is running.
 
 The curator enforces a cross-client singleton with the atomic, NFS-visible
 `selection-fast-v1/.curation.cross-client-lease.json` owner record in addition
