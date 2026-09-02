@@ -30,6 +30,31 @@ import torch.distributed as dist
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+CHECKPOINT_COMPARE_CHUNK_ELEMENTS = 1_048_576
+CHECKPOINT_MISMATCH_PATH_LIMIT = 256
+CHECKPOINT_TRAJECTORY_COMPONENTS = (
+    "format",
+    "format_version",
+    "torch_version",
+    "runtime_signature",
+    "implementation_signature",
+    "model",
+    "model_config",
+    "parameter_dtypes",
+    "optimizer",
+    "optimizer_class",
+    "train_state",
+    "rng_states",
+    "train_trajectory_config",
+    "training_geometry",
+    "validation_configuration",
+    "data_identity",
+    "tokenizer_manifest_sha256",
+    "tokenizer_vocabulary_sha256",
+    "world_size",
+)
+TOLERANCE_ELIGIBLE_COMPONENTS = frozenset(("model", "optimizer"))
+
 from pretrain.model import CausalLM, ModelConfig
 from pretrain.data import (
     DOMAIN_ORDER,
@@ -327,43 +352,381 @@ def checkpoint_trajectory_digests(path: Path) -> dict[str, str]:
     payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     if not isinstance(payload, dict):
         raise ValueError("Checkpoint root must be a dictionary")
-    components = (
-        "format",
-        "format_version",
-        "torch_version",
-        "runtime_signature",
-        "implementation_signature",
-        "model",
-        "model_config",
-        "parameter_dtypes",
-        "optimizer",
-        "optimizer_class",
-        "train_state",
-        "rng_states",
-        "train_trajectory_config",
-        "training_geometry",
-        "validation_configuration",
-        "data_identity",
-        "tokenizer_manifest_sha256",
-        "tokenizer_vocabulary_sha256",
-        "world_size",
-    )
-    missing = [component for component in components if component not in payload]
+    missing = [
+        component
+        for component in CHECKPOINT_TRAJECTORY_COMPONENTS
+        if component not in payload
+    ]
     if missing:
         raise ValueError(f"Checkpoint lacks exact-resume fields: {missing}")
     result: dict[str, str] = {}
-    for component in components:
+    for component in CHECKPOINT_TRAJECTORY_COMPONENTS:
         digest = hashlib.sha256()
         _hash_semantic_value(digest, payload[component])
         result[component] = digest.hexdigest()
     return result
 
 
+def _semantic_value_sha256(value: Any) -> str:
+    digest = hashlib.sha256()
+    _hash_semantic_value(digest, value)
+    return digest.hexdigest()
+
+
+def _validate_resume_tensor_tolerances(*, atol: float, rtol: float) -> None:
+    for name, value in (("atol", atol), ("rtol", rtol)):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"Resume tensor {name} must be finite and non-negative, got {value!r}"
+            )
+
+
+def _checkpoint_path_child(path: str, key: Any) -> str:
+    if isinstance(key, str):
+        return f"{path}[{json.dumps(key)}]"
+    return f"{path}[{type(key).__name__}:{repr(key)}]"
+
+
+def _mapping_key_identity(key: Any) -> tuple[str, str, str]:
+    return type(key).__name__, repr(key), _semantic_value_sha256(key)
+
+
+def _linear_tensor_chunk(
+    tensor: torch.Tensor,
+    start: int,
+    stop: int,
+) -> torch.Tensor:
+    """Read one logical flattened slice without materializing a whole tensor."""
+
+    if tensor.layout != torch.strided:
+        raise TypeError(f"Unsupported checkpoint tensor layout: {tensor.layout}")
+    if tensor.is_contiguous():
+        return tensor.view(-1)[start:stop]
+    linear_indices = torch.arange(start, stop, dtype=torch.int64)
+    coordinates = torch.unravel_index(linear_indices, tensor.shape)
+    return tensor[coordinates]
+
+
+class _CheckpointToleranceDiagnostics:
+    """Bounded, JSON-safe diagnostics for a checkpoint numeric comparison."""
+
+    def __init__(self, *, atol: float, rtol: float) -> None:
+        self.atol = atol
+        self.rtol = rtol
+        self.floating_tensor_count = 0
+        self.floating_element_count = 0
+        self.numerically_different_tensor_count = 0
+        self.numerically_different_element_count = 0
+        self.out_of_tolerance_tensor_count = 0
+        self.out_of_tolerance_element_count = 0
+        self.non_finite_tensor_count = 0
+        self.non_finite_element_count = 0
+        self.structural_mismatch_count = 0
+        self.exact_value_mismatch_count = 0
+        self.mismatch_path_count = 0
+        self.max_absolute_difference = 0.0
+        self.max_relative_difference = 0.0
+        self.metrics_clamped = False
+        self.mismatch_paths: list[dict[str, Any]] = []
+        self.numeric_difference_paths: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _bounded_append(
+        destination: list[dict[str, Any]],
+        payload: dict[str, Any],
+    ) -> None:
+        if len(destination) < CHECKPOINT_MISMATCH_PATH_LIMIT:
+            destination.append(payload)
+
+    def add_violation(self, *, path: str, kind: str, **details: Any) -> None:
+        self.mismatch_path_count += 1
+        self._bounded_append(
+            self.mismatch_paths,
+            {"path": path, "kind": kind, **details},
+        )
+
+    def add_structural_mismatch(
+        self,
+        *,
+        path: str,
+        reason: str,
+        **details: Any,
+    ) -> None:
+        self.structural_mismatch_count += 1
+        self.add_violation(
+            path=path,
+            kind="structure_mismatch",
+            reason=reason,
+            **details,
+        )
+
+    def add_exact_value_mismatch(self, *, path: str) -> None:
+        self.exact_value_mismatch_count += 1
+        self.add_violation(path=path, kind="exact_value_mismatch")
+
+    @staticmethod
+    def _finite_max(value: torch.Tensor) -> tuple[float, bool]:
+        if value.numel() == 0:
+            return 0.0, False
+        maximum = float(value.max())
+        if math.isfinite(maximum):
+            return maximum, False
+        return sys.float_info.max, True
+
+    def compare_floating_tensors(
+        self,
+        *,
+        actual: torch.Tensor,
+        reference: torch.Tensor,
+        path: str,
+    ) -> None:
+        self.floating_tensor_count += 1
+        elements = actual.numel()
+        self.floating_element_count += elements
+        tensor_different_elements = 0
+        tensor_out_of_tolerance_elements = 0
+        tensor_non_finite_elements = 0
+        tensor_max_absolute = 0.0
+        tensor_max_relative = 0.0
+        tensor_metrics_clamped = False
+        for start in range(0, elements, CHECKPOINT_COMPARE_CHUNK_ELEMENTS):
+            stop = min(start + CHECKPOINT_COMPARE_CHUNK_ELEMENTS, elements)
+            actual_chunk = _linear_tensor_chunk(actual, start, stop).to(torch.float64)
+            reference_chunk = _linear_tensor_chunk(reference, start, stop).to(
+                torch.float64
+            )
+            finite = torch.isfinite(actual_chunk) & torch.isfinite(reference_chunk)
+            non_finite_count = int((~finite).sum())
+            tensor_non_finite_elements += non_finite_count
+            different = actual_chunk.ne(reference_chunk) | ~finite
+            tensor_different_elements += int(different.sum())
+            close = torch.isclose(
+                actual_chunk,
+                reference_chunk,
+                atol=self.atol,
+                rtol=self.rtol,
+                equal_nan=False,
+            ) & finite
+            tensor_out_of_tolerance_elements += int((~close).sum())
+            if bool(finite.any()):
+                finite_actual = actual_chunk[finite]
+                finite_reference = reference_chunk[finite]
+                absolute = (finite_actual - finite_reference).abs()
+                absolute_max, absolute_clamped = self._finite_max(absolute)
+                denominator = finite_reference.abs().clamp_min(
+                    torch.finfo(torch.float64).tiny
+                )
+                relative = absolute / denominator
+                relative_max, relative_clamped = self._finite_max(relative)
+                tensor_max_absolute = max(tensor_max_absolute, absolute_max)
+                tensor_max_relative = max(tensor_max_relative, relative_max)
+                tensor_metrics_clamped |= absolute_clamped or relative_clamped
+
+        self.numerically_different_element_count += tensor_different_elements
+        self.out_of_tolerance_element_count += tensor_out_of_tolerance_elements
+        self.non_finite_element_count += tensor_non_finite_elements
+        self.max_absolute_difference = max(
+            self.max_absolute_difference,
+            tensor_max_absolute,
+        )
+        self.max_relative_difference = max(
+            self.max_relative_difference,
+            tensor_max_relative,
+        )
+        self.metrics_clamped |= tensor_metrics_clamped
+        if tensor_different_elements:
+            self.numerically_different_tensor_count += 1
+            self._bounded_append(
+                self.numeric_difference_paths,
+                {
+                    "path": path,
+                    "elements": elements,
+                    "different_elements": tensor_different_elements,
+                    "out_of_tolerance_elements": tensor_out_of_tolerance_elements,
+                    "non_finite_elements": tensor_non_finite_elements,
+                    "max_absolute_difference": tensor_max_absolute,
+                    "max_relative_difference": tensor_max_relative,
+                    "metrics_clamped": tensor_metrics_clamped,
+                },
+            )
+        if tensor_non_finite_elements:
+            self.non_finite_tensor_count += 1
+        if tensor_out_of_tolerance_elements:
+            self.out_of_tolerance_tensor_count += 1
+            self.add_violation(
+                path=path,
+                kind="floating_tensor_out_of_tolerance",
+                elements=elements,
+                out_of_tolerance_elements=tensor_out_of_tolerance_elements,
+                non_finite_elements=tensor_non_finite_elements,
+                max_absolute_difference=tensor_max_absolute,
+                max_relative_difference=tensor_max_relative,
+                metrics_clamped=tensor_metrics_clamped,
+            )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "eligible_components": sorted(TOLERANCE_ELIGIBLE_COMPONENTS),
+            "chunk_elements": CHECKPOINT_COMPARE_CHUNK_ELEMENTS,
+            "floating_tensor_count": self.floating_tensor_count,
+            "floating_element_count": self.floating_element_count,
+            "numerically_different_tensor_count": (
+                self.numerically_different_tensor_count
+            ),
+            "numerically_different_element_count": (
+                self.numerically_different_element_count
+            ),
+            "out_of_tolerance_tensor_count": self.out_of_tolerance_tensor_count,
+            "out_of_tolerance_element_count": self.out_of_tolerance_element_count,
+            "non_finite_tensor_count": self.non_finite_tensor_count,
+            "non_finite_element_count": self.non_finite_element_count,
+            "structural_mismatch_count": self.structural_mismatch_count,
+            "exact_value_mismatch_count": self.exact_value_mismatch_count,
+            "mismatch_path_count": self.mismatch_path_count,
+            "max_absolute_difference": self.max_absolute_difference,
+            "max_relative_difference": self.max_relative_difference,
+            "metrics_clamped": self.metrics_clamped,
+            "mismatch_paths_truncated": (
+                self.mismatch_path_count > len(self.mismatch_paths)
+            ),
+            "mismatch_paths": self.mismatch_paths,
+            "numeric_difference_paths_truncated": (
+                self.numerically_different_tensor_count
+                > len(self.numeric_difference_paths)
+            ),
+            "numeric_difference_paths": self.numeric_difference_paths,
+        }
+
+
+def _compare_tolerance_eligible_value(
+    actual: Any,
+    reference: Any,
+    *,
+    path: str,
+    diagnostics: _CheckpointToleranceDiagnostics,
+) -> None:
+    if isinstance(actual, torch.Tensor) or isinstance(reference, torch.Tensor):
+        if not isinstance(actual, torch.Tensor) or not isinstance(
+            reference, torch.Tensor
+        ):
+            diagnostics.add_structural_mismatch(
+                path=path,
+                reason="tensor_type",
+                actual_type=type(actual).__name__,
+                reference_type=type(reference).__name__,
+            )
+            return
+        if actual.dtype != reference.dtype:
+            diagnostics.add_structural_mismatch(
+                path=path,
+                reason="tensor_dtype",
+                actual_dtype=str(actual.dtype),
+                reference_dtype=str(reference.dtype),
+            )
+            return
+        if actual.shape != reference.shape:
+            diagnostics.add_structural_mismatch(
+                path=path,
+                reason="tensor_shape",
+                actual_shape=list(actual.shape),
+                reference_shape=list(reference.shape),
+            )
+            return
+        if actual.layout != reference.layout or actual.layout != torch.strided:
+            diagnostics.add_structural_mismatch(
+                path=path,
+                reason="tensor_layout",
+                actual_layout=str(actual.layout),
+                reference_layout=str(reference.layout),
+            )
+            return
+        if torch.is_floating_point(actual):
+            diagnostics.compare_floating_tensors(
+                actual=actual.detach().cpu(),
+                reference=reference.detach().cpu(),
+                path=path,
+            )
+        elif _semantic_value_sha256(actual) != _semantic_value_sha256(reference):
+            diagnostics.add_exact_value_mismatch(path=path)
+        return
+
+    if isinstance(actual, Mapping) or isinstance(reference, Mapping):
+        if not isinstance(actual, Mapping) or not isinstance(reference, Mapping):
+            diagnostics.add_structural_mismatch(
+                path=path,
+                reason="mapping_type",
+                actual_type=type(actual).__name__,
+                reference_type=type(reference).__name__,
+            )
+            return
+        actual_keys = {_mapping_key_identity(key): key for key in actual}
+        reference_keys = {_mapping_key_identity(key): key for key in reference}
+        if actual_keys.keys() != reference_keys.keys():
+            diagnostics.add_structural_mismatch(
+                path=path,
+                reason="mapping_keys",
+                actual_key_count=len(actual_keys),
+                reference_key_count=len(reference_keys),
+            )
+            return
+        for identity in sorted(actual_keys):
+            actual_key = actual_keys[identity]
+            reference_key = reference_keys[identity]
+            _compare_tolerance_eligible_value(
+                actual[actual_key],
+                reference[reference_key],
+                path=_checkpoint_path_child(path, actual_key),
+                diagnostics=diagnostics,
+            )
+        return
+
+    if isinstance(actual, (list, tuple)) or isinstance(reference, (list, tuple)):
+        if type(actual) is not type(reference):
+            diagnostics.add_structural_mismatch(
+                path=path,
+                reason="sequence_type",
+                actual_type=type(actual).__name__,
+                reference_type=type(reference).__name__,
+            )
+            return
+        if len(actual) != len(reference):
+            diagnostics.add_structural_mismatch(
+                path=path,
+                reason="sequence_length",
+                actual_length=len(actual),
+                reference_length=len(reference),
+            )
+            return
+        for index, (actual_item, reference_item) in enumerate(
+            zip(actual, reference, strict=True)
+        ):
+            _compare_tolerance_eligible_value(
+                actual_item,
+                reference_item,
+                path=f"{path}[{index}]",
+                diagnostics=diagnostics,
+            )
+        return
+
+    if _semantic_value_sha256(actual) != _semantic_value_sha256(reference):
+        diagnostics.add_exact_value_mismatch(path=path)
+
+
 def compare_checkpoint_trajectories(
     actual: Path,
     reference: Path,
+    *,
+    tensor_atol: float = 0.0,
+    tensor_rtol: float = 0.0,
 ) -> dict[str, Any]:
-    """Return exact semantic equality evidence for two final checkpoints."""
+    """Compare final checkpoints under an exact or explicitly tolerant contract.
+
+    Only floating tensors nested below ``model`` and ``optimizer`` are tolerance
+    eligible. Every other component and all structure/dtypes/shapes/non-floating
+    leaves remain exact. Zero tolerances preserve the prior exact acceptance gate.
+    """
+
+    _validate_resume_tensor_tolerances(atol=tensor_atol, rtol=tensor_rtol)
 
     actual_digests = checkpoint_trajectory_digests(actual)
     reference_digests = checkpoint_trajectory_digests(reference)
@@ -372,14 +735,56 @@ def compare_checkpoint_trajectories(
         for component in actual_digests
         if actual_digests[component] != reference_digests[component]
     ]
+    actual_payload = torch.load(actual, map_location="cpu", weights_only=False, mmap=True)
+    reference_payload = torch.load(
+        reference,
+        map_location="cpu",
+        weights_only=False,
+        mmap=True,
+    )
+    if not isinstance(actual_payload, dict) or not isinstance(reference_payload, dict):
+        raise ValueError("Checkpoint root must be a dictionary")
+    diagnostics = _CheckpointToleranceDiagnostics(
+        atol=tensor_atol,
+        rtol=tensor_rtol,
+    )
+    tolerant_mismatches: list[str] = []
+    for component in CHECKPOINT_TRAJECTORY_COMPONENTS:
+        if component in TOLERANCE_ELIGIBLE_COMPONENTS:
+            before = diagnostics.mismatch_path_count
+            _compare_tolerance_eligible_value(
+                actual_payload[component],
+                reference_payload[component],
+                path=_checkpoint_path_child("$", component),
+                diagnostics=diagnostics,
+            )
+            if diagnostics.mismatch_path_count != before:
+                tolerant_mismatches.append(component)
+        elif actual_digests[component] != reference_digests[component]:
+            tolerant_mismatches.append(component)
+            diagnostics.add_exact_value_mismatch(
+                path=_checkpoint_path_child("$", component)
+            )
+    exact_match = not mismatches
+    tolerant_match = not tolerant_mismatches
+    tolerance_enabled = tensor_atol > 0.0 or tensor_rtol > 0.0
     return {
         "requested": True,
+        "comparison_mode": (
+            "floating_tensor_tolerance" if tolerance_enabled else "exact"
+        ),
+        "tensor_atol": tensor_atol,
+        "tensor_rtol": tensor_rtol,
         "reference_checkpoint": str(reference.resolve()),
         "actual_checkpoint": str(actual.resolve()),
         "components": actual_digests,
         "reference_components": reference_digests,
         "mismatches": mismatches,
-        "exact_match": not mismatches,
+        "exact_match": exact_match,
+        "tolerant_mismatches": tolerant_mismatches,
+        "tolerant_match": tolerant_match,
+        "accepted_match": tolerant_match if tolerance_enabled else exact_match,
+        "numeric_diagnostics": diagnostics.as_dict(),
     }
 
 
@@ -430,6 +835,8 @@ def run_overfit(
     wandb_run_id: str | None = None,
     until_step: int | None = None,
     exact_reference_checkpoint: Path | None = None,
+    resume_tensor_atol: float = 0.0,
+    resume_tensor_rtol: float = 0.0,
     rank: int = 0,
     world_size: int = 1,
 ) -> dict[str, Any]:
@@ -443,6 +850,10 @@ def run_overfit(
         raise ValueError("until_step must be in [1, steps) for a partial run")
     if exact_reference_checkpoint is not None and until_step is not None:
         raise ValueError("A partial run cannot compare a final reference checkpoint")
+    _validate_resume_tensor_tolerances(
+        atol=resume_tensor_atol,
+        rtol=resume_tensor_rtol,
+    )
 
     global_batch = load_one_packed_batch(order_manifest, batch_size=batch_size)
     boundaries = packed_boundary_diagnostics(global_batch)
@@ -570,12 +981,14 @@ def run_overfit(
             exact_resume = compare_checkpoint_trajectories(
                 checkpoint_path,
                 exact_reference_checkpoint,
+                tensor_atol=resume_tensor_atol,
+                tensor_rtol=resume_tensor_rtol,
             )
         except BaseException as exc:
             comparison_error = exc
     _raise_if_distributed_stage_failed(
         comparison_error,
-        stage="exact final-checkpoint comparison",
+        stage="final-checkpoint trajectory comparison",
         rank=rank,
         world_size=world_size,
     )
@@ -597,7 +1010,7 @@ def run_overfit(
         failures.append("loss_ratio_above_required_threshold")
     if final_loss > required_final_loss:
         failures.append("final_loss_above_memorization_threshold")
-    if exact_resume.get("requested") and not exact_resume.get("exact_match"):
+    if exact_resume.get("requested") and not exact_resume.get("accepted_match"):
         failures.append("resumed_trajectory_differs_from_uninterrupted_reference")
     result["failures"] = failures
     result["status"] = "failed" if failures else "passed"
@@ -643,8 +1056,26 @@ def main() -> int:
         "--exact-reference-checkpoint",
         type=Path,
         help=(
-            "uninterrupted final checkpoint whose model, optimizer, counters, "
-            "RNG states, trajectory, data, tokenizer, and world size must match"
+            "trusted uninterrupted final checkpoint; comparison is exact unless "
+            "explicit tensor tolerances are supplied"
+        ),
+    )
+    parser.add_argument(
+        "--resume-tensor-atol",
+        type=float,
+        default=0.0,
+        help=(
+            "absolute tolerance for floating model/optimizer tensors only; "
+            "default 0 preserves exact resume semantics"
+        ),
+    )
+    parser.add_argument(
+        "--resume-tensor-rtol",
+        type=float,
+        default=0.0,
+        help=(
+            "relative tolerance for floating model/optimizer tensors only; "
+            "default 0 preserves exact resume semantics"
         ),
     )
     parser.add_argument("--compile", action="store_true")
@@ -669,6 +1100,20 @@ def main() -> int:
         parser.error("--stop-after-step must be in [1, steps)")
     if args.stop_after_step is not None and args.exact_reference_checkpoint is not None:
         parser.error("a partial checkpoint cannot be compared with a final reference")
+    try:
+        _validate_resume_tensor_tolerances(
+            atol=args.resume_tensor_atol,
+            rtol=args.resume_tensor_rtol,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if (
+        (args.resume_tensor_atol > 0.0 or args.resume_tensor_rtol > 0.0)
+        and args.exact_reference_checkpoint is None
+    ):
+        parser.error(
+            "resume tensor tolerances require --exact-reference-checkpoint"
+        )
     if not 0 < args.required_loss_ratio < 1:
         parser.error("--required-loss-ratio must be in (0, 1)")
     if not math.isfinite(args.required_final_loss) or args.required_final_loss <= 0:
@@ -830,6 +1275,8 @@ def main() -> int:
                             "learning_rate": args.learning_rate,
                             "seed": args.seed,
                             "world_size": world_size,
+                            "resume_tensor_atol": args.resume_tensor_atol,
+                            "resume_tensor_rtol": args.resume_tensor_rtol,
                         },
                         directory=args.output_dir,
                     )
@@ -863,6 +1310,8 @@ def main() -> int:
                     "steps": args.steps,
                     "stop_after_step": args.stop_after_step,
                     "seed": args.seed,
+                    "resume_tensor_atol": args.resume_tensor_atol,
+                    "resume_tensor_rtol": args.resume_tensor_rtol,
                 },
             )
 
@@ -890,6 +1339,8 @@ def main() -> int:
                 wandb_run_id=wandb_run_id,
                 until_step=args.stop_after_step,
                 exact_reference_checkpoint=args.exact_reference_checkpoint,
+                resume_tensor_atol=args.resume_tensor_atol,
+                resume_tensor_rtol=args.resume_tensor_rtol,
                 rank=rank,
                 world_size=world_size,
             )

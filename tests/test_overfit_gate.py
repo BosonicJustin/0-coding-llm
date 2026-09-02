@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -21,7 +22,190 @@ OVERFIT_MODULE = importlib.util.module_from_spec(OVERFIT_SPEC)
 OVERFIT_SPEC.loader.exec_module(OVERFIT_MODULE)
 
 
+def _checkpoint_payload(
+    *,
+    model_dtype: torch.dtype = torch.float32,
+    model_delta: float = 0.0,
+    optimizer_delta: float = 0.0,
+    optimizer_seen: int = 7,
+    train_step: int = 11,
+) -> dict[str, object]:
+    return {
+        "format": "pretrain-checkpoint",
+        "format_version": 1,
+        "torch_version": str(torch.__version__),
+        "runtime_signature": {"device": "test"},
+        "implementation_signature": "implementation-sha256",
+        "model": {
+            "weight": torch.tensor(
+                [1.0 + model_delta, -2.0, 0.0],
+                dtype=model_dtype,
+            )
+        },
+        "model_config": {"dim": 3},
+        "parameter_dtypes": {"weight": str(model_dtype)},
+        "optimizer": {
+            "state": {
+                0: {
+                    "step": torch.tensor(11.0),
+                    "exp_avg": torch.tensor([0.25 + optimizer_delta, -0.5]),
+                    "seen": torch.tensor(optimizer_seen, dtype=torch.int64),
+                }
+            },
+            "param_groups": [{"lr": 1e-3, "params": [0]}],
+        },
+        "optimizer_class": "AdamW",
+        "train_state": {"completed_steps": train_step},
+        "rng_states": {"cpu": torch.tensor([1, 2, 3], dtype=torch.uint8)},
+        "train_trajectory_config": {"seed": 1234},
+        "training_geometry": {"world_size": 6},
+        "validation_configuration": {"every": 10},
+        "data_identity": "data-sha256",
+        "tokenizer_manifest_sha256": "a" * 64,
+        "tokenizer_vocabulary_sha256": "b" * 64,
+        "world_size": 6,
+    }
+
+
+def _save_checkpoint(path: Path, **changes: object) -> None:
+    torch.save(_checkpoint_payload(**changes), path)
+
+
 class OverfitGateArtifactTest(unittest.TestCase):
+    def test_explicit_tensor_tolerance_is_narrow_and_json_finite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference = root / "reference.pt"
+            actual = root / "actual.pt"
+            _save_checkpoint(reference)
+            _save_checkpoint(
+                actual,
+                model_delta=1e-7,
+                optimizer_delta=5e-8,
+            )
+
+            exact = OVERFIT_MODULE.compare_checkpoint_trajectories(
+                actual,
+                reference,
+            )
+            self.assertFalse(exact["exact_match"])
+            self.assertFalse(exact["accepted_match"])
+            self.assertEqual(exact["comparison_mode"], "exact")
+
+            with mock.patch.object(
+                OVERFIT_MODULE,
+                "CHECKPOINT_COMPARE_CHUNK_ELEMENTS",
+                2,
+            ):
+                tolerant = OVERFIT_MODULE.compare_checkpoint_trajectories(
+                    actual,
+                    reference,
+                    tensor_atol=2e-7,
+                    tensor_rtol=1e-5,
+                )
+            self.assertFalse(tolerant["exact_match"])
+            self.assertTrue(tolerant["tolerant_match"])
+            self.assertTrue(tolerant["accepted_match"])
+            self.assertEqual(
+                tolerant["mismatches"],
+                ["model", "optimizer"],
+            )
+            diagnostics = tolerant["numeric_diagnostics"]
+            self.assertEqual(diagnostics["chunk_elements"], 2)
+            self.assertEqual(diagnostics["out_of_tolerance_element_count"], 0)
+            self.assertEqual(diagnostics["non_finite_element_count"], 0)
+            self.assertGreaterEqual(
+                diagnostics["numerically_different_element_count"],
+                2,
+            )
+            self.assertTrue(
+                math.isfinite(diagnostics["max_absolute_difference"])
+            )
+            self.assertTrue(
+                math.isfinite(diagnostics["max_relative_difference"])
+            )
+            json.dumps(tolerant, allow_nan=False)
+
+    def test_tolerance_never_relaxes_structure_or_exact_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference = root / "reference.pt"
+            _save_checkpoint(reference)
+
+            dtype_mismatch = root / "dtype.pt"
+            _save_checkpoint(dtype_mismatch, model_dtype=torch.float64)
+            dtype_result = OVERFIT_MODULE.compare_checkpoint_trajectories(
+                dtype_mismatch,
+                reference,
+                tensor_atol=1.0,
+                tensor_rtol=1.0,
+            )
+            self.assertFalse(dtype_result["accepted_match"])
+            self.assertIn("model", dtype_result["tolerant_mismatches"])
+            self.assertEqual(
+                dtype_result["numeric_diagnostics"]["structural_mismatch_count"],
+                1,
+            )
+
+            integer_mismatch = root / "integer.pt"
+            _save_checkpoint(integer_mismatch, optimizer_seen=8)
+            integer_result = OVERFIT_MODULE.compare_checkpoint_trajectories(
+                integer_mismatch,
+                reference,
+                tensor_atol=1.0,
+                tensor_rtol=1.0,
+            )
+            self.assertFalse(integer_result["accepted_match"])
+            self.assertIn("optimizer", integer_result["tolerant_mismatches"])
+            self.assertEqual(
+                integer_result["numeric_diagnostics"]["exact_value_mismatch_count"],
+                1,
+            )
+
+            state_mismatch = root / "state.pt"
+            _save_checkpoint(state_mismatch, train_step=12)
+            state_result = OVERFIT_MODULE.compare_checkpoint_trajectories(
+                state_mismatch,
+                reference,
+                tensor_atol=1.0,
+                tensor_rtol=1.0,
+            )
+            self.assertFalse(state_result["accepted_match"])
+            self.assertIn("train_state", state_result["tolerant_mismatches"])
+
+    def test_non_finite_float_tensor_is_never_tolerance_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference = root / "reference.pt"
+            actual = root / "actual.pt"
+            _save_checkpoint(reference)
+            payload = _checkpoint_payload()
+            payload["model"]["weight"][0] = torch.nan
+            torch.save(payload, actual)
+
+            result = OVERFIT_MODULE.compare_checkpoint_trajectories(
+                actual,
+                reference,
+                tensor_atol=2e-7,
+                tensor_rtol=1e-5,
+            )
+            self.assertFalse(result["tolerant_match"])
+            self.assertFalse(result["accepted_match"])
+            diagnostics = result["numeric_diagnostics"]
+            self.assertEqual(diagnostics["non_finite_element_count"], 1)
+            self.assertEqual(diagnostics["out_of_tolerance_element_count"], 1)
+            json.dumps(result, allow_nan=False)
+
+    def test_resume_tensor_tolerances_must_be_finite_and_nonnegative(self) -> None:
+        for value in (float("nan"), float("inf"), -1e-9):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "finite and non-negative"):
+                    OVERFIT_MODULE.compare_checkpoint_trajectories(
+                        Path("unused-actual.pt"),
+                        Path("unused-reference.pt"),
+                        tensor_atol=value,
+                    )
+
     def test_fixture_exercises_real_packed_boundary_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             order = OVERFIT_MODULE.build_synthetic_order(
@@ -105,7 +289,40 @@ class OverfitGateArtifactTest(unittest.TestCase):
             )
             self.assertEqual(resumed["status"], "passed")
             self.assertTrue(resumed["exact_resume"]["exact_match"])
+            self.assertTrue(resumed["exact_resume"]["accepted_match"])
             self.assertEqual(resumed["exact_resume"]["mismatches"], [])
+
+            accepted_checkpoint = root / "accepted-tolerance" / "checkpoint.pt"
+            OVERFIT_MODULE.run_overfit(
+                **common,
+                checkpoint_path=accepted_checkpoint,
+                resume_path=None,
+                until_step=15,
+            )
+            accepted_comparison = {
+                "requested": True,
+                "exact_match": False,
+                "tolerant_match": True,
+                "accepted_match": True,
+                "mismatches": ["model"],
+                "tolerant_mismatches": [],
+            }
+            with mock.patch.object(
+                OVERFIT_MODULE,
+                "compare_checkpoint_trajectories",
+                return_value=accepted_comparison,
+            ):
+                accepted = OVERFIT_MODULE.run_overfit(
+                    **common,
+                    checkpoint_path=accepted_checkpoint,
+                    resume_path=accepted_checkpoint,
+                    exact_reference_checkpoint=control_checkpoint,
+                    resume_tensor_atol=2e-7,
+                    resume_tensor_rtol=1e-5,
+                )
+            self.assertEqual(accepted["status"], "passed")
+            self.assertFalse(accepted["exact_resume"]["exact_match"])
+            self.assertTrue(accepted["exact_resume"]["accepted_match"])
 
             tampered_checkpoint = root / "tampered.pt"
             tampered = torch.load(
