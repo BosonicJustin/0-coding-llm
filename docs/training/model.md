@@ -115,11 +115,14 @@ document-isolation smoke test before the long run.
 
 ## Post-training compatibility
 
-The model has no pretraining-specific label construction. SFT can pass labels
-with prompt/user positions set to `-100`, while assistant targets remain
-supervised. RL can load the same checkpoint into a separate generation and
-rollout stack. Pretraining, SFT, and RL data formats should remain separate and
-independently versioned.
+The model does not shift labels internally. Every loader must pass already
+next-token-aligned targets: `labels[:, t]` is the token predicted from
+`input_ids[:, :t+1]`. The pretraining collator builds exactly that contract.
+An SFT collator must perform the same shift and then set prompt/user and
+cross-example target positions to `-100`; passing ordinary unshifted Hugging
+Face-style labels directly would train the wrong objective. RL can load the same
+checkpoint into a separate generation and rollout stack. Pretraining, SFT, and
+RL data formats should remain separate and independently versioned.
 
 ### Hugging Face export
 

@@ -16,12 +16,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.utils.checkpoint import checkpoint
 
 
@@ -57,7 +59,10 @@ class ModelConfig:
             "loss_chunk_size",
         )
         for name in integer_fields:
-            if getattr(self, name) <= 0:
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.dim % self.n_heads:
             raise ValueError("dim must be divisible by n_heads")
@@ -65,8 +70,14 @@ class ModelConfig:
             raise ValueError("n_heads must be divisible by n_kv_heads")
         if self.head_dim % 2:
             raise ValueError("RoPE head_dim must be even")
-        if self.norm_eps <= 0 or self.rope_theta <= 0 or self.initializer_range <= 0:
-            raise ValueError("normalization, RoPE, and initialization constants must be positive")
+        for name in ("norm_eps", "rope_theta", "initializer_range"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(f"{name} must be a real number")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not isinstance(self.tie_word_embeddings, bool):
+            raise TypeError("tie_word_embeddings must be boolean")
         if self.attention_backend not in ("auto", "flex", "sdpa"):
             raise ValueError(f"Unknown attention backend {self.attention_backend!r}")
         if not isinstance(self.activation_checkpointing, bool):
@@ -187,10 +198,6 @@ def _dense_document_causal_mask(document_ids: torch.Tensor) -> torch.Tensor:
 
 
 def _create_flex_document_mask(document_ids: torch.Tensor):
-    try:
-        from torch.nn.attention.flex_attention import create_block_mask
-    except ImportError as exc:  # pragma: no cover - depends on installed PyTorch
-        raise RuntimeError("This PyTorch build does not provide FlexAttention") from exc
     batch_size, sequence_length = document_ids.shape
 
     def document_causal_mask(batch, head, query_index, key_index):
@@ -273,8 +280,6 @@ class CausalSelfAttention(nn.Module):
         if backend == "flex":
             if not x.is_cuda:
                 raise RuntimeError("FlexAttention training backend requires CUDA")
-            from torch.nn.attention.flex_attention import flex_attention
-
             attended = flex_attention(
                 query,
                 key,
@@ -393,9 +398,19 @@ class CausalLM(nn.Module):
             self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # ``Module.to_empty`` materializes aliased meta parameters separately.
+        # Restore the configured alias before initialization so tied models keep
+        # one shared parameter after deferred allocation.
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.tok_embeddings.weight
+        initialized_weights: set[int] = set()
         for module in self.modules():
             if isinstance(module, (nn.Linear, nn.Embedding)):
+                parameter_identity = id(module.weight)
+                if parameter_identity in initialized_weights:
+                    continue
                 nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+                initialized_weights.add(parameter_identity)
             elif isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
             elif isinstance(module, RotaryEmbedding):
@@ -420,22 +435,45 @@ class CausalLM(nn.Module):
         *,
         return_logits: bool | None = None,
     ) -> CausalLMOutput:
+        """Evaluate already aligned next-token targets.
+
+        ``labels[b, t]`` is the token predicted from ``input_ids[b, : t + 1]``;
+        this method deliberately does not shift labels internally. Callers must
+        set cross-document and otherwise unsupervised targets to ``-100``.
+        """
+
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [B, T]")
+        if input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
+            raise ValueError("input_ids must have non-empty batch and sequence dimensions")
         if position_ids.shape != input_ids.shape or document_ids.shape != input_ids.shape:
             raise ValueError("position_ids and document_ids must match input_ids")
         if input_ids.shape[1] > self.config.max_seq_len:
             raise ValueError("Input sequence exceeds max_seq_len")
         if labels is not None and labels.shape != input_ids.shape:
             raise ValueError("labels must match input_ids")
+        if return_logits is not None and not isinstance(return_logits, bool):
+            raise TypeError("return_logits must be boolean or None")
         if return_logits is None:
             # Inference needs logits; training normally needs only loss and
             # should not accidentally materialize a [B, T, V] tensor.
             return_logits = labels is None
+        if input_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("input_ids must be an integer tensor")
         if position_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError("position_ids must be an integer tensor")
         if document_ids.dtype not in (torch.int32, torch.int64):
             raise TypeError("document_ids must be an integer tensor")
+        if labels is not None and labels.dtype != torch.int64:
+            raise TypeError("labels must be an int64 tensor")
+        expected_device = input_ids.device
+        for name, tensor in (
+            ("position_ids", position_ids),
+            ("document_ids", document_ids),
+            ("labels", labels),
+        ):
+            if tensor is not None and tensor.device != expected_device:
+                raise ValueError(f"{name} must be on the same device as input_ids")
         # A device reduction followed by Python conversion synchronizes CUDA.
         # Validate once for CPU/debug use; production CUDA batches come from the
         # validated packed-data contract and must not pay 48 synchronizations

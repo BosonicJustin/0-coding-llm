@@ -48,6 +48,35 @@ class NativeModelTest(unittest.TestCase):
         self.assertEqual(config.expected_parameter_count, 1_283_557_376)
         self.assertEqual(model.parameter_count(), 1_283_557_376)
 
+    def test_model_config_rejects_malformed_runtime_values(self) -> None:
+        for field in (
+            "vocab_size",
+            "dim",
+            "hidden_dim",
+            "n_layers",
+            "n_heads",
+            "n_kv_heads",
+            "max_seq_len",
+            "loss_chunk_size",
+        ):
+            with self.subTest(field=field, value=True):
+                with self.assertRaisesRegex(TypeError, f"{field} must be an integer"):
+                    ModelConfig(**{field: True})
+            with self.subTest(field=field, value=1.5):
+                with self.assertRaisesRegex(TypeError, f"{field} must be an integer"):
+                    ModelConfig(**{field: 1.5})
+
+        for field in ("norm_eps", "rope_theta", "initializer_range"):
+            with self.subTest(field=field, value=float("nan")):
+                with self.assertRaisesRegex(ValueError, f"{field} must be finite and positive"):
+                    ModelConfig(**{field: float("nan")})
+            with self.subTest(field=field, value=float("inf")):
+                with self.assertRaisesRegex(ValueError, f"{field} must be finite and positive"):
+                    ModelConfig(**{field: float("inf")})
+
+        with self.assertRaisesRegex(TypeError, "tie_word_embeddings must be boolean"):
+            ModelConfig(tie_word_embeddings="no")  # type: ignore[arg-type]
+
     def test_forward_loss_and_backward(self) -> None:
         config = tiny_config()
         model = CausalLM(config, dtype=torch.float32)
@@ -71,6 +100,33 @@ class NativeModelTest(unittest.TestCase):
         output.loss.backward()
         self.assertIsNotNone(model.tok_embeddings.weight.grad)
 
+    def test_forward_rejects_invalid_tensor_contracts(self) -> None:
+        config = tiny_config()
+        model = CausalLM(config, dtype=torch.float32)
+        input_ids = torch.randint(0, config.vocab_size, (1, 4))
+        position_ids = torch.arange(4).unsqueeze(0)
+        document_ids = torch.zeros_like(position_ids)
+
+        with self.assertRaisesRegex(ValueError, "non-empty batch and sequence"):
+            model(
+                input_ids[:, :0],
+                position_ids[:, :0],
+                document_ids[:, :0],
+            )
+        with self.assertRaisesRegex(TypeError, "input_ids must be an integer tensor"):
+            model(input_ids.float(), position_ids, document_ids)
+        with self.assertRaisesRegex(TypeError, "labels must be an int64 tensor"):
+            model(input_ids, position_ids, document_ids, input_ids.to(torch.int32))
+        with self.assertRaisesRegex(TypeError, "return_logits must be boolean or None"):
+            model(input_ids, position_ids, document_ids, return_logits=1)  # type: ignore[arg-type]
+
+        meta_document_ids = torch.empty_like(document_ids, device="meta")
+        with self.assertRaisesRegex(
+            ValueError,
+            "document_ids must be on the same device as input_ids",
+        ):
+            model(input_ids, position_ids, meta_document_ids)
+
     def test_training_defaults_to_chunked_loss_without_returning_logits(self) -> None:
         config = tiny_config()
         model = CausalLM(config, dtype=torch.float32).eval()
@@ -92,6 +148,31 @@ class NativeModelTest(unittest.TestCase):
         self.assertIsNotNone(full.logits)
         torch.testing.assert_close(chunked.loss_sum, full.loss_sum)
         torch.testing.assert_close(chunked.loss, full.loss)
+
+    def test_labels_are_already_next_token_aligned(self) -> None:
+        config = tiny_config()
+        model = CausalLM(config, dtype=torch.float32).eval()
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+        position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+        document_ids = torch.zeros_like(position_ids)
+        labels = torch.tensor([[7, 8, -100, 9, 10]], dtype=torch.int64)
+
+        with torch.no_grad():
+            output = model(
+                input_ids,
+                position_ids,
+                document_ids,
+                labels,
+                return_logits=True,
+            )
+        expected_token_losses = torch.nn.functional.cross_entropy(
+            output.logits.float().reshape(-1, config.vocab_size),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape_as(labels)
+        torch.testing.assert_close(output.loss_sum, expected_token_losses.sum())
+        torch.testing.assert_close(output.loss_sums_per_row, expected_token_losses.sum(dim=1))
 
     def test_checkpointed_chunk_loss_matches_full_loss_gradients(self) -> None:
         config = tiny_config()
@@ -188,6 +269,19 @@ class NativeModelTest(unittest.TestCase):
         torch.testing.assert_close(rope.sin[0], torch.zeros(config.head_dim))
         self.assertTrue(torch.isfinite(rope.cos).all())
         self.assertTrue(torch.isfinite(rope.sin).all())
+
+    def test_meta_materialization_preserves_tied_embeddings(self) -> None:
+        config = dataclasses.replace(tiny_config(), tie_word_embeddings=True)
+        model = CausalLM(config, device="meta", dtype=torch.float32)
+        model.to_empty(device="cpu")
+        model.reset_parameters()
+
+        self.assertIs(model.lm_head.weight, model.tok_embeddings.weight)
+        self.assertEqual(
+            model.lm_head.weight.untyped_storage().data_ptr(),
+            model.tok_embeddings.weight.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(model.parameter_count(), config.expected_parameter_count)
 
     def test_all_ignored_labels_fail_eager_and_stay_finite_compiled(self) -> None:
         config = tiny_config()
