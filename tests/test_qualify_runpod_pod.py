@@ -762,6 +762,127 @@ class NvidiaEvidenceParsingTests(unittest.TestCase):
             qualify._normalize_pci_bus_id("0000:0A:00.0"), "00000000:0a:00.0"
         )
 
+    def test_collector_canonicalizes_bare_uuid_and_numeric_pci_properties(self) -> None:
+        fake_torch = types.ModuleType("torch")
+        uuid_bodies = [
+            f"{index:08x}-0000-0000-0000-{index:012x}" for index in range(6)
+        ]
+        properties = [
+            types.SimpleNamespace(
+                uuid=uuid_bodies[index],
+                pci_domain_id=0,
+                pci_bus_id=0x19 + index,
+                pci_device_id=0,
+            )
+            for index in range(6)
+        ]
+        fake_torch.cuda = types.SimpleNamespace(
+            get_device_properties=lambda index: properties[index],
+            can_device_access_peer=lambda _left, _right: True,
+            get_arch_list=lambda: ["sm_90"],
+            nccl=types.SimpleNamespace(version=lambda: (2, 25, 1)),
+        )
+        fake_torch.backends = types.SimpleNamespace(
+            cudnn=types.SimpleNamespace(version=lambda: 90800)
+        )
+        runtime = types.SimpleNamespace(
+            cuda_device_profiles=[
+                {
+                    "name": "Fixture H100",
+                    "compute_capability": [9, 0],
+                    "total_memory_bytes": 80 * 1024**3,
+                    "available_memory_bytes": 79 * 1024**3,
+                    "multiprocessor_count": 120,
+                }
+                for _ in range(6)
+            ],
+            bf16_supported_devices=list(range(6)),
+            cuda_runtime="12.8",
+            torch_version="2.9.1+cu128",
+        )
+        inventory = [
+            {
+                "index": index,
+                "uuid": f"GPU-{uuid_bodies[index]}",
+                "name": "Fixture H100",
+                "memory_bytes_reported": 80 * 1024**3,
+                "compute_capability": [9, 0],
+                "driver_version": "570.86.15",
+                "pci_bus_id": f"00000000:{0x19 + index:02x}:00.0",
+                "mig_mode": "disabled",
+            }
+            for index in range(6)
+        ]
+        topology = {
+            "labels_in_visible_order": [f"GPU{index}" for index in range(6)],
+            "matrix": [
+                ["X" if left == right else "PIX" for right in range(6)]
+                for left in range(6)
+            ],
+            "nvlink_pairs": 0,
+            "possible_pairs": 15,
+            "raw_sha256": "a" * 64,
+            "raw": "fixture",
+        }
+        smoke = _gpu_observation()["nccl_smoke"]
+        smoke["device_uuids_in_rank_order"] = [
+            f"GPU-{body}" for body in uuid_bodies
+        ]
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}), mock.patch.object(
+            qualify.launch, "inspect_runtime", return_value=runtime
+        ), mock.patch.object(
+            qualify,
+            "_collect_smi",
+            return_value=(inventory, "12.8", "fixture", {"path": "/nvidia-smi"}),
+        ), mock.patch.object(
+            qualify, "_parse_topology", return_value=topology
+        ), mock.patch.object(
+            qualify, "_run_nccl_smoke", return_value=smoke
+        ) as nccl_smoke:
+            result = qualify._collect_gpu_observation(  # noqa: SLF001
+                environment={"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5"},
+                local_work_root=Path("/tmp"),
+            )
+        expected_uuids = [f"GPU-{body}" for body in uuid_bodies]
+        self.assertEqual(
+            [device["uuid"] for device in result["devices"]], expected_uuids
+        )
+        self.assertEqual(
+            result["devices"][0]["pci_bus_id"], "00000000:19:00.0"
+        )
+        self.assertEqual(
+            nccl_smoke.call_args.kwargs["expected_device_uuids"], expected_uuids
+        )
+
+    def test_uuid_and_pci_normalization_remain_fail_closed(self) -> None:
+        body = "568a0000-0000-0000-0000-000000000001"
+        self.assertEqual(
+            qualify._canonical_gpu_uuid(body, label="fixture"), f"GPU-{body}"
+        )
+        string_properties = types.SimpleNamespace(
+            pci_bus_id="0000:19:00.0"
+        )
+        self.assertEqual(
+            qualify._canonical_torch_pci_bus_id(  # noqa: SLF001
+                string_properties, label="fixture"
+            ),
+            "00000000:19:00.0",
+        )
+        for invalid in ("", "568a", "GPU-not-a-uuid", None):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                qualify.PodQualificationError
+            ):
+                qualify._canonical_gpu_uuid(invalid, label="fixture")
+        invalid_numeric = types.SimpleNamespace(
+            pci_domain_id=0,
+            pci_bus_id=256,
+            pci_device_id=0,
+        )
+        with self.assertRaisesRegex(qualify.PodQualificationError, "PCI bus"):
+            qualify._canonical_torch_pci_bus_id(  # noqa: SLF001
+                invalid_numeric, label="fixture"
+            )
+
     def test_topology_parser_preserves_visible_physical_order(self) -> None:
         header = "        GPU0 GPU1 GPU2 GPU3 GPU4 GPU5 CPU Affinity"
         rows = []
@@ -823,7 +944,7 @@ class NcclWorkerContractTests(unittest.TestCase):
             set_device=lambda rank: calls.setdefault("set_device", rank),
             synchronize=lambda rank: calls.setdefault("synchronize", rank),
             get_device_properties=lambda rank: types.SimpleNamespace(
-                uuid=f"GPU-{rank:032x}"
+                uuid=f"{rank:032x}"
             ),
         )
         fake_torch.distributed = fake_distributed

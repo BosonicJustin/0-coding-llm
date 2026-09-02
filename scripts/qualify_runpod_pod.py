@@ -76,6 +76,11 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CUDA_VERSION = re.compile(r"^(\d+)\.(\d+)(?:\.\d+)?$")
 _NVIDIA_CUDA_HEADER = re.compile(r"CUDA Version:\s*(\d+\.\d+)")
 _NVLINK = re.compile(r"NV\d+\Z")
+_GPU_UUID = re.compile(
+    r"(?:GPU-)?(?P<body>(?:[0-9a-f]{32}|"
+    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))\Z",
+    re.IGNORECASE,
+)
 _SAFE_TOPOLOGY_CODES = frozenset(
     {"X", "PIX", "PXB", "PHB", "NODE", "SYS", "N/A"}
 )
@@ -298,10 +303,63 @@ def _normalize_pci_bus_id(value: str) -> str:
     )
     if match is None:
         raise PodQualificationError(f"Cannot parse PCI bus ID {value!r}")
+    device = int(match.group(3), 16)
+    if device > 0x1F:
+        raise PodQualificationError(f"PCI device is outside [0, 31]: {value!r}")
     return (
         f"{int(match.group(1), 16):08x}:{int(match.group(2), 16):02x}:"
-        f"{int(match.group(3), 16):02x}.{int(match.group(4), 16)}"
+        f"{device:02x}.{int(match.group(4), 16)}"
     )
+
+
+def _canonical_gpu_uuid(
+    value: Any, *, label: str, require_gpu_prefix: bool = False
+) -> str:
+    """Normalize valid PyTorch/nvidia-smi UUID spellings to ``GPU-...``."""
+
+    if not isinstance(value, str):
+        value = str(value)
+    raw = value.strip()
+    if require_gpu_prefix and not raw.upper().startswith("GPU-"):
+        raise PodQualificationError(f"{label} lacks the required GPU- prefix")
+    match = _GPU_UUID.fullmatch(raw)
+    if match is None:
+        raise PodQualificationError(f"{label} is malformed or empty: {raw!r}")
+    return f"GPU-{match.group('body').lower()}"
+
+
+def _canonical_torch_pci_bus_id(properties: Any, *, label: str) -> str:
+    """Read either legacy string or PyTorch 2.9 numeric PCI properties."""
+
+    bus = getattr(properties, "pci_bus_id", None)
+    if isinstance(bus, str):
+        if not bus.strip():
+            raise PodQualificationError(f"{label} PCI bus ID is empty")
+        return _normalize_pci_bus_id(bus)
+    if not isinstance(bus, int) or isinstance(bus, bool):
+        raise PodQualificationError(f"{label} PCI bus ID has invalid type")
+    domain = getattr(properties, "pci_domain_id", None)
+    device = getattr(properties, "pci_device_id", None)
+    function = getattr(properties, "pci_function_id", 0)
+    fields = {
+        "domain": (domain, 0xFFFFFFFF),
+        "bus": (bus, 0xFF),
+        "device": (device, 0x1F),
+        "function": (function, 0x7),
+    }
+    for field, (found, maximum) in fields.items():
+        if (
+            not isinstance(found, int)
+            or isinstance(found, bool)
+            or not 0 <= found <= maximum
+        ):
+            raise PodQualificationError(
+                f"{label} PCI {field} must be an integer in [0, {maximum}]"
+            )
+    assert isinstance(domain, int)
+    assert isinstance(device, int)
+    assert isinstance(function, int)
+    return f"{domain:08x}:{bus:02x}:{device:02x}.{function}"
 
 
 def _parse_visible_devices(environment: Mapping[str, str]) -> list[str]:
@@ -393,16 +451,18 @@ def _parse_nvidia_smi_inventory(text: str) -> list[dict[str, Any]]:
             or memory_bytes < 1
             or len(capability_pair) != 2
             or any(part < 0 for part in capability_pair)
-            or not uuid.startswith("GPU-")
             or not name
             or not driver
             or not pci_bus
         ):
             raise PodQualificationError(f"Invalid nvidia-smi GPU identity: {fields!r}")
+        canonical_uuid = _canonical_gpu_uuid(
+            uuid, label="nvidia-smi GPU UUID", require_gpu_prefix=True
+        )
         inventory.append(
             {
                 "index": index_value,
-                "uuid": uuid,
+                "uuid": canonical_uuid,
                 "name": name,
                 "memory_bytes_reported": memory_bytes,
                 "compute_capability": capability_pair,
@@ -525,6 +585,18 @@ def validate_gpu_observation(
             raise PodQualificationError("CUDA visible indices are not contiguous and ordered")
         if not device["uuid"] or not device["name"] or not device["pci_bus_id"]:
             raise PodQualificationError(f"CUDA device {index} has an empty identity field")
+        if device["uuid"] != _canonical_gpu_uuid(
+            device["uuid"],
+            label=f"CUDA device {index} UUID",
+            require_gpu_prefix=True,
+        ):
+            raise PodQualificationError(
+                f"CUDA device {index} UUID is not in canonical GPU- form"
+            )
+        if device["pci_bus_id"] != _normalize_pci_bus_id(device["pci_bus_id"]):
+            raise PodQualificationError(
+                f"CUDA device {index} PCI bus ID is not canonical"
+            )
         if device["bf16_supported"] is not True:
             raise PodQualificationError(f"CUDA device {index} lacks native BF16")
         if not _plain_int(device["total_memory_bytes"], minimum=1):
@@ -1681,13 +1753,18 @@ def _collect_gpu_observation(
         zip(runtime.cuda_device_profiles, selected, strict=True)
     ):
         properties = torch.cuda.get_device_properties(visible_index)
-        uuid = str(getattr(properties, "uuid", ""))
-        pci_bus = str(getattr(properties, "pci_bus_id", ""))
+        uuid = _canonical_gpu_uuid(
+            getattr(properties, "uuid", ""),
+            label=f"PyTorch CUDA-visible GPU {visible_index} UUID",
+        )
+        pci_bus = _canonical_torch_pci_bus_id(
+            properties, label=f"PyTorch CUDA-visible GPU {visible_index}"
+        )
         if uuid != smi["uuid"]:
             raise PodQualificationError(
                 f"CUDA-visible GPU {visible_index} UUID differs from nvidia-smi selection"
             )
-        if pci_bus and _normalize_pci_bus_id(pci_bus) != smi["pci_bus_id"]:
+        if pci_bus != smi["pci_bus_id"]:
             raise PodQualificationError(
                 f"CUDA-visible GPU {visible_index} PCI bus differs from nvidia-smi"
             )
@@ -1705,7 +1782,7 @@ def _collect_gpu_observation(
                 "physical_index": smi["index"],
                 "uuid": uuid,
                 "name": profile["name"],
-                "pci_bus_id": smi["pci_bus_id"],
+                "pci_bus_id": pci_bus,
                 "compute_capability": profile["compute_capability"],
                 "total_memory_bytes": profile["total_memory_bytes"],
                 "available_memory_bytes": profile["available_memory_bytes"],
@@ -1928,7 +2005,12 @@ def _nccl_worker(output_dir: Path) -> int:
                 "rank": rank,
                 "local_rank": local_rank,
                 "world_size": world_size,
-                "device_uuid": str(torch.cuda.get_device_properties(local_rank).uuid),
+                "device_uuid": _canonical_gpu_uuid(
+                    getattr(
+                        torch.cuda.get_device_properties(local_rank), "uuid", ""
+                    ),
+                    label=f"NCCL worker rank {rank} GPU UUID",
+                ),
                 "all_reduce_sum": int(reduced.item()),
                 "all_reduce_dtype": "bfloat16",
                 "all_gather_ranks": [int(item.item()) for item in gathered],
