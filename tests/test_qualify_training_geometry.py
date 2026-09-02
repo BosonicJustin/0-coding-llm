@@ -26,10 +26,27 @@ class GeometryQualificationTest(unittest.TestCase):
         self,
         root: Path,
         *,
-        hardware_sha256: str = "a" * 64,
+        hardware_identity_sha256: str = "a" * 64,
         sequence_length: int = 16,
     ) -> tuple[Path, dict[str, object]]:
         candidates: dict[str, object] = {}
+        results: dict[str, object] = {}
+        plan: dict[str, object] = {
+            "format": qualification.BASELINE_PLAN_FORMAT,
+            "format_version": qualification.FORMAT_VERSION,
+            "mode": "single-gpu-baselines",
+            "inputs": {
+                "hardware": {
+                    "geometry_identity": {
+                        "identity_sha256": hardware_identity_sha256
+                    }
+                },
+                "common": {"sequence_length": sequence_length},
+            },
+        }
+        plan["plan_sha256"] = qualification.canonical_sha256(plan)
+        plan_bound = qualification.publish_json_new(root / "baseline-plan.json", plan)
+        shared_order_sha256 = "d" * 64
         for candidate in qualification.CANDIDATES:
             token_delta = (
                 100
@@ -51,11 +68,27 @@ class GeometryQualificationTest(unittest.TestCase):
                 "elapsed_wall_time_ns": elapsed,
                 "aggregate_input_tokens_per_second": "1000",
             }
+            result_payload = {
+                "format": qualification.BASELINE_CANDIDATE_RESULT_FORMAT,
+                "format_version": qualification.FORMAT_VERSION,
+                "status": "pass",
+                "plan_sha256": plan["plan_sha256"],
+                "candidate": candidate.as_dict(),
+                "order": {"order": {"sha256": shared_order_sha256}},
+                "measurement": candidates[candidate.candidate_id],
+            }
+            result_path = root / f"{candidate.candidate_id}.json"
+            results[candidate.candidate_id] = qualification.publish_json_new(
+                result_path, result_payload
+            )
         payload: dict[str, object] = {
             "format": qualification.BASELINE_FORMAT,
             "format_version": qualification.FORMAT_VERSION,
             "status": "pass",
-            "hardware_contract_sha256": hardware_sha256,
+            "hardware_identity_sha256": hardware_identity_sha256,
+            "producer_plan": plan_bound,
+            "exact_shared_order_payload_sha256": shared_order_sha256,
+            "results": results,
             "candidates": candidates,
         }
         path = root / "baselines.json"
@@ -69,6 +102,19 @@ class GeometryQualificationTest(unittest.TestCase):
         self.assertEqual(
             {candidate.optimizer_update_rows for candidate in qualification.CANDIDATES},
             {192},
+        )
+        self.assertEqual(
+            qualification.FINAL_TRAIN_EXPECTED_ROWS,
+            qualification.FINAL_TRAIN_EXPECTED_OPTIMIZER_UPDATES * 192,
+        )
+        self.assertEqual(
+            qualification.FINAL_TRAIN_EXPECTED_CONSUMED_INPUT_TOKENS,
+            52_579_270_656,
+        )
+        self.assertLessEqual(
+            qualification.FINAL_TRAIN_TARGET_INPUT_TOKENS
+            - qualification.FINAL_TRAIN_EXPECTED_CONSUMED_INPUT_TOKENS,
+            192 * 4_096 - 1,
         )
         settings = qualification.SoakSettings()
         for candidate in qualification.CANDIDATES:
@@ -97,6 +143,38 @@ class GeometryQualificationTest(unittest.TestCase):
             )
             self.assertEqual(command.count("--compile"), int(candidate.compile_model))
             self.assertEqual(command[-2:], ["--resume", "/checkpoints/last.pt"])
+
+    def test_online_wandb_mode_and_run_name_are_explicitly_forwarded(self) -> None:
+        settings = qualification.SoakSettings(
+            wandb_mode="online",
+            wandb_project="live-project",
+            wandb_run_name_prefix="h100-qualification",
+        )
+        settings.validate()
+        command = qualification.render_torchrun_command(
+            python_executable=Path("/python"),
+            order_manifest=Path("/order.json"),
+            validation_order_manifest=Path("/validation.json"),
+            tokenizer_root=Path("/tokenizer"),
+            checkpoint=Path("/last.pt"),
+            candidate=qualification.CANDIDATES[0],
+            settings=settings,
+            run_name="h100-qualification-candidate",
+            run_group="group",
+            resume=False,
+        )
+        self.assertEqual(command[command.index("--wandb-mode") + 1], "online")
+        self.assertEqual(
+            command[command.index("--wandb-project") + 1], "live-project"
+        )
+        self.assertEqual(
+            command[command.index("--wandb-run-name") + 1],
+            "h100-qualification-candidate",
+        )
+        with self.assertRaisesRegex(
+            qualification.GeometryQualificationError, "disabled"
+        ):
+            qualification.SoakSettings(wandb_mode="disabled").validate()
 
     def test_phase_observation_uses_external_counter_and_requests_one_stop(self) -> None:
         observation = qualification.PhaseObservation()
@@ -420,7 +498,7 @@ for step in range(1, 20):
             path, _ = self._baseline(root)
             rates, _ = qualification.load_single_gpu_baselines(
                 path,
-                hardware_contract_sha256="a" * 64,
+                hardware_identity_sha256="a" * 64,
                 sequence_length=16,
             )
             self.assertEqual(set(rates), {
@@ -433,7 +511,7 @@ for step in range(1, 20):
             ):
                 qualification.load_single_gpu_baselines(
                     path,
-                    hardware_contract_sha256="a" * 64,
+                    hardware_identity_sha256="a" * 64,
                     sequence_length=16,
                 )
 
@@ -458,11 +536,15 @@ for step in range(1, 20):
             ):
                 qualification.load_single_gpu_baselines(
                     short,
-                    hardware_contract_sha256="a" * 64,
+                    hardware_identity_sha256="a" * 64,
                     sequence_length=16,
                 )
 
     def test_command_and_cli_error_redaction_reject_secret_values(self) -> None:
+        self.assertEqual(
+            qualification.command_display(["python", "-m", "pretrain.train"]),
+            "python -m pretrain.train",
+        )
         with self.assertRaisesRegex(
             qualification.GeometryQualificationError, "credential-bearing"
         ):
@@ -489,6 +571,11 @@ for step in range(1, 20):
                 return_value=(
                     {"status": "accepted"},
                     {"artifact": {"sha256": "a" * 64}},
+                    {
+                        "scope": "geometry-only-provisional",
+                        "identity": {},
+                        "identity_sha256": "a" * 64,
+                    },
                 ),
             ):
                 bound = qualification.seal_single_gpu_baselines(
@@ -509,6 +596,11 @@ for step in range(1, 20):
                 return_value=(
                     {"status": "accepted"},
                     {"artifact": {"sha256": "a" * 64}},
+                    {
+                        "scope": "geometry-only-provisional",
+                        "identity": {},
+                        "identity_sha256": "a" * 64,
+                    },
                 ),
             ):
                 with self.assertRaisesRegex(
@@ -562,6 +654,9 @@ for step in range(1, 20):
                     "hardware": {
                         "bound": {"artifact": {"sha256": "a" * 64}},
                         "expected": {"gpu_memory_bytes": 80 * GIB},
+                        "geometry_identity": {
+                            "identity_sha256": "a" * 64
+                        },
                     },
                     "common": {"sequence_length": 16},
                 },
@@ -627,6 +722,309 @@ for step in range(1, 20):
                     run_root / "GRID-RESULT.json"
                 )
             self.assertEqual(loaded, payload)
+
+    def test_automatic_baselines_run_all_six_and_publish_sealed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "baselines"
+            root.mkdir()
+            sequence_length = 16
+            plan = {
+                "format": qualification.BASELINE_PLAN_FORMAT,
+                "format_version": qualification.FORMAT_VERSION,
+                "mode": "single-gpu-baselines",
+                "inputs": {
+                    "common": {"sequence_length": sequence_length},
+                    "hardware": {
+                        "geometry_identity": {
+                            "identity_sha256": "b" * 64
+                        }
+                    },
+                },
+            }
+            plan["plan_sha256"] = qualification.canonical_sha256(plan)
+            qualification.publish_json_new(root / "PLAN.json", plan)
+            calls: list[str] = []
+            shared_order = {
+                "manifest": {"sha256": "c" * 64},
+                "order": {"sha256": "d" * 64},
+                "geometry": {},
+            }
+
+            def runner(**kwargs: object):
+                candidate = kwargs["candidate"]
+                candidate_root = kwargs["root"]
+                assert isinstance(candidate, qualification.CandidateSpec)
+                assert isinstance(candidate_root, Path)
+                calls.append(candidate.candidate_id)
+                updates = 100
+                token_delta = (
+                    updates
+                    * candidate.local_microbatch_rows
+                    * candidate.gradient_accumulation_steps
+                    * sequence_length
+                )
+                measurement = {
+                    "global_microbatch_rows": candidate.local_microbatch_rows,
+                    "gradient_accumulation_steps": (
+                        candidate.gradient_accumulation_steps
+                    ),
+                    "compile_model": candidate.compile_model,
+                    "gpu_count": 1,
+                    "scope": geometry_evidence.THROUGHPUT_SCOPE,
+                    "timer": geometry_evidence.THROUGHPUT_TIMER,
+                    "counter": geometry_evidence.THROUGHPUT_COUNTER,
+                    "start_consumed_input_tokens": 0,
+                    "end_consumed_input_tokens": token_delta,
+                    "elapsed_wall_time_ns": token_delta * 1_000_000,
+                    "aggregate_input_tokens_per_second": "1000",
+                }
+                payload = {
+                    "format": qualification.BASELINE_CANDIDATE_RESULT_FORMAT,
+                    "format_version": qualification.FORMAT_VERSION,
+                    "status": "pass",
+                    "plan_sha256": plan["plan_sha256"],
+                    "candidate": candidate.as_dict(),
+                    "order": {"order": {"sha256": "d" * 64}},
+                    "measurement": measurement,
+                }
+                candidate_root.mkdir(parents=True)
+                return payload, qualification.publish_json_new(
+                    candidate_root / "RESULT.json", payload
+                )
+
+            with (
+                mock.patch.object(
+                    qualification,
+                    "verify_baseline_plan_authority",
+                    return_value={"status": "pass"},
+                ),
+                mock.patch.object(
+                    qualification,
+                    "ensure_baseline_order",
+                    return_value=shared_order,
+                ),
+            ):
+                payload, bound = qualification.run_single_gpu_baselines(
+                    root=root,
+                    plan=plan,
+                    candidate_runner=runner,
+                    runtime_verifier=lambda **_: {"status": "pass"},
+                )
+            self.assertEqual(calls, [item.candidate_id for item in qualification.CANDIDATES])
+            self.assertEqual(payload["status"], "pass")
+            self.assertEqual(
+                payload["hardware_identity_sha256"], "b" * 64
+            )
+            self.assertEqual(
+                bound,
+                qualification.verified_json_with_sidecar(
+                    root / "single-gpu-baselines.json",
+                    label="automatic baselines",
+                )[1],
+            )
+
+    def test_baseline_candidate_measures_real_one_rank_counter_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_root = root / "candidate"
+            candidate = qualification.CANDIDATES[0]
+            sequence_length = 16
+            tokens_per_update = qualification.BASELINE_UPDATE_ROWS * sequence_length
+            validation = root / "validation.json"
+            validation.write_text("{}", encoding="utf-8")
+            tokenizer = root / "tokenizer"
+            tokenizer.mkdir()
+            order_manifest = root / "order.json"
+            order_manifest.write_text("{}", encoding="utf-8")
+            order = {
+                "manifest": qualification.artifact(order_manifest, label="order"),
+                "order": {"path": "/unused", "bytes": 1, "sha256": "1" * 64},
+                "geometry": {},
+            }
+            trainer_source = Path(qualification.training_data.__file__).parent / "train.py"
+            plan = {
+                "plan_sha256": "2" * 64,
+                "baseline_gpu": {
+                    "visible_index": 0,
+                    "physical_index": 0,
+                    "uuid": "GPU-0",
+                },
+                "settings": vars(qualification.SoakSettings()),
+                "runtime": {
+                    "python": {"invocation_path": sys.executable},
+                    "sources": {
+                        "trainer": {"path": str(trainer_source), "sha256": "8" * 64},
+                        "model": {"sha256": "9" * 64},
+                        "data": {"sha256": "a" * 64},
+                    },
+                },
+                "inputs": {
+                    "validation_order": {"manifest": {"path": str(validation)}},
+                    "common": {
+                        "sequence_length": sequence_length,
+                        "tokenizer": {"root": str(tokenizer)},
+                    },
+                    "hardware": {
+                        "expected": {
+                            "qualification": {
+                                "host": {
+                                    "environment": {
+                                        "cuda_visible_devices": [
+                                            "0",
+                                            "1",
+                                            "2",
+                                            "3",
+                                            "4",
+                                            "5",
+                                        ]
+                                    }
+                                },
+                                "gpu": {
+                                    "nvidia_smi_executable": {
+                                        "path": "/usr/bin/nvidia-smi"
+                                    },
+                                    "devices": [
+                                        {"nvidia_smi_memory_bytes": 80 * GIB}
+                                        for _ in range(6)
+                                    ],
+                                },
+                            }
+                        }
+                    },
+                },
+            }
+            phase_calls = 0
+
+            def phase_runner(**kwargs: object) -> qualification.PhaseRun:
+                nonlocal phase_calls
+                phase_calls += 1
+                self.assertEqual(kwargs["expected_gpu_count"], 1)
+                self.assertEqual(kwargs["environment"]["CUDA_VISIBLE_DEVICES"], "0")
+                command = kwargs["command"]
+                self.assertIn("--nproc-per-node=1", command)
+                self.assertEqual("--resume" in command, phase_calls == 2)
+                log = kwargs["log_path"]
+                stop = kwargs["stop_request_path"]
+                assert isinstance(log, Path) and isinstance(stop, Path)
+                log.write_text(
+                    f"exitcode : {128 + int(signal.SIGUSR1)} (pid: 123)\n",
+                    encoding="utf-8",
+                )
+                stop.write_text(f"{int(signal.SIGUSR1)}\n", encoding="ascii")
+                checkpoint = candidate_root / "checkpoints" / "last.pt"
+                if phase_calls == 2:
+                    (candidate_root / "checkpoints" / "last.previous.pt").write_bytes(
+                        checkpoint.read_bytes()
+                    )
+                checkpoint.write_bytes(f"checkpoint-{phase_calls}".encode("ascii"))
+                wandb = candidate_root / "checkpoints" / "wandb"
+                wandb.mkdir(exist_ok=True)
+                (wandb / "offline-run").write_bytes(b"wandb")
+                last_step = 55 if phase_calls == 1 else 105
+                completed_ns = (
+                    26_600_000_000 if phase_calls == 1 else 52_200_000_000
+                )
+                stop_ns = 26_000_000_000 if phase_calls == 1 else 52_000_000_000
+                return qualification.PhaseRun(
+                    return_code=1,
+                    completed_monotonic_ns=completed_ns,
+                    observation=qualification.PhaseObservation(
+                        start_monotonic_ns=1_000_000_000,
+                        start_step=5,
+                        start_consumed_input_tokens=5 * tokens_per_update,
+                        last_step=last_step,
+                        last_consumed_input_tokens=last_step * tokens_per_update,
+                        validation_events_after_start=1,
+                        wandb_log_events_after_start=50,
+                        data_wait_samples=50,
+                        maximum_data_wait_fraction=Decimal("0.01"),
+                        peak_memory_allocated_bytes=60 * GIB,
+                        peak_memory_reserved_bytes=64 * GIB,
+                        stop_request_monotonic_ns=stop_ns,
+                        stop_requested_after_step=last_step,
+                        json_metric_records=50,
+                        graceful_stop_events=1,
+                    ),
+                    gpu_memory=qualification.GPUMemoryObservation(
+                        gpu_count=1,
+                        total_bytes_per_gpu=(80 * GIB,),
+                        minimum_free_bytes_per_gpu=12 * GIB,
+                        samples=4,
+                    ),
+                    log=qualification.artifact(log, label="baseline log"),
+                )
+
+            def inspect_checkpoint(path: Path, **kwargs: object) -> dict[str, object]:
+                self.assertEqual(kwargs["expected_world_size"], 1)
+                completed_steps = 55 if path.name == "last.previous.pt" else 105
+                expected_implementation = {
+                    "trainer_class": "pretrain.train.Trainer",
+                    "model_class": "pretrain.model.CausalLM",
+                    "trainer_source_sha256": "8" * 64,
+                    "model_source_sha256": "9" * 64,
+                    "data_source_sha256": "a" * 64,
+                }
+                return {
+                    **qualification.artifact(path, label="checkpoint"),
+                    "completed_steps": completed_steps,
+                    "consumed_input_tokens": completed_steps * tokens_per_update,
+                    "world_size": 1,
+                    "wandb_run_id_sha256": "b" * 64,
+                    "data_identity_sha256": "c" * 64,
+                    "training_geometry_sha256": qualification.canonical_sha256({}),
+                    "trajectory_sha256": "d" * 64,
+                    "runtime_signature_sha256": "e" * 64,
+                    "implementation_signature_sha256": (
+                        qualification.canonical_sha256(expected_implementation)
+                    ),
+                }
+
+            with mock.patch.object(
+                qualification,
+                "_boot_id",
+                return_value="12345678-1234-1234-1234-123456789abc",
+            ):
+                payload, _ = qualification.run_baseline_candidate(
+                    root=candidate_root,
+                    plan=plan,
+                    candidate=candidate,
+                    order=order,
+                    phase_runner=phase_runner,
+                    checkpoint_inspector=inspect_checkpoint,
+                    binding_verifier=lambda **_: {"status": "pass"},
+                    order_verifier=lambda _: {"order": order["order"]},
+                )
+            self.assertEqual(phase_calls, 2)
+            self.assertEqual(payload["status"], "pass")
+            self.assertTrue(payload["evidence"]["resume_verified"])
+            self.assertEqual(payload["measurement"]["gpu_count"], 1)
+            self.assertEqual(
+                payload["measurement"]["aggregate_input_tokens_per_second"],
+                "1000",
+            )
+
+    def test_baseline_preview_is_one_rank_and_uses_local_recipe(self) -> None:
+        plan = {
+            "output_root": "/output",
+            "plan_sha256": "a" * 64,
+            "settings": vars(qualification.SoakSettings()),
+            "runtime": {"python": {"invocation_path": "/python"}},
+            "inputs": {
+                "validation_order": {"manifest": {"path": "/validation"}},
+                "common": {"tokenizer": {"root": "/tokenizer"}},
+            },
+        }
+        previews = cli._preview_baseline_commands(plan)  # noqa: SLF001
+        self.assertEqual(len(previews), 6)
+        for candidate, preview in zip(
+            qualification.CANDIDATES, previews, strict=True
+        ):
+            command = preview["command"]
+            self.assertIn("--nproc-per-node=1", command)
+            self.assertEqual(
+                command[command.index("--global-microbatch-rows") + 1],
+                str(candidate.local_microbatch_rows),
+            )
 
     def test_candidate_resumes_only_after_authenticated_phase_one_journal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -833,6 +1231,9 @@ for step in range(1, 20):
                     "hardware": {
                         "bound": {"artifact": {"sha256": "a" * 64}},
                         "expected": {"gpu_memory_bytes": 80 * GIB},
+                        "geometry_identity": {
+                            "identity_sha256": "a" * 64
+                        },
                     },
                     "common": {"sequence_length": 16},
                     "train_order": {
@@ -910,7 +1311,7 @@ for step in range(1, 20):
             self.assertEqual(same, receipt)
             self.assertEqual(same_bound, bound)
 
-    def test_cli_previews_have_six_commands_and_baseline_is_explicitly_incomplete(
+    def test_cli_grid_preview_has_six_two_phase_commands(
         self,
     ) -> None:
         plan = {

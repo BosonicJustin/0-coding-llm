@@ -38,6 +38,7 @@ AUTHORITY_FORMAT = "immutable-pretraining-run-authority"
 AUTHORITY_VERSION = 1
 PACKAGE_LOCK_FORMAT = "pretraining-python-package-lock"
 HARDWARE_FORMAT = "pretraining-six-gpu-hardware-runtime"
+PROVISIONAL_HARDWARE_FORMAT = "pretraining-six-gpu-provisional-hardware-runtime"
 POD_QUALIFICATION_FORMAT = "runpod-six-gpu-pod-qualification"
 POD_QUALIFICATION_VERSION = 1
 CORPUS_QUALIFICATION_FORMAT = "materialized-pretraining-corpus-qualification"
@@ -679,12 +680,18 @@ def _validate_qualification_provenance(
         )
 
 
-def inspect_hardware_contract(path: str | Path) -> dict[str, Any]:
-    contract, descriptor = _json_object(path, label="six-GPU hardware contract")
-    bound = _verified_sidecar(path, label="six-GPU hardware contract")
+def _inspect_hardware_contract(
+    path: str | Path,
+    *,
+    expected_format: str,
+    expected_status: str,
+    label: str,
+) -> dict[str, Any]:
+    contract, descriptor = _json_object(path, label=label)
+    bound = _verified_sidecar(path, label=label)
     if bound["artifact"] != descriptor:
         raise RunAuthorityError("Hardware contract changed during inspection")
-    if contract.get("format") != HARDWARE_FORMAT or contract.get("format_version") != 1:
+    if contract.get("format") != expected_format or contract.get("format_version") != 1:
         raise RunAuthorityError("Unsupported six-GPU hardware contract format")
     required = {
         "status",
@@ -706,8 +713,10 @@ def inspect_hardware_contract(path: str | Path) -> dict[str, Any]:
     missing = sorted(required - set(contract))
     if missing:
         raise RunAuthorityError(f"Hardware contract is missing fields: {missing}")
-    if contract["status"] != "accepted" or contract["topology"] != "single-node":
-        raise RunAuthorityError("Hardware contract must be an accepted single-node contract")
+    if contract["status"] != expected_status or contract["topology"] != "single-node":
+        raise RunAuthorityError(
+            f"Hardware contract must be a {expected_status} single-node contract"
+        )
     if contract["world_size"] != WORLD_SIZE or contract["gpu_count"] != WORLD_SIZE:
         raise RunAuthorityError("Hardware contract must declare exactly six visible GPUs/ranks")
     if contract["bf16_supported"] is not True:
@@ -748,6 +757,34 @@ def inspect_hardware_contract(path: str | Path) -> dict[str, Any]:
         "sidecar": bound["sidecar"],
         "expected": contract,
     }
+
+
+def inspect_hardware_contract(path: str | Path) -> dict[str, Any]:
+    """Inspect only the final launch-authorizing six-GPU contract."""
+
+    return _inspect_hardware_contract(
+        path,
+        expected_format=HARDWARE_FORMAT,
+        expected_status="accepted",
+        label="six-GPU hardware contract",
+    )
+
+
+def inspect_provisional_hardware_contract(path: str | Path) -> dict[str, Any]:
+    """Inspect pod evidence usable for geometry work, never full training.
+
+    The distinct format and ``provisional`` status are deliberate.  The
+    production run-authority path calls :func:`inspect_hardware_contract`, so
+    this artifact cannot authorize a launch even though it proves the same
+    six-GPU/NCCL/package/runtime invariants.
+    """
+
+    return _inspect_hardware_contract(
+        path,
+        expected_format=PROVISIONAL_HARDWARE_FORMAT,
+        expected_status="provisional",
+        label="provisional six-GPU hardware contract",
+    )
 
 
 def _stable_tree_identity(value: Any, *, label: str) -> dict[str, Any]:

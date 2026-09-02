@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import qualify_runpod_pod as qualify
 from pretrain import run_authority
+from pretrain import geometry_qualification
 
 
 def _gpu_observation() -> dict[str, object]:
@@ -237,6 +238,43 @@ def _observation() -> dict[str, object]:
 
 
 class PodQualificationValidationTests(unittest.TestCase):
+    def test_provisional_and_final_receipts_share_only_stable_geometry_identity(
+        self,
+    ) -> None:
+        observation = _observation()
+        environment = observation["host"]["environment"]
+        environment["required"]["WANDB_MODE"] = "offline"
+        environment["cuda_visible_devices"] = [str(index) for index in range(6)]
+        provisional = qualify.build_hardware_receipt(
+            observation,
+            nvlink_policy="observe",
+            provisional=True,
+            created_utc="2026-09-01T00:00:00+00:00",
+        )
+        final_observation = json.loads(json.dumps(observation))
+        final_observation["host"]["data"] = {
+            "status": "pass",
+            "train_order": {"sha256": "9" * 64},
+        }
+        final_observation["host"]["storage"]["network"]["free_bytes"] -= 1
+        final_observation["source"]["argv"][1] = "verify"
+        final = qualify.build_hardware_receipt(
+            final_observation,
+            nvlink_policy="observe",
+            created_utc="2026-09-01T01:00:00+00:00",
+        )
+        self.assertNotEqual(provisional["format"], final["format"])
+        self.assertNotEqual(provisional["created_utc"], final["created_utc"])
+        self.assertEqual(
+            geometry_qualification._geometry_hardware_identity(provisional),  # noqa: SLF001
+            geometry_qualification._geometry_hardware_identity(final),  # noqa: SLF001
+        )
+        final["qualification"]["gpu"]["devices"][0]["uuid"] = "GPU-changed"
+        self.assertNotEqual(
+            geometry_qualification._geometry_hardware_identity(provisional),  # noqa: SLF001
+            geometry_qualification._geometry_hardware_identity(final),  # noqa: SLF001
+        )
+
     def test_cpu_mock_cli_publishes_once_and_preserves_failure_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -310,6 +348,41 @@ class PodQualificationValidationTests(unittest.TestCase):
             self.assertEqual(
                 hashlib.sha256(path.read_bytes()).hexdigest(), published["sha256"]
             )
+
+    def test_provisional_receipt_can_drive_geometry_but_not_run_authority(self) -> None:
+        observation = _observation()
+        environment = observation["host"]["environment"]
+        environment["required"]["WANDB_MODE"] = "offline"
+        environment["cuda_visible_devices"] = [str(index) for index in range(6)]
+        receipt = qualify.build_hardware_receipt(
+            observation,
+            nvlink_policy="observe",
+            provisional=True,
+            created_utc="2026-09-01T00:00:00+00:00",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "provisional-hardware.json"
+            qualify.publish_receipt(path, receipt, provisional=True)
+            inspected = run_authority.inspect_provisional_hardware_contract(path)
+            self.assertEqual(inspected["expected"], receipt)
+            geometry_payload, _, geometry_identity = (
+                geometry_qualification._validate_hardware_contract(  # noqa: SLF001
+                    path, allow_provisional=True
+                )
+            )
+            self.assertEqual(geometry_payload, receipt)
+            self.assertEqual(
+                geometry_identity["scope"], "geometry-only-provisional"
+            )
+            with self.assertRaisesRegex(
+                run_authority.RunAuthorityError, "Unsupported"
+            ):
+                run_authority.inspect_hardware_contract(path)
+            with self.assertRaisesRegex(
+                geometry_qualification.GeometryQualificationError,
+                "cannot authorize the final soak",
+            ):
+                geometry_qualification._validate_hardware_contract(path)  # noqa: SLF001
 
     def test_receipt_pair_is_write_once(self) -> None:
         receipt = qualify.build_hardware_receipt(

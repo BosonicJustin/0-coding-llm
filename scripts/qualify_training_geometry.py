@@ -69,7 +69,19 @@ def _add_settings(parser: argparse.ArgumentParser) -> None:
         "--gpu-poll-interval-seconds",
         default=defaults.gpu_poll_interval_seconds,
     )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("disabled", "offline", "online"),
+        default=defaults.wandb_mode,
+        help=(
+            "authoritative runs require offline or online; disabled is parsed "
+            "only to fail closed with an explicit evidence error"
+        ),
+    )
     parser.add_argument("--wandb-project", default=defaults.wandb_project)
+    parser.add_argument(
+        "--wandb-run-name-prefix", default=defaults.wandb_run_name_prefix
+    )
     parser.add_argument(
         "--checkpoint-generation-bytes",
         type=int,
@@ -96,6 +108,21 @@ def _add_common_plan_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--hardware-contract", type=Path, required=True)
     parser.add_argument("--single-gpu-baselines", type=Path, required=True)
+    parser.add_argument(
+        "--python-executable", type=Path, default=Path(sys.executable)
+    )
+    _add_settings(parser)
+
+
+def _add_baseline_inputs(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--validation-order-manifest", type=Path, required=True)
+    parser.add_argument("--tokenizer", type=Path, required=True)
+    parser.add_argument("--hardware-contract", type=Path, required=True)
+    parser.add_argument("--python-packed-manifest", type=Path, required=True)
+    parser.add_argument("--other-code-packed-manifest", type=Path, required=True)
+    parser.add_argument("--english-packed-manifest", type=Path, required=True)
+    parser.add_argument("--baseline-gpu-visible-index", type=int, default=0)
     parser.add_argument(
         "--python-executable", type=Path, default=Path(sys.executable)
     )
@@ -134,6 +161,24 @@ def _grid_plan(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _baseline_plan(args: argparse.Namespace) -> dict[str, Any]:
+    return qualification.build_baseline_plan(
+        output_root=args.output_root,
+        packed_manifests={
+            "python": args.python_packed_manifest,
+            "other_code": args.other_code_packed_manifest,
+            "english": args.english_packed_manifest,
+        },
+        validation_order_manifest=args.validation_order_manifest,
+        tokenizer_root=args.tokenizer,
+        hardware_contract=args.hardware_contract,
+        settings=_settings(args),
+        cli_script=Path(__file__),
+        python_executable=args.python_executable,
+        baseline_gpu_visible_index=args.baseline_gpu_visible_index,
+    )
+
+
 def _final_plan(args: argparse.Namespace) -> dict[str, Any]:
     return qualification.build_final_plan(
         output_root=args.output_root,
@@ -167,7 +212,10 @@ def _preview_grid_commands(plan: dict[str, Any]) -> list[dict[str, Any]]:
             "checkpoint": checkpoint,
             "candidate": candidate,
             "settings": settings,
-            "run_name": f"geometry-{candidate.candidate_id}-{plan['plan_sha256'][:16]}",
+            "run_name": (
+                f"{settings.wandb_run_name_prefix}-{candidate.candidate_id}-"
+                f"{plan['plan_sha256'][:16]}"
+            ),
             "run_group": plan["plan_sha256"][:16],
         }
         commands.append(
@@ -178,6 +226,49 @@ def _preview_grid_commands(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
                 "phase_two": qualification.render_torchrun_command(
                     **common, resume=True
+                ),
+            }
+        )
+    return commands
+
+
+def _preview_baseline_commands(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    settings = qualification.SoakSettings(**plan["settings"])
+    python_path = Path(plan["runtime"]["python"]["invocation_path"])
+    validation = Path(plan["inputs"]["validation_order"]["manifest"]["path"])
+    tokenizer = Path(plan["inputs"]["common"]["tokenizer"]["root"])
+    commands: list[dict[str, Any]] = []
+    for candidate in qualification.CANDIDATES:
+        candidate_root = (
+            Path(plan["output_root"]) / "candidates" / candidate.candidate_id
+        )
+        order = (
+            Path(plan["output_root"])
+            / "orders"
+            / candidate.candidate_id
+            / "manifest.json"
+        )
+        commands.append(
+            {
+                "candidate": candidate.as_dict(),
+                "command": qualification.render_torchrun_command(
+                    python_executable=python_path,
+                    order_manifest=order,
+                    validation_order_manifest=validation,
+                    tokenizer_root=tokenizer,
+                    checkpoint=candidate_root / "checkpoints" / "last.pt",
+                    candidate=candidate,
+                    settings=settings,
+                    run_name=(
+                        f"{settings.wandb_run_name_prefix}-baseline-"
+                        f"{candidate.candidate_id}-"
+                        f"{plan['plan_sha256'][:16]}"
+                    ),
+                    run_group=plan["plan_sha256"][:16],
+                    resume=False,
+                    world_size=qualification.BASELINE_WORLD_SIZE,
+                    global_microbatch_rows=candidate.local_microbatch_rows,
+                    wandb_tag="single-gpu-geometry-baseline",
                 ),
             }
         )
@@ -202,7 +293,10 @@ def _preview_final_commands(plan: dict[str, Any]) -> list[dict[str, Any]]:
         "checkpoint": root / "checkpoints" / "last.pt",
         "candidate": candidate,
         "settings": settings,
-        "run_name": f"geometry-{candidate.candidate_id}-{plan['plan_sha256'][:16]}",
+        "run_name": (
+            f"{settings.wandb_run_name_prefix}-{candidate.candidate_id}-"
+            f"{plan['plan_sha256'][:16]}"
+        ),
         "run_group": plan["plan_sha256"][:16],
     }
     return [
@@ -214,62 +308,23 @@ def _preview_final_commands(plan: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _baseline_template(args: argparse.Namespace) -> dict[str, Any]:
-    hardware, bound = qualification._validate_hardware_contract(  # noqa: SLF001
-        args.hardware_contract
-    )
-    del hardware
-    candidates: dict[str, Any] = {}
-    for candidate in qualification.CANDIDATES:
-        candidates[candidate.candidate_id] = {
-            "global_microbatch_rows": candidate.local_microbatch_rows,
-            "gradient_accumulation_steps": candidate.gradient_accumulation_steps,
-            "compile_model": candidate.compile_model,
-            "gpu_count": 1,
-            "scope": qualification.THROUGHPUT_SCOPE,
-            "timer": qualification.THROUGHPUT_TIMER,
-            "counter": qualification.THROUGHPUT_COUNTER,
-            "start_consumed_input_tokens": "REPLACE_WITH_INTEGER",
-            "end_consumed_input_tokens": "REPLACE_WITH_INTEGER",
-            "elapsed_wall_time_ns": "REPLACE_WITH_INTEGER",
-            "aggregate_input_tokens_per_second": "REPLACE_WITH_EXACT_DECIMAL",
-        }
-    return {
-        "format": qualification.BASELINE_FORMAT,
-        "format_version": qualification.FORMAT_VERSION,
-        "status": "INCOMPLETE_REPLACE_WITH_pass",
-        "hardware_contract_sha256": bound["artifact"]["sha256"],
-        "sequence_length_for_alignment": args.sequence_length,
-        "candidates": candidates,
-        "instructions": (
-            "Remove sequence_length_for_alignment and instructions, replace every "
-            "placeholder from an externally timed one-GPU run, write canonical JSON, "
-            "and pass the draft to seal-baselines. The sealer publishes the exact "
-            "'<sha256>  <filename>\\n' sidecar and rejects missing, misaligned, or "
-            "arithmetically inconsistent evidence."
-        ),
-    }
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
     for action in ("preflight-grid", "run-grid"):
         child = subparsers.add_parser(action)
         _add_grid_inputs(child)
+    for action in ("preflight-baselines", "run-baselines"):
+        child = subparsers.add_parser(action)
+        _add_baseline_inputs(child)
     for action in ("preflight-final", "run-final"):
         child = subparsers.add_parser(action)
         _add_final_inputs(child)
     status = subparsers.add_parser("status")
     status.add_argument("--output-root", type=Path, required=True)
-    baseline = subparsers.add_parser("baseline-template")
-    baseline.add_argument("--hardware-contract", type=Path, required=True)
-    baseline.add_argument("--sequence-length", type=int, required=True)
-    seal = subparsers.add_parser("seal-baselines")
-    seal.add_argument("--draft", type=Path, required=True)
-    seal.add_argument("--output", type=Path, required=True)
-    seal.add_argument("--hardware-contract", type=Path, required=True)
-    seal.add_argument("--sequence-length", type=int, required=True)
+    final_order = subparsers.add_parser("build-final-train-order")
+    final_order.add_argument("--grid-result", type=Path, required=True)
+    final_order.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -279,18 +334,32 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "status":
             output = qualification.qualification_status(args.output_root)
-        elif args.action == "baseline-template":
-            if args.sequence_length < 1:
-                parser.error("--sequence-length must be positive")
-            output = _baseline_template(args)
-        elif args.action == "seal-baselines":
-            bound = qualification.seal_single_gpu_baselines(
-                draft=args.draft,
-                output=args.output,
-                hardware_contract=args.hardware_contract,
-                sequence_length=args.sequence_length,
+        elif args.action == "build-final-train-order":
+            manifest = qualification.build_final_train_order_from_grid(
+                grid_result=args.grid_result,
+                output_dir=args.output,
             )
-            output = {"status": "pass", "single_gpu_baselines": bound}
+            output = {"status": "pass", "manifest": manifest}
+        elif args.action in {"preflight-baselines", "run-baselines"}:
+            plan = _baseline_plan(args)
+            if args.action == "preflight-baselines":
+                output = {
+                    "status": "preflight-pass-no-gpu-action",
+                    "plan": plan,
+                    "commands": _preview_baseline_commands(plan),
+                    "output_storage": qualification.verify_output_storage(
+                        args.output_root, plan=plan, allow_missing_root=True
+                    ),
+                }
+            else:
+                qualification.prepare_plan_root(args.output_root, plan)
+                with qualification.QualificationLock(args.output_root):
+                    payload, bound = qualification.run_single_gpu_baselines(
+                        root=args.output_root,
+                        plan=plan,
+                        environment=os.environ,
+                    )
+                output = {"status": payload["status"], "result": bound}
         elif args.action in {"preflight-grid", "run-grid"}:
             plan = _grid_plan(args)
             if args.action == "preflight-grid":
@@ -344,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {safe_error}", file=sys.stderr)
         return 2
     print(json.dumps(output, indent=2, sort_keys=True, allow_nan=False))
-    if args.action == "run-grid" and output.get("status") != "pass":
+    if args.action in {"run-baselines", "run-grid"} and output.get("status") != "pass":
         return 3
     return 0
 

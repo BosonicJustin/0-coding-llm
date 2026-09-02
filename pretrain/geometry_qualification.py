@@ -51,10 +51,19 @@ from pretrain.tokenizer_identity import verify_tokenizer_identity
 
 WORLD_SIZE = 6
 UPDATE_ROWS = 192
+BASELINE_WORLD_SIZE = 1
+BASELINE_UPDATE_ROWS = UPDATE_ROWS // WORLD_SIZE
+FINAL_TRAIN_TARGET_INPUT_TOKENS = 52_580_000_000
+FINAL_TRAIN_EXPECTED_OPTIMIZER_UPDATES = 66_858
+FINAL_TRAIN_EXPECTED_ROWS = FINAL_TRAIN_EXPECTED_OPTIMIZER_UPDATES * UPDATE_ROWS
+FINAL_TRAIN_EXPECTED_CONSUMED_INPUT_TOKENS = FINAL_TRAIN_EXPECTED_ROWS * 4_096
 GRID: tuple[tuple[int, int], ...] = ((6, 32), (12, 16), (24, 8))
 PLAN_FORMAT = "six-gpu-geometry-qualification-plan"
+BASELINE_PLAN_FORMAT = "single-gpu-geometry-baseline-plan"
 GRID_RESULT_FORMAT = "six-gpu-geometry-grid-result"
 CANDIDATE_RESULT_FORMAT = "six-gpu-geometry-candidate-result"
+BASELINE_CANDIDATE_RESULT_FORMAT = "single-gpu-geometry-baseline-candidate-result"
+BASELINE_FAILURE_FORMAT = "single-gpu-geometry-baseline-failure"
 BASELINE_FORMAT = "single-gpu-geometry-baselines"
 GEOMETRY_RECEIPT_FORMAT = "pretraining-accepted-geometry"
 FORMAT_VERSION = 1
@@ -152,7 +161,9 @@ class SoakSettings:
     phase_timeout_seconds: int = 7200
     graceful_shutdown_seconds: int = 1800
     gpu_poll_interval_seconds: str = "0.5"
+    wandb_mode: str = "offline"
     wandb_project: str = "coding-model-from-scratch"
+    wandb_run_name_prefix: str = "geometry"
     checkpoint_generation_bytes: int = 16 * 1024**3
 
     def validate(self) -> None:
@@ -202,8 +213,21 @@ class SoakSettings:
             "max_grad_norm",
         ):
             _decimal(getattr(self, field), field=field, allow_zero=field == "weight_decay")
+        if self.wandb_mode not in {"offline", "online"}:
+            raise GeometryQualificationError(
+                "Authoritative geometry requires --wandb-mode offline or online; "
+                "disabled cannot prove metric visibility"
+            )
         if not self.wandb_project or _SECRET_NAME.search(self.wandb_project):
             raise GeometryQualificationError("wandb_project is empty or secret-like")
+        if (
+            not self.wandb_run_name_prefix
+            or _SECRET_NAME.search(self.wandb_run_name_prefix)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", self.wandb_run_name_prefix)
+        ):
+            raise GeometryQualificationError(
+                "wandb_run_name_prefix is empty, secret-like, or unsafe"
+            )
 
     @property
     def diagnostic_optimizer_updates(self) -> int:
@@ -355,17 +379,23 @@ class GPUMemoryObservation:
     minimum_free_bytes_per_gpu: int | None = None
     samples: int = 0
 
-    def add(self, rows: Sequence[tuple[int, int]]) -> None:
-        if len(rows) != WORLD_SIZE:
+    def add(
+        self,
+        rows: Sequence[tuple[int, int]],
+        *,
+        expected_gpu_count: int = WORLD_SIZE,
+    ) -> None:
+        if len(rows) != expected_gpu_count:
             raise GeometryQualificationError(
-                f"GPU sampler returned {len(rows)} devices, expected {WORLD_SIZE}"
+                f"GPU sampler returned {len(rows)} devices, expected "
+                f"{expected_gpu_count}"
             )
         totals = tuple(total for total, _ in rows)
         if any(total < 1 or free < 0 or free > total for total, free in rows):
             raise GeometryQualificationError("GPU memory sampler returned invalid bytes")
         if self.samples and totals != self.total_bytes_per_gpu:
             raise GeometryQualificationError("Visible GPU memory topology changed during soak")
-        self.gpu_count = len(rows)
+        self.gpu_count = expected_gpu_count
         self.total_bytes_per_gpu = totals
         sample_minimum = min(free for _, free in rows)
         self.minimum_free_bytes_per_gpu = (
@@ -385,7 +415,7 @@ class GPUMemoryObservation:
         assert self.minimum_free_bytes_per_gpu is not None
         assert later.minimum_free_bytes_per_gpu is not None
         return GPUMemoryObservation(
-            gpu_count=WORLD_SIZE,
+            gpu_count=self.gpu_count,
             total_bytes_per_gpu=self.total_bytes_per_gpu,
             minimum_free_bytes_per_gpu=min(
                 self.minimum_free_bytes_per_gpu,
@@ -636,17 +666,158 @@ def _boot_id() -> str:
     return value
 
 
-def _validate_hardware_contract(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    # Reuse the launch authority's complete receipt validator.  A superficial
+def _geometry_hardware_identity(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the stable hardware/runtime identity shared by both pod receipts.
+
+    The bootstrap and final RunPod receipts intentionally contain different
+    data-path evidence, argv, timestamps, and free-space observations.  None of
+    those fields describes the hardware/runtime on which geometry was measured.
+    This projection retains the device UUID/order, CUDA/NCCL stack, package
+    lock, deterministic environment, and clean source identity while excluding
+    only phase-specific or volatile observations.
+    """
+
+    try:
+        qualification = contract["qualification"]
+        gpu = qualification["gpu"]
+        host = qualification["host"]
+        source = qualification["source"]
+        devices = gpu["devices"]
+        package = host["package_lock"]
+        environment = host["environment"]
+        git = source["git"]
+    except (KeyError, TypeError) as exc:
+        raise GeometryQualificationError(
+            "Hardware contract lacks stable geometry identity fields"
+        ) from exc
+    if not isinstance(devices, list) or len(devices) != WORLD_SIZE:
+        raise GeometryQualificationError(
+            "Hardware contract lacks the six-device geometry identity"
+        )
+    stable_device_fields = (
+        "visible_index",
+        "physical_index",
+        "uuid",
+        "name",
+        "pci_bus_id",
+        "compute_capability",
+        "total_memory_bytes",
+        "multiprocessor_count",
+        "bf16_supported",
+        "nvidia_smi_memory_bytes",
+        "mig_mode",
+    )
+    stable_devices: list[dict[str, Any]] = []
+    for index, device in enumerate(devices):
+        if not isinstance(device, Mapping):
+            raise GeometryQualificationError(
+                "Hardware contract contains an invalid GPU identity"
+            )
+        stable = {
+            field: device[field]
+            for field in stable_device_fields
+            if field in device
+        }
+        if (
+            stable.get("visible_index") != index
+            or not isinstance(stable.get("uuid"), str)
+            or not stable["uuid"].startswith("GPU-")
+        ):
+            raise GeometryQualificationError(
+                "Hardware contract GPU identity/order is invalid"
+            )
+        stable_devices.append(stable)
+    try:
+        identity = {
+            "topology": contract["topology"],
+            "world_size": contract["world_size"],
+            "gpu_count": contract["gpu_count"],
+            "gpu_model": contract["gpu_model"],
+            "gpu_memory_bytes": contract["gpu_memory_bytes"],
+            "compute_capability": contract["compute_capability"],
+            "multiprocessor_count": contract["multiprocessor_count"],
+            "driver_version": contract["driver_version"],
+            "cuda_runtime_version": contract["cuda_runtime_version"],
+            "cudnn_version": contract["cudnn_version"],
+            "nccl_version": contract["nccl_version"],
+            "torch_version": contract["torch_version"],
+            "bf16_supported": contract["bf16_supported"],
+            "distributed_strategy": contract["distributed_strategy"],
+            "nvlink_policy": qualification["nvlink_policy"],
+            "devices": stable_devices,
+            "peer_access_matrix": gpu["peer_access_matrix"],
+            "nvidia_topology": {
+                "labels_in_visible_order": gpu["nvidia_topology"][
+                    "labels_in_visible_order"
+                ],
+                "matrix": gpu["nvidia_topology"]["matrix"],
+                "nvlink_pairs": gpu["nvidia_topology"]["nvlink_pairs"],
+                "possible_pairs": gpu["nvidia_topology"]["possible_pairs"],
+            },
+            "torch_cuda_arch_list": gpu["torch_cuda_arch_list"],
+            "compiled_arch_supported": gpu["compiled_arch_supported"],
+            "package_lock": package,
+            "deterministic_environment": {
+                "required": environment["required"],
+                "cuda_visible_devices": environment["cuda_visible_devices"],
+            },
+            "source": {
+                "qualification_script_sha256": source[
+                    "qualification_script"
+                ]["sha256"],
+                "requirements_train_sha256": source["requirements_train"][
+                    "sha256"
+                ],
+                "requirements_wandb_sha256": source["requirements_wandb"][
+                    "sha256"
+                ],
+                "git_commit": git["commit"],
+                "git_tree": git["tree"],
+                "git_head_archive_sha256": git["head_archive_sha256"],
+                "git_clean": git["clean"],
+            },
+        }
+    except (KeyError, TypeError) as exc:
+        raise GeometryQualificationError(
+            "Hardware contract stable geometry identity is incomplete"
+        ) from exc
+    canonical_json_bytes(identity)
+    return identity
+
+
+def _validate_hardware_contract(
+    path: Path,
+    *,
+    allow_provisional: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    # Reuse the launch authority's complete receipt validators.  A superficial
     # six-field check here would allow a hand-written object to impersonate the
     # RunPod qualifier's NCCL/topology/package evidence.
     try:
         from pretrain.run_authority import (
+            HARDWARE_FORMAT,
+            PROVISIONAL_HARDWARE_FORMAT,
             RunAuthorityError,
             inspect_hardware_contract,
+            inspect_provisional_hardware_contract,
         )
 
-        inspected = inspect_hardware_contract(path)
+        raw = _load_json_file(path, label="six-GPU hardware contract")
+        contract_format = raw.get("format")
+        if contract_format == HARDWARE_FORMAT:
+            inspected = inspect_hardware_contract(path)
+            scope = "final-launch-authorizing"
+        elif contract_format == PROVISIONAL_HARDWARE_FORMAT and allow_provisional:
+            inspected = inspect_provisional_hardware_contract(path)
+            scope = "geometry-only-provisional"
+        elif contract_format == PROVISIONAL_HARDWARE_FORMAT:
+            raise GeometryQualificationError(
+                "Provisional hardware evidence cannot authorize the final soak"
+            )
+        else:
+            raise GeometryQualificationError(
+                "Unsupported hardware receipt format for geometry qualification"
+            )
     except (OSError, ValueError, RunAuthorityError) as exc:
         raise GeometryQualificationError(
             f"Hardware contract is not production-authoritative: {exc}"
@@ -656,8 +827,9 @@ def _validate_hardware_contract(path: Path) -> tuple[dict[str, Any], dict[str, A
         "artifact": inspected["contract"],
         "sidecar": inspected["sidecar"],
     }
+    allowed_statuses = {"accepted", "provisional"} if allow_provisional else {"accepted"}
     if (
-        payload.get("status") != "accepted"
+        payload.get("status") not in allowed_statuses
         or payload.get("topology") != "single-node"
         or payload.get("world_size") != WORLD_SIZE
         or payload.get("gpu_count") != WORLD_SIZE
@@ -665,9 +837,14 @@ def _validate_hardware_contract(path: Path) -> tuple[dict[str, Any], dict[str, A
         or payload.get("distributed_strategy") != "ddp"
     ):
         raise GeometryQualificationError(
-            "Hardware contract is not an accepted six-GPU BF16 DDP contract"
+            "Hardware contract is not a valid six-GPU BF16 DDP contract"
         )
-    return payload, bound
+    identity = _geometry_hardware_identity(payload)
+    return payload, bound, {
+        "scope": scope,
+        "identity": identity,
+        "identity_sha256": canonical_sha256(identity),
+    }
 
 
 def verify_plan_artifacts(plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -747,7 +924,8 @@ def verify_live_runtime(
         ) from exc
     if (
         not isinstance(required_environment, Mapping)
-        or required_environment.get("WANDB_MODE") != "offline"
+        or required_environment.get("WANDB_MODE")
+        != plan.get("settings", {}).get("wandb_mode", "offline")
         or any(
             environment.get(str(name)) != value
             for name, value in required_environment.items()
@@ -918,13 +1096,21 @@ def verify_output_storage(
             "Qualification output is not the writable qualified network filesystem"
         )
     mode = plan.get("mode")
-    generations = 2 * len(CANDIDATES) if mode == "grid" else 2
-    if mode not in {"grid", "final-soak"}:
+    if mode == "grid":
+        generations = 2 * len(CANDIDATES)
+    elif mode == "single-gpu-baselines":
+        # Baseline throughput uses the same end-to-end stop/checkpoint/resume
+        # scope as the six-GPU candidates, so each lineage retains both the
+        # pre-resume and post-resume generations.
+        generations = 2 * len(CANDIDATES)
+    elif mode == "final-soak":
+        generations = 2
+    else:
         raise GeometryQualificationError("Unknown qualification storage mode")
     estimate = settings.checkpoint_generation_bytes
     existing_bytes = 0
     if root.is_dir() and not root.is_symlink():
-        if mode == "grid":
+        if mode in {"grid", "single-gpu-baselines"}:
             structural_directories = [root / "orders", root / "candidates"]
             structural_directories.extend(
                 root / "candidates" / candidate.candidate_id / "checkpoints"
@@ -933,7 +1119,9 @@ def verify_output_storage(
             expected_paths = {
                 root / "candidates" / candidate.candidate_id / "checkpoints" / name
                 for candidate in CANDIDATES
-                for name in ("last.pt", "last.previous.pt")
+                for name in (
+                    ("last.pt", "last.previous.pt")
+                )
             }
         else:
             structural_directories = [
@@ -1035,7 +1223,7 @@ def _normalized_nvidia_free_memory(
 def load_single_gpu_baselines(
     path: Path,
     *,
-    hardware_contract_sha256: str,
+    hardware_identity_sha256: str,
     sequence_length: int,
 ) -> tuple[dict[str, Decimal], dict[str, Any]]:
     payload, bound = verified_json_with_sidecar(
@@ -1045,13 +1233,16 @@ def load_single_gpu_baselines(
         "format",
         "format_version",
         "status",
-        "hardware_contract_sha256",
+        "hardware_identity_sha256",
+        "producer_plan",
+        "exact_shared_order_payload_sha256",
+        "results",
         "candidates",
     } or (
         payload.get("format") != BASELINE_FORMAT
         or payload.get("format_version") != FORMAT_VERSION
         or payload.get("status") != "pass"
-        or payload.get("hardware_contract_sha256") != hardware_contract_sha256
+        or payload.get("hardware_identity_sha256") != hardware_identity_sha256
     ):
         raise GeometryQualificationError(
             "Single-GPU baseline receipt format/hardware binding is invalid"
@@ -1064,6 +1255,45 @@ def load_single_gpu_baselines(
             "Single-GPU baseline receipt must contain all six grid candidates"
         )
     rates: dict[str, Decimal] = {}
+    producer_bound = payload.get("producer_plan")
+    try:
+        producer_path = Path(str(producer_bound["artifact"]["path"]))
+    except (KeyError, TypeError) as exc:
+        raise GeometryQualificationError(
+            "Single-GPU baseline receipt lacks its producer plan"
+        ) from exc
+    producer_plan, verified_producer_bound = verified_json_with_sidecar(
+        producer_path, label="single-GPU baseline producer plan"
+    )
+    _validate_plan_self_hash(producer_plan)
+    if (
+        verified_producer_bound != producer_bound
+        or producer_plan.get("format") != BASELINE_PLAN_FORMAT
+        or producer_plan.get("mode") != "single-gpu-baselines"
+        or producer_plan.get("inputs", {})
+        .get("hardware", {})
+        .get("geometry_identity", {})
+        .get("identity_sha256")
+        != hardware_identity_sha256
+        or producer_plan.get("inputs", {}).get("common", {}).get("sequence_length")
+        != sequence_length
+    ):
+        raise GeometryQualificationError(
+            "Single-GPU baseline producer plan binding is invalid"
+        )
+    shared_order_sha256 = payload.get("exact_shared_order_payload_sha256")
+    if (
+        not isinstance(shared_order_sha256, str)
+        or _SHA256.fullmatch(shared_order_sha256) is None
+    ):
+        raise GeometryQualificationError(
+            "Single-GPU baseline shared-order identity is invalid"
+        )
+    result_bindings = payload.get("results")
+    if not isinstance(result_bindings, dict) or set(result_bindings) != set(entries):
+        raise GeometryQualificationError(
+            "Single-GPU baseline receipt lacks all candidate result bindings"
+        )
     required = {
         "global_microbatch_rows",
         "gradient_accumulation_steps",
@@ -1131,6 +1361,31 @@ def load_single_gpu_baselines(
                 f"Baseline {candidate.candidate_id} throughput does not reconcile"
             )
         rates[candidate.candidate_id] = reported
+        result_bound = result_bindings[candidate.candidate_id]
+        try:
+            result_path = Path(str(result_bound["artifact"]["path"]))
+        except (KeyError, TypeError) as exc:
+            raise GeometryQualificationError(
+                f"Baseline {candidate.candidate_id} result binding is invalid"
+            ) from exc
+        result, verified_result_bound = verified_json_with_sidecar(
+            result_path,
+            label=f"single-GPU baseline {candidate.candidate_id} result",
+        )
+        if (
+            verified_result_bound != result_bound
+            or result.get("format") != BASELINE_CANDIDATE_RESULT_FORMAT
+            or result.get("format_version") != FORMAT_VERSION
+            or result.get("status") != "pass"
+            or result.get("plan_sha256") != producer_plan["plan_sha256"]
+            or result.get("candidate") != candidate.as_dict()
+            or result.get("measurement") != entry
+            or result.get("order", {}).get("order", {}).get("sha256")
+            != shared_order_sha256
+        ):
+            raise GeometryQualificationError(
+                f"Baseline {candidate.candidate_id} result/provenance is invalid"
+            )
     return rates, bound
 
 
@@ -1149,7 +1404,9 @@ def seal_single_gpu_baselines(
         or sequence_length < 1
     ):
         raise GeometryQualificationError("Baseline sequence_length must be positive")
-    _, hardware_bound = _validate_hardware_contract(hardware_contract)
+    _, _, hardware_identity = _validate_hardware_contract(
+        hardware_contract, allow_provisional=True
+    )
     draft_payload = _load_json_file(draft, label="single-GPU baseline draft")
     parent = output.parent.resolve(strict=True)
     if output.parent.is_symlink() or not parent.is_dir():
@@ -1163,13 +1420,13 @@ def seal_single_gpu_baselines(
         publish_json_new(candidate, draft_payload)
         load_single_gpu_baselines(
             candidate,
-            hardware_contract_sha256=hardware_bound["artifact"]["sha256"],
+            hardware_identity_sha256=hardware_identity["identity_sha256"],
             sequence_length=sequence_length,
         )
     bound = publish_json_new(output, draft_payload)
     _, verified_bound = load_single_gpu_baselines(
         output,
-        hardware_contract_sha256=hardware_bound["artifact"]["sha256"],
+        hardware_identity_sha256=hardware_identity["identity_sha256"],
         sequence_length=sequence_length,
     )
     if verified_bound != bound:
@@ -1191,14 +1448,31 @@ def render_torchrun_command(
     run_name: str,
     run_group: str,
     resume: bool,
+    world_size: int = WORLD_SIZE,
+    global_microbatch_rows: int | None = None,
+    wandb_tag: str = "geometry-qualification",
 ) -> list[str]:
+    if global_microbatch_rows is None:
+        global_microbatch_rows = candidate.global_microbatch_rows
+    if (
+        not isinstance(world_size, int)
+        or isinstance(world_size, bool)
+        or world_size < 1
+        or not isinstance(global_microbatch_rows, int)
+        or isinstance(global_microbatch_rows, bool)
+        or global_microbatch_rows < 1
+        or global_microbatch_rows % world_size
+    ):
+        raise GeometryQualificationError(
+            "Torchrun world-size/global-microbatch geometry is invalid"
+        )
     command = [
         str(python_executable),
         "-m",
         "torch.distributed.run",
         "--standalone",
         "--nnodes=1",
-        f"--nproc-per-node={WORLD_SIZE}",
+        f"--nproc-per-node={world_size}",
         "--max-restarts=0",
         "-m",
         "pretrain.train",
@@ -1218,7 +1492,7 @@ def render_torchrun_command(
         "--activation-checkpointing",
         "--fused-adamw",
         "--global-microbatch-rows",
-        str(candidate.global_microbatch_rows),
+        str(global_microbatch_rows),
         "--gradient-accumulation-steps",
         str(candidate.gradient_accumulation_steps),
         "--workers",
@@ -1235,7 +1509,7 @@ def render_torchrun_command(
         "--log-every",
         "1",
         "--wandb-mode",
-        "offline",
+        settings.wandb_mode,
         "--wandb-project",
         settings.wandb_project,
         "--wandb-run-name",
@@ -1243,7 +1517,7 @@ def render_torchrun_command(
         "--wandb-group",
         run_group,
         "--wandb-tags",
-        "geometry-qualification",
+        wandb_tag,
         candidate.candidate_id,
         "--learning-rate",
         settings.learning_rate,
@@ -1305,7 +1579,7 @@ def command_sha256(command: Sequence[str]) -> str:
 
 
 def command_display(command: Sequence[str]) -> str:
-    _assert_secret_free_command(command, environment)
+    _assert_secret_free_command(command)
     return shlex.join(command)
 
 
@@ -1572,6 +1846,7 @@ def supervise_phase(
     start_after_step: int | None,
     request_stop_after_step: int,
     prior_observation: PhaseObservation | None = None,
+    expected_gpu_count: int = WORLD_SIZE,
     clock_ns: Callable[[], int] = time.monotonic_ns,
     gpu_sampler: Callable[[], Sequence[tuple[int, int]]] = sample_nvidia_smi_memory,
     popen_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
@@ -1593,7 +1868,7 @@ def supervise_phase(
             "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
             "PYTHONHASHSEED": "0",
             "PRETRAIN_STOP_REQUEST_FILE": str(stop_request_path),
-            "WANDB_MODE": "offline",
+            "WANDB_MODE": settings.wandb_mode,
             "WANDB_SILENT": "true",
         }
     )
@@ -1615,6 +1890,12 @@ def supervise_phase(
             wandb_failure=None,
         )
     )
+    if (
+        not isinstance(expected_gpu_count, int)
+        or isinstance(expected_gpu_count, bool)
+        or expected_gpu_count < 1
+    ):
+        raise GeometryQualificationError("expected_gpu_count must be positive")
     memory = GPUMemoryObservation()
     phase_started_ns = clock_ns()
     phase_timeout_ns = settings.phase_timeout_seconds * 1_000_000_000
@@ -1657,7 +1938,9 @@ def supervise_phase(
             while True:
                 now = clock_ns()
                 if now >= next_gpu_poll_ns:
-                    memory.add(gpu_sampler())
+                    memory.add(
+                        gpu_sampler(), expected_gpu_count=expected_gpu_count
+                    )
                     next_gpu_poll_ns = now + poll_interval_ns
                 if now - phase_started_ns > phase_timeout_ns:
                     if observation.stop_request_monotonic_ns is None:
@@ -1695,7 +1978,7 @@ def supervise_phase(
                         )
                     break
             completed_ns = clock_ns()
-            memory.add(gpu_sampler())
+            memory.add(gpu_sampler(), expected_gpu_count=expected_gpu_count)
             return_code = int(process.wait())
             log.flush()
             os.fsync(log.fileno())
@@ -1726,7 +2009,7 @@ def supervise_phase(
         )
     if observation.wandb_failure is not None:
         raise GeometryQualificationError(
-            f"Offline W&B failed during qualification: {observation.wandb_failure}"
+            f"W&B failed during qualification: {observation.wandb_failure}"
         )
     return PhaseRun(
         return_code=return_code,
@@ -1742,6 +2025,7 @@ def _checkpoint_summary(
     *,
     expected_order_sha256: str,
     expected_order_payload_sha256: str,
+    expected_world_size: int = WORLD_SIZE,
 ) -> dict[str, Any]:
     """Inspect a trusted qualification-generated checkpoint with mmap loading."""
 
@@ -1774,13 +2058,13 @@ def _checkpoint_summary(
     data_identity = payload.get("data_identity")
     metadata = payload.get("metadata")
     if (
-        payload.get("world_size") != WORLD_SIZE
+        payload.get("world_size") != expected_world_size
         or not isinstance(train_state, dict)
         or not isinstance(data_identity, str)
         or not isinstance(metadata, dict)
     ):
         raise GeometryQualificationError(
-            "Qualification checkpoint lacks six-rank state/identity metadata"
+            "Qualification checkpoint lacks expected-rank state/identity metadata"
         )
     if (
         f"order-manifest-sha256:{expected_order_sha256}" not in data_identity
@@ -1804,12 +2088,12 @@ def _checkpoint_summary(
     wandb_run_id = metadata.get("wandb_run_id")
     if not isinstance(wandb_run_id, str) or not wandb_run_id:
         raise GeometryQualificationError(
-            "Checkpoint lacks the successful offline-W&B run identity"
+            "Checkpoint lacks the successful W&B run identity"
         )
     summary = {
         **descriptor,
         **counters,
-        "world_size": WORLD_SIZE,
+        "world_size": expected_world_size,
         "wandb_run_id_sha256": hashlib.sha256(
             wandb_run_id.encode("utf-8")
         ).hexdigest(),
@@ -1831,20 +2115,22 @@ def _wandb_inventory(root: Path) -> dict[str, Any]:
     wandb_root = root / "wandb"
     if wandb_root.is_symlink() or not wandb_root.is_dir():
         raise GeometryQualificationError(
-            f"Offline W&B directory is missing: {wandb_root}"
+            f"Local W&B evidence directory is missing: {wandb_root}"
         )
     entries: list[dict[str, Any]] = []
     for path in sorted(wandb_root.rglob("*")):
         if path.is_symlink():
-            raise GeometryQualificationError(f"Offline W&B tree contains a symlink: {path}")
+            raise GeometryQualificationError(
+                f"Local W&B evidence tree contains a symlink: {path}"
+            )
         if path.is_dir():
             continue
         if not path.is_file():
             raise GeometryQualificationError(
-                f"Offline W&B tree contains a special filesystem node: {path}"
+                f"Local W&B evidence tree contains a special filesystem node: {path}"
             )
         relative = path.relative_to(wandb_root).as_posix()
-        descriptor = artifact(path, label=f"offline W&B file {relative}")
+        descriptor = artifact(path, label=f"local W&B evidence file {relative}")
         entries.append(
             {
                 "path": relative,
@@ -1853,7 +2139,9 @@ def _wandb_inventory(root: Path) -> dict[str, Any]:
             }
         )
     if not entries or not any(entry["bytes"] > 0 for entry in entries):
-        raise GeometryQualificationError("Offline W&B tree contains no durable data")
+        raise GeometryQualificationError(
+            "Local W&B evidence tree contains no durable data"
+        )
     return {
         "root": str(wandb_root.resolve(strict=True)),
         "files": len(entries),
@@ -2020,22 +2308,156 @@ def _validation_input(
                 f"Validation order differs from packed data on {field}"
             )
     geometries: dict[str, Any] = {}
-    for candidate in CANDIDATES:
-        key = str(candidate.global_microbatch_rows)
+    evaluation_rows = {
+        candidate.global_microbatch_rows for candidate in CANDIDATES
+    } | {candidate.local_microbatch_rows for candidate in CANDIDATES}
+    for global_rows in sorted(evaluation_rows):
+        key = str(global_rows)
         if key in geometries:
             continue
         geometry = training_data.evaluation_order_geometry(
             path,
-            global_microbatch_rows=candidate.global_microbatch_rows,
+            global_microbatch_rows=global_rows,
             verify_checksum=True,
         )
         if geometry["available_global_microbatches"] < eval_batches:
             raise GeometryQualificationError(
                 f"Validation order has fewer than {eval_batches} microbatches for "
-                f"global rows {candidate.global_microbatch_rows}"
+                f"global rows {global_rows}"
             )
         geometries[key] = geometry
     return {"manifest": descriptor, "geometry_by_global_rows": geometries}
+
+
+def build_baseline_plan(
+    *,
+    output_root: Path,
+    packed_manifests: Mapping[str, Path],
+    validation_order_manifest: Path,
+    tokenizer_root: Path,
+    hardware_contract: Path,
+    settings: SoakSettings,
+    cli_script: Path,
+    python_executable: Path = Path(sys.executable),
+    baseline_gpu_visible_index: int = 0,
+) -> dict[str, Any]:
+    """Build the immutable plan that automatically measures one-GPU baselines."""
+
+    settings.validate()
+    if (
+        not isinstance(baseline_gpu_visible_index, int)
+        or isinstance(baseline_gpu_visible_index, bool)
+        or not 0 <= baseline_gpu_visible_index < WORLD_SIZE
+    ):
+        raise GeometryQualificationError(
+            "baseline_gpu_visible_index must select one of the six qualified GPUs"
+        )
+    hardware, hardware_bound, hardware_identity = _validate_hardware_contract(
+        hardware_contract, allow_provisional=True
+    )
+    packed, common = _packed_inputs(
+        packed_manifests,
+        tokenizer_root=tokenizer_root,
+    )
+    if common["split"] != "train":
+        raise GeometryQualificationError("Baseline packed manifests must be from train")
+    validation = _validation_input(
+        validation_order_manifest,
+        common=common,
+        eval_batches=settings.eval_batches,
+    )
+    devices = hardware["qualification"]["gpu"]["devices"]
+    selected_device = devices[baseline_gpu_visible_index]
+    plan: dict[str, Any] = {
+        "format": BASELINE_PLAN_FORMAT,
+        "format_version": FORMAT_VERSION,
+        "mode": "single-gpu-baselines",
+        "output_root": str(Path(output_root).resolve(strict=False)),
+        "world_size": BASELINE_WORLD_SIZE,
+        "effective_optimizer_update_rows": BASELINE_UPDATE_ROWS,
+        "baseline_gpu": {
+            "visible_index": baseline_gpu_visible_index,
+            "physical_index": selected_device["physical_index"],
+            "uuid": selected_device["uuid"],
+        },
+        "candidates": [candidate.as_dict() for candidate in CANDIDATES],
+        "settings": dataclasses.asdict(settings),
+        "inputs": {
+            "packed": packed,
+            "common": common,
+            "validation_order": validation,
+            "hardware": {
+                "bound": hardware_bound,
+                "expected": hardware,
+                "geometry_identity": hardware_identity,
+            },
+        },
+        "runtime": {
+            "python": _executable_identity(python_executable),
+            "sources": _source_identity(cli_script),
+        },
+        "secrets_recorded": False,
+    }
+    plan["plan_sha256"] = canonical_sha256(plan)
+    return plan
+
+
+def verify_baseline_plan_authority(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Rebuild every semantic input to an automatic one-GPU baseline plan."""
+
+    _validate_plan_self_hash(plan)
+    if (
+        plan.get("format") != BASELINE_PLAN_FORMAT
+        or plan.get("format_version") != FORMAT_VERSION
+        or plan.get("mode") != "single-gpu-baselines"
+        or plan.get("world_size") != BASELINE_WORLD_SIZE
+        or plan.get("effective_optimizer_update_rows") != BASELINE_UPDATE_ROWS
+        or plan.get("candidates")
+        != [candidate.as_dict() for candidate in CANDIDATES]
+    ):
+        raise GeometryQualificationError("Single-GPU baseline plan is not canonical")
+    artifacts = verify_plan_artifacts(plan)
+    hardware_path = Path(plan["inputs"]["hardware"]["bound"]["artifact"]["path"])
+    hardware, bound, identity = _validate_hardware_contract(
+        hardware_path, allow_provisional=True
+    )
+    if (
+        hardware != plan["inputs"]["hardware"]["expected"]
+        or bound != plan["inputs"]["hardware"]["bound"]
+        or identity != plan["inputs"]["hardware"]["geometry_identity"]
+    ):
+        raise GeometryQualificationError("Baseline hardware authority changed")
+    packed_paths = {
+        domain: Path(plan["inputs"]["packed"][domain]["manifest"]["path"])
+        for domain in training_data.DOMAIN_ORDER
+    }
+    packed, common = _packed_inputs(
+        packed_paths,
+        tokenizer_root=Path(plan["inputs"]["common"]["tokenizer"]["root"]),
+    )
+    if packed != plan["inputs"]["packed"] or common != plan["inputs"]["common"]:
+        raise GeometryQualificationError("Baseline packed-data authority changed")
+    settings = SoakSettings(**plan["settings"])
+    validation = _validation_input(
+        Path(plan["inputs"]["validation_order"]["manifest"]["path"]),
+        common=common,
+        eval_batches=settings.eval_batches,
+    )
+    if validation != plan["inputs"]["validation_order"]:
+        raise GeometryQualificationError("Baseline validation authority changed")
+    selected = plan.get("baseline_gpu")
+    devices = hardware["qualification"]["gpu"]["devices"]
+    try:
+        expected = devices[int(selected["visible_index"])]
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise GeometryQualificationError("Baseline GPU selection is invalid") from exc
+    if selected != {
+        "visible_index": expected["visible_index"],
+        "physical_index": expected["physical_index"],
+        "uuid": expected["uuid"],
+    }:
+        raise GeometryQualificationError("Baseline GPU identity changed")
+    return {"artifacts": artifacts, "status": "pass"}
 
 
 def build_grid_plan(
@@ -2051,7 +2473,9 @@ def build_grid_plan(
     python_executable: Path = Path(sys.executable),
 ) -> dict[str, Any]:
     settings.validate()
-    hardware, hardware_bound = _validate_hardware_contract(hardware_contract)
+    hardware, hardware_bound, hardware_identity = _validate_hardware_contract(
+        hardware_contract, allow_provisional=True
+    )
     packed, common = _packed_inputs(
         packed_manifests,
         tokenizer_root=tokenizer_root,
@@ -2065,9 +2489,36 @@ def build_grid_plan(
     )
     _, baseline_bound = load_single_gpu_baselines(
         single_gpu_baselines,
-        hardware_contract_sha256=hardware_bound["artifact"]["sha256"],
+        hardware_identity_sha256=hardware_identity["identity_sha256"],
         sequence_length=common["sequence_length"],
     )
+    baseline_receipt = read_bound_json(
+        baseline_bound["artifact"], label="single-GPU baseline receipt"
+    )
+    baseline_plan = read_bound_json(
+        baseline_receipt["producer_plan"]["artifact"],
+        label="single-GPU baseline producer plan",
+    )
+    verify_baseline_plan_authority(baseline_plan)
+    runtime = {
+        "python": _executable_identity(python_executable),
+        "sources": _source_identity(cli_script),
+    }
+    if (
+        baseline_plan.get("settings") != dataclasses.asdict(settings)
+        or baseline_plan.get("inputs", {}).get("packed") != packed
+        or baseline_plan.get("inputs", {}).get("common") != common
+        or baseline_plan.get("inputs", {}).get("validation_order") != validation
+        or baseline_plan.get("inputs", {})
+        .get("hardware", {})
+        .get("geometry_identity", {})
+        .get("identity_sha256")
+        != hardware_identity["identity_sha256"]
+        or baseline_plan.get("runtime") != runtime
+    ):
+        raise GeometryQualificationError(
+            "Grid settings/data/hardware/runtime differ from automatic baselines"
+        )
     plan: dict[str, Any] = {
         "format": PLAN_FORMAT,
         "format_version": FORMAT_VERSION,
@@ -2081,13 +2532,14 @@ def build_grid_plan(
             "packed": packed,
             "common": common,
             "validation_order": validation,
-            "hardware": {"bound": hardware_bound, "expected": hardware},
+            "hardware": {
+                "bound": hardware_bound,
+                "expected": hardware,
+                "geometry_identity": hardware_identity,
+            },
             "single_gpu_baselines": baseline_bound,
         },
-        "runtime": {
-            "python": _executable_identity(python_executable),
-            "sources": _source_identity(cli_script),
-        },
+        "runtime": runtime,
         "secrets_recorded": False,
     }
     plan["plan_sha256"] = canonical_sha256(plan)
@@ -2107,10 +2559,14 @@ def verify_grid_plan_authority(plan: Mapping[str, Any]) -> dict[str, Any]:
 
     artifacts = verify_plan_artifacts(plan)
     hardware_path = Path(plan["inputs"]["hardware"]["bound"]["artifact"]["path"])
-    hardware, hardware_bound = _validate_hardware_contract(hardware_path)
+    hardware, hardware_bound, hardware_identity = _validate_hardware_contract(
+        hardware_path, allow_provisional=True
+    )
     if (
         hardware != plan["inputs"]["hardware"]["expected"]
         or hardware_bound != plan["inputs"]["hardware"]["bound"]
+        or hardware_identity
+        != plan["inputs"]["hardware"]["geometry_identity"]
     ):
         raise GeometryQualificationError("Grid hardware authority changed")
     settings = SoakSettings(**plan["settings"])
@@ -2133,7 +2589,7 @@ def verify_grid_plan_authority(plan: Mapping[str, Any]) -> dict[str, Any]:
         raise GeometryQualificationError("Grid validation authority changed")
     _, baseline_bound = load_single_gpu_baselines(
         Path(plan["inputs"]["single_gpu_baselines"]["artifact"]["path"]),
-        hardware_contract_sha256=hardware_bound["artifact"]["sha256"],
+        hardware_identity_sha256=hardware_identity["identity_sha256"],
         sequence_length=common["sequence_length"],
     )
     if baseline_bound != plan["inputs"]["single_gpu_baselines"]:
@@ -2299,6 +2755,102 @@ def _load_validated_grid_result(
     return payload, bound, grid_plan_bound
 
 
+def build_final_train_order_from_grid(
+    *,
+    grid_result: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Publish the selected 52.58B, 40/40/20 order from grid authority.
+
+    The target is quantized down to 66,858 complete 192-row optimizer updates:
+    12,836,736 rows and 52,579,270,656 consumed 4,096-token positions.  No row
+    is repeated and no partial optimizer update is authorized.
+    """
+
+    grid, _, grid_plan_bound = _load_validated_grid_result(grid_result)
+    grid_plan = read_bound_json(
+        grid_plan_bound["artifact"], label="authenticated geometry grid plan"
+    )
+    if grid_plan.get("inputs", {}).get("common", {}).get("sequence_length") != 4_096:
+        raise GeometryQualificationError(
+            "Final selected-run constants require the frozen 4,096-token corpus"
+        )
+    accepted = grid.get("accepted_candidate")
+    matches = [candidate for candidate in CANDIDATES if candidate.as_dict() == accepted]
+    if len(matches) != 1:
+        raise GeometryQualificationError("Grid accepted candidate is not canonical")
+    candidate = matches[0]
+    manifest_path = output_dir / "manifest.json"
+    if manifest_path.exists() or manifest_path.is_symlink():
+        manifest = read_bound_json(
+            artifact(manifest_path, label="existing final train order manifest"),
+            label="existing final train order manifest",
+        )
+    else:
+        if output_dir.exists() and (
+            output_dir.is_symlink()
+            or not output_dir.is_dir()
+            or any(output_dir.iterdir())
+        ):
+            raise GeometryQualificationError(
+                "Final train-order output must be absent or an empty real directory"
+            )
+        manifests = {
+            domain: grid_plan["inputs"]["packed"][domain]["manifest"]["path"]
+            for domain in training_data.DOMAIN_ORDER
+        }
+        manifest = training_data.build_training_order(
+            manifests,
+            output_dir,
+            seed=int(grid_plan["settings"]["seed"]),
+            expected_weights={"python": 0.4, "other_code": 0.4, "english": 0.2},
+            expected_total_input_tokens=FINAL_TRAIN_TARGET_INPUT_TOKENS,
+            input_token_tolerance=UPDATE_ROWS * 4_096 - 1,
+            frozen_global_microbatch_rows=candidate.global_microbatch_rows,
+            frozen_gradient_accumulation_steps=(
+                candidate.gradient_accumulation_steps
+            ),
+        )
+    geometry = training_data.frozen_training_geometry(
+        manifest_path, verify_checksum=True
+    )
+    if (
+        manifest.get("split") != "train"
+        or manifest.get("input_token_budget", {}).get("expected_total")
+        != FINAL_TRAIN_TARGET_INPUT_TOKENS
+        or manifest.get("expected_input_token_weights")
+        != {"python": 0.4, "other_code": 0.4, "english": 0.2}
+        or geometry["global_microbatch_rows"] != candidate.global_microbatch_rows
+        or geometry["gradient_accumulation_steps"]
+        != candidate.gradient_accumulation_steps
+        or geometry["optimizer_update_rows"] != UPDATE_ROWS
+        or geometry["optimizer_updates"]
+        != FINAL_TRAIN_EXPECTED_OPTIMIZER_UPDATES
+        or geometry["consumed_rows"] != FINAL_TRAIN_EXPECTED_ROWS
+        or geometry["consumed_input_tokens"]
+        != FINAL_TRAIN_EXPECTED_CONSUMED_INPUT_TOKENS
+        or geometry.get("dropped_tail_rows") != 0
+    ):
+        raise GeometryQualificationError(
+            "Final train order does not match the authenticated 52.58B selection"
+        )
+    for domain in training_data.DOMAIN_ORDER:
+        record = manifest.get("dataset_manifests", {}).get(domain)
+        if not isinstance(record, Mapping) or not isinstance(record.get("path"), str):
+            raise GeometryQualificationError(
+                f"Final train order lacks packed-manifest binding for {domain}"
+            )
+        current = artifact(
+            manifest_path.parent / record["path"],
+            label=f"final train {domain} packed manifest",
+        )
+        if current != grid_plan["inputs"]["packed"][domain]["manifest"]:
+            raise GeometryQualificationError(
+                f"Final train {domain} packed manifest differs from the grid"
+            )
+    return manifest
+
+
 def build_final_plan(
     *,
     output_root: Path,
@@ -2313,7 +2865,9 @@ def build_final_plan(
     python_executable: Path = Path(sys.executable),
 ) -> dict[str, Any]:
     settings.validate()
-    hardware, hardware_bound = _validate_hardware_contract(hardware_contract)
+    hardware, hardware_bound, hardware_identity = _validate_hardware_contract(
+        hardware_contract
+    )
     grid_payload, grid_bound, grid_plan_bound = _load_validated_grid_result(
         grid_result
     )
@@ -2373,7 +2927,7 @@ def build_final_plan(
     )
     _, baseline_bound = load_single_gpu_baselines(
         single_gpu_baselines,
-        hardware_contract_sha256=hardware_bound["artifact"]["sha256"],
+        hardware_identity_sha256=hardware_identity["identity_sha256"],
         sequence_length=train_payload["sequence_length"],
     )
     runtime = {
@@ -2383,8 +2937,12 @@ def build_final_plan(
     grid_common = grid_plan["inputs"]["common"]
     if (
         dataclasses.asdict(settings) != grid_plan.get("settings")
-        or hardware != grid_plan["inputs"]["hardware"]["expected"]
-        or hardware_bound != grid_plan["inputs"]["hardware"]["bound"]
+        or hardware_identity["identity_sha256"]
+        != grid_plan["inputs"]["hardware"]["geometry_identity"][
+            "identity_sha256"
+        ]
+        or hardware_identity["identity"]
+        != grid_plan["inputs"]["hardware"]["geometry_identity"]["identity"]
         or baseline_bound != grid_plan["inputs"]["single_gpu_baselines"]
         or runtime != grid_plan.get("runtime")
         or any(
@@ -2393,7 +2951,8 @@ def build_final_plan(
         )
     ):
         raise GeometryQualificationError(
-            "Final soak hardware/settings/tokenizer/baseline/runtime differs from the grid"
+            "Final soak stable hardware identity/settings/tokenizer/baseline/runtime "
+            "differs from the grid"
         )
     dataset_manifests = train_payload.get("dataset_manifests")
     if not isinstance(dataset_manifests, Mapping) or set(dataset_manifests) != set(
@@ -2432,7 +2991,12 @@ def build_final_plan(
             },
             "common": common,
             "validation_order": validation,
-            "hardware": {"bound": hardware_bound, "expected": hardware},
+            "hardware": {
+                "bound": hardware_bound,
+                "expected": hardware,
+                "geometry_identity": hardware_identity,
+                "grid_hardware": grid_plan["inputs"]["hardware"],
+            },
             "single_gpu_baselines": baseline_bound,
             "grid_result": grid_bound,
             "grid_plan": grid_plan_bound,
@@ -2547,6 +3111,85 @@ def ensure_grid_order(
     order_descriptor = artifact(order_path, label="diagnostic order payload")
     if order_descriptor["sha256"] != payload["order"]["sha256"]:
         raise GeometryQualificationError("Diagnostic order payload changed")
+    return {
+        "manifest": descriptor,
+        "order": order_descriptor,
+        "geometry": geometry,
+    }
+
+
+def ensure_baseline_order(
+    *,
+    root: Path,
+    plan: Mapping[str, Any],
+    candidate: CandidateSpec,
+) -> dict[str, Any]:
+    """Build/reopen the exact one-rank counterpart of a six-rank candidate."""
+
+    orders_root = root / "orders"
+    _ensure_confined_child_directory(root, orders_root, label="baseline orders")
+    order_dir = orders_root / candidate.candidate_id
+    if order_dir.is_symlink() or (order_dir.exists() and not order_dir.is_dir()):
+        raise GeometryQualificationError(
+            f"Baseline order directory is unsafe: {order_dir}"
+        )
+    manifest_path = order_dir / "manifest.json"
+    settings = SoakSettings(**plan["settings"])
+    sequence_length = int(plan["inputs"]["common"]["sequence_length"])
+    expected_tokens = (
+        settings.diagnostic_optimizer_updates
+        * BASELINE_UPDATE_ROWS
+        * sequence_length
+    )
+    if manifest_path.is_symlink():
+        raise GeometryQualificationError(
+            f"Baseline order manifest must not be a symlink: {manifest_path}"
+        )
+    if manifest_path.exists():
+        geometry = training_data.frozen_training_geometry(
+            manifest_path, verify_checksum=True
+        )
+    else:
+        if order_dir.exists():
+            raise GeometryQualificationError(
+                f"Partial baseline order must not be reused: {order_dir}"
+            )
+        manifests = {
+            domain: plan["inputs"]["packed"][domain]["manifest"]["path"]
+            for domain in training_data.DOMAIN_ORDER
+        }
+        training_data.build_training_order(
+            manifests,
+            order_dir,
+            seed=settings.seed,
+            expected_weights={"python": 0.4, "other_code": 0.4, "english": 0.2},
+            expected_total_input_tokens=expected_tokens,
+            input_token_tolerance=0,
+            frozen_global_microbatch_rows=candidate.local_microbatch_rows,
+            frozen_gradient_accumulation_steps=(
+                candidate.gradient_accumulation_steps
+            ),
+        )
+        geometry = training_data.frozen_training_geometry(
+            manifest_path, verify_checksum=True
+        )
+    if (
+        geometry["global_microbatch_rows"] != candidate.local_microbatch_rows
+        or geometry["gradient_accumulation_steps"]
+        != candidate.gradient_accumulation_steps
+        or geometry["optimizer_update_rows"] != BASELINE_UPDATE_ROWS
+        or geometry["optimizer_updates"] != settings.diagnostic_optimizer_updates
+        or geometry["consumed_input_tokens"] != expected_tokens
+    ):
+        raise GeometryQualificationError(
+            f"Baseline order geometry differs for {candidate.candidate_id}"
+        )
+    descriptor = artifact(manifest_path, label="baseline order manifest")
+    payload = read_bound_json(descriptor, label="baseline order manifest")
+    order_path = manifest_path.parent / payload["order"]["path"]
+    order_descriptor = artifact(order_path, label="baseline order payload")
+    if order_descriptor["sha256"] != payload["order"]["sha256"]:
+        raise GeometryQualificationError("Baseline order payload changed")
     return {
         "manifest": descriptor,
         "order": order_descriptor,
@@ -2688,7 +3331,9 @@ def _memory_payload(memory: GPUMemoryObservation) -> dict[str, Any]:
     }
 
 
-def _memory_from_payload(payload: Mapping[str, Any]) -> GPUMemoryObservation:
+def _memory_from_payload(
+    payload: Mapping[str, Any], *, expected_gpu_count: int = WORLD_SIZE
+) -> GPUMemoryObservation:
     if set(payload) != {
         "gpu_count",
         "total_bytes_per_gpu",
@@ -2709,8 +3354,8 @@ def _memory_from_payload(payload: Mapping[str, Any]) -> GPUMemoryObservation:
         samples=payload["samples"],
     )
     if (
-        memory.gpu_count != WORLD_SIZE
-        or len(memory.total_bytes_per_gpu) != WORLD_SIZE
+        memory.gpu_count != expected_gpu_count
+        or len(memory.total_bytes_per_gpu) != expected_gpu_count
         or not isinstance(memory.minimum_free_bytes_per_gpu, int)
         or memory.minimum_free_bytes_per_gpu < 0
         or not isinstance(memory.samples, int)
@@ -2808,7 +3453,7 @@ def _candidate_failures(
     if external["checkpoint_events"] < 2:
         failures.append("timed_interval_did_not_cross_both_checkpoints")
     if external["wandb_log_events"] < 1:
-        failures.append("no_timed_offline_wandb_event")
+        failures.append("no_timed_wandb_event")
     provenance = measurements.get("measurement_provenance")
     if (
         not isinstance(provenance, Mapping)
@@ -2905,7 +3550,9 @@ def run_candidate(
     order_sha256 = order["manifest"]["sha256"]
     order_payload_sha256 = starting_order["order"]["sha256"]
     run_group = plan["plan_sha256"][:16]
-    run_name = f"geometry-{candidate.candidate_id}-{run_group}"
+    run_name = (
+        f"{settings.wandb_run_name_prefix}-{candidate.candidate_id}-{run_group}"
+    )
     command_one = render_torchrun_command(
         python_executable=python_path,
         order_manifest=order_path,
@@ -3211,7 +3858,7 @@ def run_candidate(
     )
     combined_observation = phase_one_observation.merge(phase_two_observation)
     if combined_observation.wandb_failure is not None:
-        raise GeometryQualificationError("Offline W&B failed during the timed soak")
+        raise GeometryQualificationError("W&B failed during the timed soak")
     phase_one_latency_ns = (
         phase_one_payload["completed_monotonic_ns"]
         - phase_one_observation.stop_request_monotonic_ns
@@ -3286,7 +3933,7 @@ def run_candidate(
             "single_gpu_baseline_input_tokens_per_second": _decimal_string(
                 baseline_rate
             ),
-            "offline_wandb": wandb_inventory,
+            "wandb_artifacts": wandb_inventory,
             "mid_checkpoint": mid_checkpoint,
             "final_checkpoint": final_checkpoint,
             "phase_one_log": phase_one_payload["log"],
@@ -3330,9 +3977,9 @@ def _load_baseline_rates_from_plan(
     )
     rates, bound = load_single_gpu_baselines(
         baseline_path,
-        hardware_contract_sha256=plan["inputs"]["hardware"]["bound"][
-            "artifact"
-        ]["sha256"],
+        hardware_identity_sha256=plan["inputs"]["hardware"][
+            "geometry_identity"
+        ]["identity_sha256"],
         sequence_length=int(plan["inputs"]["common"]["sequence_length"]),
     )
     if bound != plan["inputs"]["single_gpu_baselines"]:
@@ -3377,6 +4024,638 @@ def _candidate_failure_result(
         "secrets_recorded": False,
     }
     return payload, publish_json_new(path, payload)
+
+
+def _baseline_failure_result(
+    *,
+    root: Path,
+    plan: Mapping[str, Any],
+    candidate: CandidateSpec,
+    error: BaseException,
+    environment: Mapping[str, str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "FAILURE.json"
+    if path.exists() or path.is_symlink():
+        payload, bound = verified_json_with_sidecar(
+            path, label="single-GPU baseline failure"
+        )
+        if (
+            payload.get("plan_sha256") != plan["plan_sha256"]
+            or payload.get("candidate") != candidate.as_dict()
+        ):
+            raise GeometryQualificationError(
+                "Existing baseline failure belongs to another identity"
+            )
+        return payload, bound
+    payload = {
+        "format": BASELINE_FAILURE_FORMAT,
+        "format_version": FORMAT_VERSION,
+        "status": "fail",
+        "plan_sha256": plan["plan_sha256"],
+        "candidate": candidate.as_dict(),
+        "failure": {
+            "type": type(error).__name__,
+            "message": redact_text(f"{error}", environment),
+        },
+        "secrets_recorded": False,
+    }
+    return payload, publish_json_new(path, payload)
+
+
+def run_baseline_candidate(
+    *,
+    root: Path,
+    plan: Mapping[str, Any],
+    candidate: CandidateSpec,
+    order: Mapping[str, Any],
+    environment: Mapping[str, str] = os.environ,
+    clock_ns: Callable[[], int] = time.monotonic_ns,
+    phase_runner: Callable[..., PhaseRun] = supervise_phase,
+    checkpoint_inspector: Callable[..., dict[str, Any]] = _checkpoint_summary,
+    binding_verifier: Callable[..., dict[str, Any]] = verify_plan_artifacts,
+    order_verifier: Callable[[Mapping[str, Any]], dict[str, Any]] = verify_order_binding,
+    gpu_sampler: Callable[[], Sequence[tuple[int, int]]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Measure one one-GPU counterpart without any hand-edited evidence.
+
+    The baseline deliberately crosses a durable checkpoint and resumes from it.
+    That gives the denominator the same external end-to-end scope as the
+    six-GPU candidate: validation, W&B, checkpoint I/O, process restart, and
+    resume are all inside the measured monotonic interval.
+    """
+
+    settings = SoakSettings(**plan["settings"])
+    settings.validate()
+    starting_bindings = binding_verifier(plan=plan)
+    starting_order = order_verifier(order)
+    result_path = root / "RESULT.json"
+    if result_path.exists() or result_path.is_symlink():
+        payload, bound = verified_json_with_sidecar(
+            result_path, label="single-GPU baseline result"
+        )
+        if (
+            payload.get("format") != BASELINE_CANDIDATE_RESULT_FORMAT
+            or payload.get("plan_sha256") != plan["plan_sha256"]
+            or payload.get("candidate") != candidate.as_dict()
+            or payload.get("status") != "pass"
+        ):
+            raise GeometryQualificationError(
+                "Existing single-GPU result has another identity"
+            )
+        if binding_verifier(plan=plan) != starting_bindings or order_verifier(
+            order
+        ) != starting_order:
+            raise GeometryQualificationError(
+                "Baseline inputs changed after candidate publication"
+            )
+        return payload, bound
+    if root.exists():
+        if root.is_symlink() or not root.is_dir():
+            raise GeometryQualificationError(f"Baseline root is unsafe: {root}")
+    else:
+        root.mkdir(parents=True)
+    logs = root / "logs"
+    checkpoints = root / "checkpoints"
+    _ensure_confined_child_directory(root, logs, label="baseline logs")
+    _ensure_confined_child_directory(root, checkpoints, label="baseline checkpoints")
+    checkpoint = checkpoints / "last.pt"
+    previous = checkpoints / "last.previous.pt"
+    stop_request = root / "stop-request"
+    journal_path = root / "JOURNAL.json"
+    journal_sidecar = root / "JOURNAL.json.sha256"
+    baseline_gpu = plan["baseline_gpu"]
+    try:
+        visible_devices = plan["inputs"]["hardware"]["expected"]["qualification"][
+            "host"
+        ]["environment"]["cuda_visible_devices"]
+        selected_visible = visible_devices[baseline_gpu["visible_index"]]
+        physical_index = int(baseline_gpu["physical_index"])
+        nvidia_smi_path = Path(
+            plan["inputs"]["hardware"]["expected"]["qualification"]["gpu"][
+                "nvidia_smi_executable"
+            ]["path"]
+        )
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise GeometryQualificationError(
+            "Baseline plan lacks its selected GPU/runtime evidence"
+        ) from exc
+    child_environment = dict(environment)
+    child_environment["CUDA_VISIBLE_DEVICES"] = str(selected_visible)
+    if gpu_sampler is None:
+
+        def selected_gpu_sampler() -> Sequence[tuple[int, int]]:
+            rows = sample_nvidia_smi_memory(nvidia_smi_path)
+            try:
+                return [rows[physical_index]]
+            except IndexError as exc:
+                raise GeometryQualificationError(
+                    "Selected physical GPU disappeared during baseline"
+                ) from exc
+
+        gpu_sampler = selected_gpu_sampler
+    python_path = Path(plan["runtime"]["python"]["invocation_path"])
+    validation_path = Path(
+        plan["inputs"]["validation_order"]["manifest"]["path"]
+    )
+    tokenizer_root = Path(plan["inputs"]["common"]["tokenizer"]["root"])
+    order_path = Path(order["manifest"]["path"])
+    run_group = plan["plan_sha256"][:16]
+    run_name = (
+        f"{settings.wandb_run_name_prefix}-baseline-"
+        f"{candidate.candidate_id}-{run_group}"
+    )
+    command_one = render_torchrun_command(
+        python_executable=python_path,
+        order_manifest=order_path,
+        validation_order_manifest=validation_path,
+        tokenizer_root=tokenizer_root,
+        checkpoint=checkpoint,
+        candidate=candidate,
+        settings=settings,
+        run_name=run_name,
+        run_group=run_group,
+        resume=False,
+        world_size=BASELINE_WORLD_SIZE,
+        global_microbatch_rows=candidate.local_microbatch_rows,
+        wandb_tag="single-gpu-geometry-baseline",
+    )
+    command_two = render_torchrun_command(
+        python_executable=python_path,
+        order_manifest=order_path,
+        validation_order_manifest=validation_path,
+        tokenizer_root=tokenizer_root,
+        checkpoint=checkpoint,
+        candidate=candidate,
+        settings=settings,
+        run_name=run_name,
+        run_group=run_group,
+        resume=True,
+        world_size=BASELINE_WORLD_SIZE,
+        global_microbatch_rows=candidate.local_microbatch_rows,
+        wandb_tag="single-gpu-geometry-baseline",
+    )
+    project_root = _project_root_from_plan(plan)
+    boot = _boot_id()
+    phase_one_payload: dict[str, Any]
+    if (
+        journal_path.exists()
+        or journal_path.is_symlink()
+        or journal_sidecar.exists()
+        or journal_sidecar.is_symlink()
+    ):
+        journal, _ = verified_json_with_sidecar(
+            journal_path, label="single-GPU baseline journal"
+        )
+        if (
+            journal.get("format") != "single-gpu-geometry-baseline-journal"
+            or journal.get("format_version") != FORMAT_VERSION
+            or journal.get("plan_sha256") != plan["plan_sha256"]
+            or journal.get("candidate") != candidate.as_dict()
+            or journal.get("boot_id") != boot
+            or journal.get("stage") != "phase-one-complete"
+        ):
+            raise GeometryQualificationError(
+                "Baseline journal is incomplete, stale-boot, or belongs to another plan"
+            )
+        phase_one_payload = journal.get("phase_one")
+        required_phase_one = {
+            "command",
+            "command_sha256",
+            "return_code",
+            "completed_monotonic_ns",
+            "observation",
+            "gpu_memory",
+            "log",
+            "checkpoint_identity",
+        }
+        if (
+            not isinstance(phase_one_payload, dict)
+            or set(phase_one_payload) != required_phase_one
+            or phase_one_payload.get("command") != command_one
+            or phase_one_payload.get("command_sha256")
+            != command_sha256(command_one)
+            or phase_one_payload.get("return_code")
+            != _EXPECTED_TORCHRUN_GRACEFUL_STOP_RETURN_CODE
+            or not isinstance(phase_one_payload.get("completed_monotonic_ns"), int)
+            or isinstance(phase_one_payload.get("completed_monotonic_ns"), bool)
+        ):
+            raise GeometryQualificationError("Baseline phase-one journal is invalid")
+        journal_observation = _observation_from_payload(
+            phase_one_payload["observation"]
+        )
+        _memory_from_payload(
+            phase_one_payload["gpu_memory"],
+            expected_gpu_count=BASELINE_WORLD_SIZE,
+        )
+        if (
+            journal_observation.start_step != settings.measurement_warmup_steps
+            or journal_observation.start_monotonic_ns is None
+            or journal_observation.start_consumed_input_tokens is None
+            or journal_observation.last_step <= journal_observation.start_step
+            or journal_observation.stop_request_monotonic_ns is None
+            or phase_one_payload["completed_monotonic_ns"]
+            < journal_observation.stop_request_monotonic_ns
+        ):
+            raise GeometryQualificationError(
+                "Baseline phase-one journal lacks a valid timed stop"
+            )
+        _verify_stat_identity(
+            phase_one_payload["checkpoint_identity"],
+            label="baseline phase-one checkpoint",
+        )
+        if (
+            phase_one_payload["checkpoint_identity"]["bytes"]
+            > settings.checkpoint_generation_bytes
+        ):
+            raise GeometryQualificationError(
+                "Baseline phase-one checkpoint exceeds the frozen generation estimate"
+            )
+        verified_log = artifact(
+            phase_one_payload["log"]["path"], label="baseline phase-one log"
+        )
+        if verified_log != phase_one_payload["log"]:
+            raise GeometryQualificationError(
+                "Baseline phase-one log changed after journal commit"
+            )
+        _verify_torchrun_graceful_exit(
+            return_code=phase_one_payload["return_code"],
+            log=phase_one_payload["log"],
+            label="single-GPU baseline phase one",
+        )
+        if clock_ns() < journal_observation.start_monotonic_ns:
+            raise GeometryQualificationError(
+                "Monotonic clock moved backwards across baseline resume"
+            )
+    else:
+        if (
+            checkpoint.exists()
+            or previous.exists()
+            or (logs / "phase-one.log").exists()
+        ):
+            raise GeometryQualificationError(
+                "Unjournaled baseline artifacts are poisoned; use a new output root"
+            )
+        phase_one = phase_runner(
+            command=command_one,
+            environment=child_environment,
+            log_path=logs / "phase-one.log",
+            stop_request_path=stop_request,
+            working_directory=project_root,
+            settings=settings,
+            start_after_step=settings.measurement_warmup_steps,
+            request_stop_after_step=(
+                settings.measurement_warmup_steps + settings.stop_after_soak_steps
+            ),
+            expected_gpu_count=BASELINE_WORLD_SIZE,
+            clock_ns=clock_ns,
+            gpu_sampler=gpu_sampler,
+        )
+        observation = phase_one.observation
+        _verify_torchrun_graceful_exit(
+            return_code=phase_one.return_code,
+            log=phase_one.log,
+            label="single-GPU baseline phase one",
+        )
+        if (
+            observation.start_monotonic_ns is None
+            or observation.start_step != settings.measurement_warmup_steps
+            or observation.start_consumed_input_tokens is None
+            or observation.last_step <= observation.start_step
+            or observation.stop_request_monotonic_ns is None
+        ):
+            raise GeometryQualificationError(
+                "Baseline phase one did not establish an aligned timed stop"
+            )
+        checkpoint_identity = _stat_identity(checkpoint)
+        if checkpoint_identity["bytes"] > settings.checkpoint_generation_bytes:
+            raise GeometryQualificationError(
+                "Baseline phase-one checkpoint exceeds the frozen generation estimate"
+            )
+        phase_one_payload = {
+            "command": command_one,
+            "command_sha256": command_sha256(command_one),
+            "return_code": phase_one.return_code,
+            "completed_monotonic_ns": phase_one.completed_monotonic_ns,
+            "observation": _observation_payload(observation),
+            "gpu_memory": _memory_payload(phase_one.gpu_memory),
+            "log": phase_one.log,
+            "checkpoint_identity": checkpoint_identity,
+        }
+        publish_json_new(
+            journal_path,
+            {
+                "format": "single-gpu-geometry-baseline-journal",
+                "format_version": FORMAT_VERSION,
+                "stage": "phase-one-complete",
+                "plan_sha256": plan["plan_sha256"],
+                "candidate": candidate.as_dict(),
+                "boot_id": boot,
+                "phase_one": phase_one_payload,
+            },
+        )
+    mid_bindings = binding_verifier(plan=plan)
+    mid_order = order_verifier(order)
+    if mid_bindings != starting_bindings or mid_order != starting_order:
+        raise GeometryQualificationError(
+            "Baseline inputs changed before the one-rank resume"
+        )
+    _remove_exact_stop_request(stop_request)
+    if (logs / "phase-two.log").exists() or previous.exists():
+        raise GeometryQualificationError(
+            "Unjournaled baseline phase-two artifacts are poisoned; use a new root"
+        )
+    phase_one_observation = _observation_from_payload(
+        phase_one_payload["observation"]
+    )
+    phase_two = phase_runner(
+        command=command_two,
+        environment=child_environment,
+        log_path=logs / "phase-two.log",
+        stop_request_path=stop_request,
+        working_directory=project_root,
+        settings=settings,
+        start_after_step=None,
+        request_stop_after_step=(
+            phase_one_observation.start_step + settings.minimum_soak_steps
+        ),
+        prior_observation=phase_one_observation,
+        expected_gpu_count=BASELINE_WORLD_SIZE,
+        clock_ns=clock_ns,
+        gpu_sampler=gpu_sampler,
+    )
+    _verify_torchrun_graceful_exit(
+        return_code=phase_two.return_code,
+        log=phase_two.log,
+        label="single-GPU baseline phase two",
+    )
+    _remove_exact_stop_request(stop_request)
+    mid_checkpoint = checkpoint_inspector(
+        previous,
+        expected_order_sha256=order["manifest"]["sha256"],
+        expected_order_payload_sha256=starting_order["order"]["sha256"],
+        expected_world_size=BASELINE_WORLD_SIZE,
+    )
+    final_checkpoint = checkpoint_inspector(
+        checkpoint,
+        expected_order_sha256=order["manifest"]["sha256"],
+        expected_order_payload_sha256=starting_order["order"]["sha256"],
+        expected_world_size=BASELINE_WORLD_SIZE,
+    )
+    phase_two_observation = phase_two.observation
+    if (
+        phase_two_observation.start_monotonic_ns is None
+        or mid_checkpoint["completed_steps"] != phase_one_observation.last_step
+        or mid_checkpoint["consumed_input_tokens"]
+        != phase_one_observation.last_consumed_input_tokens
+        or final_checkpoint["completed_steps"] != phase_two_observation.last_step
+        or final_checkpoint["consumed_input_tokens"]
+        != phase_two_observation.last_consumed_input_tokens
+        or final_checkpoint["completed_steps"] <= mid_checkpoint["completed_steps"]
+        or final_checkpoint["world_size"] != BASELINE_WORLD_SIZE
+        or mid_checkpoint["world_size"] != BASELINE_WORLD_SIZE
+        or final_checkpoint["wandb_run_id_sha256"]
+        != mid_checkpoint["wandb_run_id_sha256"]
+        or any(
+            final_checkpoint[field] != mid_checkpoint[field]
+            for field in (
+                "training_geometry_sha256",
+                "trajectory_sha256",
+                "runtime_signature_sha256",
+                "implementation_signature_sha256",
+                "data_identity_sha256",
+            )
+        )
+    ):
+        raise GeometryQualificationError(
+            "Baseline checkpoint counters/W&B/trajectory do not prove exact resume"
+        )
+    expected_implementation = {
+        "trainer_class": "pretrain.train.Trainer",
+        "model_class": "pretrain.model.CausalLM",
+        "trainer_source_sha256": plan["runtime"]["sources"]["trainer"]["sha256"],
+        "model_source_sha256": plan["runtime"]["sources"]["model"]["sha256"],
+        "data_source_sha256": plan["runtime"]["sources"]["data"]["sha256"],
+    }
+    if (
+        final_checkpoint["training_geometry_sha256"]
+        != canonical_sha256(order["geometry"])
+        or final_checkpoint["implementation_signature_sha256"]
+        != canonical_sha256(expected_implementation)
+    ):
+        raise GeometryQualificationError(
+            "Baseline checkpoint geometry/implementation differs from the plan"
+        )
+    start_step = phase_one_observation.start_step
+    start_tokens = phase_one_observation.start_consumed_input_tokens
+    assert start_step is not None and start_tokens is not None
+    soak_steps = final_checkpoint["completed_steps"] - start_step
+    end_tokens = final_checkpoint["consumed_input_tokens"]
+    token_delta = end_tokens - start_tokens
+    sequence_length = int(plan["inputs"]["common"]["sequence_length"])
+    expected_delta = soak_steps * BASELINE_UPDATE_ROWS * sequence_length
+    elapsed_ns = (
+        phase_two.completed_monotonic_ns
+        - phase_one_observation.start_monotonic_ns
+    )
+    combined_observation = phase_one_observation.merge(phase_two_observation)
+    phase_one_memory = _memory_from_payload(
+        phase_one_payload["gpu_memory"],
+        expected_gpu_count=BASELINE_WORLD_SIZE,
+    )
+    combined_memory = phase_one_memory.merge(phase_two.gpu_memory)
+    expected_memory = plan["inputs"]["hardware"]["expected"]["qualification"][
+        "gpu"
+    ]["devices"][baseline_gpu["visible_index"]].get("nvidia_smi_memory_bytes")
+    if (
+        expected_memory is not None
+        and combined_memory.total_bytes_per_gpu != (expected_memory,)
+    ):
+        raise GeometryQualificationError(
+            "Baseline nvidia-smi memory differs from the selected GPU contract"
+        )
+    if (
+        soak_steps < settings.minimum_soak_steps
+        or token_delta != expected_delta
+        or elapsed_ns < 1
+        or combined_observation.validation_events_after_start < 1
+        or combined_observation.wandb_log_events_after_start < 1
+        or combined_observation.data_wait_samples < soak_steps
+        or max(mid_checkpoint["bytes"], final_checkpoint["bytes"])
+        > settings.checkpoint_generation_bytes
+        or combined_observation.wandb_failure is not None
+    ):
+        raise GeometryQualificationError(
+            "Single-GPU baseline lacks timed validation/resume/checkpoint/W&B evidence"
+        )
+    throughput = Decimal(token_delta) * Decimal(1_000_000_000) / Decimal(elapsed_ns)
+    ending_bindings = binding_verifier(plan=plan)
+    ending_order = order_verifier(order)
+    if ending_bindings != starting_bindings or ending_order != starting_order:
+        raise GeometryQualificationError(
+            "Baseline inputs changed during the timed candidate"
+        )
+    measurement = {
+        "global_microbatch_rows": candidate.local_microbatch_rows,
+        "gradient_accumulation_steps": candidate.gradient_accumulation_steps,
+        "compile_model": candidate.compile_model,
+        "gpu_count": BASELINE_WORLD_SIZE,
+        "scope": THROUGHPUT_SCOPE,
+        "timer": THROUGHPUT_TIMER,
+        "counter": THROUGHPUT_COUNTER,
+        "start_consumed_input_tokens": start_tokens,
+        "end_consumed_input_tokens": end_tokens,
+        "elapsed_wall_time_ns": elapsed_ns,
+        "aggregate_input_tokens_per_second": _decimal_string(throughput),
+    }
+    payload = {
+        "format": BASELINE_CANDIDATE_RESULT_FORMAT,
+        "format_version": FORMAT_VERSION,
+        "status": "pass",
+        "plan_sha256": plan["plan_sha256"],
+        "candidate": candidate.as_dict(),
+        "baseline_gpu": dict(baseline_gpu),
+        "order": dict(order),
+        "measurement": measurement,
+        "evidence": {
+            "soak_steps": soak_steps,
+            "validation_events": combined_observation.validation_events_after_start,
+            "wandb_log_events": combined_observation.wandb_log_events_after_start,
+            "data_wait_samples": combined_observation.data_wait_samples,
+            "resume_verified": True,
+            "gpu_memory": _memory_payload(combined_memory),
+            "wandb_artifacts": _wandb_inventory(checkpoints),
+            "mid_checkpoint": mid_checkpoint,
+            "final_checkpoint": final_checkpoint,
+            "phase_one_log": phase_one_payload["log"],
+            "phase_two_log": phase_two.log,
+            "phase_one_command_sha256": phase_one_payload["command_sha256"],
+            "phase_two_command_sha256": command_sha256(command_two),
+            "plan_artifact_verification": ending_bindings,
+            "order_verification": ending_order,
+        },
+        "commands": {"phase_one": command_one, "phase_two": command_two},
+        "secrets_recorded": False,
+    }
+    return payload, publish_json_new(result_path, payload)
+
+
+def run_single_gpu_baselines(
+    *,
+    root: Path,
+    plan: Mapping[str, Any],
+    environment: Mapping[str, str] = os.environ,
+    candidate_runner: Callable[..., tuple[dict[str, Any], dict[str, Any]]] = (
+        run_baseline_candidate
+    ),
+    runtime_verifier: Callable[..., dict[str, Any]] = verify_live_runtime,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run all six automatic baselines and publish the aggregate receipt."""
+
+    if plan.get("mode") != "single-gpu-baselines":
+        raise GeometryQualificationError(
+            "run_single_gpu_baselines requires a baseline plan"
+        )
+    verify_baseline_plan_authority(plan)
+    runtime_verifier(plan=plan, environment=environment)
+    receipt_path = root / "single-gpu-baselines.json"
+    if receipt_path.exists() or receipt_path.is_symlink():
+        payload, bound = verified_json_with_sidecar(
+            receipt_path, label="single-GPU baseline receipt"
+        )
+        load_single_gpu_baselines(
+            receipt_path,
+            hardware_identity_sha256=plan["inputs"]["hardware"][
+                "geometry_identity"
+            ]["identity_sha256"],
+            sequence_length=int(plan["inputs"]["common"]["sequence_length"]),
+        )
+        return payload, bound
+    orders: dict[str, dict[str, Any]] = {}
+    order_digest: str | None = None
+    for candidate in CANDIDATES:
+        order = ensure_baseline_order(root=root, plan=plan, candidate=candidate)
+        digest = order["order"]["sha256"]
+        if order_digest is None:
+            order_digest = digest
+        elif digest != order_digest:
+            raise GeometryQualificationError(
+                "Baseline candidates do not consume the exact same shuffled row order"
+            )
+        orders[candidate.candidate_id] = order
+    candidates_root = root / "candidates"
+    _ensure_confined_child_directory(root, candidates_root, label="baseline candidates")
+    entries: dict[str, Any] = {}
+    results: dict[str, Any] = {}
+    failures: list[str] = []
+    for candidate in CANDIDATES:
+        candidate_root = candidates_root / candidate.candidate_id
+        try:
+            runtime_verifier(plan=plan, environment=environment)
+            payload, bound = candidate_runner(
+                root=candidate_root,
+                plan=plan,
+                candidate=candidate,
+                order=orders[candidate.candidate_id],
+                environment=environment,
+            )
+        except Exception as exc:
+            payload, bound = _baseline_failure_result(
+                root=candidate_root,
+                plan=plan,
+                candidate=candidate,
+                error=exc,
+                environment=environment,
+            )
+        results[candidate.candidate_id] = {
+            "status": payload["status"],
+            "result": bound,
+        }
+        if payload["status"] == "pass":
+            entries[candidate.candidate_id] = payload["measurement"]
+        else:
+            failures.append(candidate.candidate_id)
+    if failures:
+        summary = {
+            "format": BASELINE_FAILURE_FORMAT,
+            "format_version": FORMAT_VERSION,
+            "status": "fail",
+            "plan_sha256": plan["plan_sha256"],
+            "failed_candidates": failures,
+            "results": results,
+            "secrets_recorded": False,
+        }
+        bound = publish_json_new(root / "BASELINE-FAILURE.json", summary)
+        return summary, bound
+    producer_plan, producer_plan_bound = verified_json_with_sidecar(
+        root / "PLAN.json", label="single-GPU baseline producer plan"
+    )
+    if producer_plan != dict(plan):
+        raise GeometryQualificationError(
+            "Published baseline producer plan differs from the running plan"
+        )
+    receipt = {
+        "format": BASELINE_FORMAT,
+        "format_version": FORMAT_VERSION,
+        "status": "pass",
+        "hardware_identity_sha256": plan["inputs"]["hardware"][
+            "geometry_identity"
+        ]["identity_sha256"],
+        "producer_plan": producer_plan_bound,
+        "exact_shared_order_payload_sha256": order_digest,
+        "results": {
+            candidate_id: record["result"]
+            for candidate_id, record in results.items()
+        },
+        "candidates": entries,
+    }
+    bound = publish_json_new(receipt_path, receipt)
+    load_single_gpu_baselines(
+        receipt_path,
+        hardware_identity_sha256=receipt["hardware_identity_sha256"],
+        sequence_length=int(plan["inputs"]["common"]["sequence_length"]),
+    )
+    return receipt, bound
 
 
 def run_grid(

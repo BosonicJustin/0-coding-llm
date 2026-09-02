@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Fail-closed qualification of the final six-GPU RunPod training pod.
+"""Fail-closed qualification of a six-GPU RunPod training pod.
 
 This command is intentionally read-only apart from its explicit immutable
 receipt and a bounded NCCL smoke-test scratch directory.  It never installs a
 package, downloads data, launches training, or talks to a cloud API.
 
-The published JSON is also the ``pretraining-six-gpu-hardware-runtime`` v1
-contract consumed by :mod:`pretrain.run_authority`.  Extra fields retain the
-evidence used to accept that contract.  Publication is write-once and includes
-an exact ``.sha256`` sidecar.
+``bootstrap`` publishes explicitly provisional evidence before final training
+orders exist; geometry qualification may consume it, but run authority cannot.
+``verify`` publishes the final ``pretraining-six-gpu-hardware-runtime`` v1
+contract consumed by :mod:`pretrain.run_authority`.  Both publications are
+write-once and include an exact ``.sha256`` sidecar.
 """
 
 from __future__ import annotations
@@ -46,8 +47,10 @@ from pretrain.run_authority import (  # noqa: E402
     HARDWARE_FORMAT,
     POD_QUALIFICATION_FORMAT,
     POD_QUALIFICATION_VERSION,
+    PROVISIONAL_HARDWARE_FORMAT,
     RunAuthorityError,
     inspect_hardware_contract,
+    inspect_provisional_hardware_contract,
     inspect_clean_git,
     inspect_package_lock,
 )
@@ -738,6 +741,7 @@ def build_hardware_receipt(
     observation: Mapping[str, Any],
     *,
     nvlink_policy: NvlinkPolicy,
+    provisional: bool = False,
     created_utc: str | None = None,
 ) -> dict[str, Any]:
     gpu_contract = validate_gpu_observation(observation["gpu"], nvlink_policy=nvlink_policy)
@@ -751,9 +755,9 @@ def build_hardware_receipt(
     if timestamp.tzinfo is None:
         raise PodQualificationError("created_utc must be timezone-aware")
     return {
-        "format": HARDWARE_FORMAT,
+        "format": PROVISIONAL_HARDWARE_FORMAT if provisional else HARDWARE_FORMAT,
         "format_version": FORMAT_VERSION,
-        "status": "accepted",
+        "status": "provisional" if provisional else "accepted",
         "topology": "single-node",
         "world_size": WORLD_SIZE,
         "gpu_count": WORLD_SIZE,
@@ -772,7 +776,9 @@ def build_hardware_receipt(
     }
 
 
-def publish_receipt(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+def publish_receipt(
+    path: Path, payload: Mapping[str, Any], *, provisional: bool = False
+) -> dict[str, Any]:
     parent = path.parent.resolve(strict=True)
     destination = parent / path.name
     sidecar = parent / f"{path.name}.sha256"
@@ -808,9 +814,14 @@ def publish_receipt(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
     finally:
         for temporary in temporary_paths:
             temporary.unlink(missing_ok=True)
-    # Prove direct compatibility with the authority builder after durable publication.
+    # Exercise the exact reader after durable publication.  The provisional
+    # reader is intentionally distinct from the launch-authorizing reader.
     try:
-        validated = inspect_hardware_contract(destination)
+        validated = (
+            inspect_provisional_hardware_contract(destination)
+            if provisional
+            else inspect_hardware_contract(destination)
+        )
     except RunAuthorityError as exc:
         raise PodQualificationError(
             f"Published receipt is not run-authority compatible: {exc}"
@@ -857,23 +868,15 @@ def _storage_record(
     }
 
 
-def _inspect_storage_and_data(args: argparse.Namespace) -> dict[str, Any]:
+def _inspect_storage_roots(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], Path, Path]:
     network_root = _require_directory(args.network_root, label="network root")
     local_work_root = _require_directory(args.local_work_root, label="local work root")
     local_data_root = _require_directory(args.local_data_root, label="local data root")
     wandb_dir = _require_directory(args.wandb_dir, label="W&B directory")
     _require_inside(wandb_dir, network_root, label="W&B directory")
     receipt_parent = _require_inside(args.receipt.parent, network_root, label="receipt parent")
-    tokenizer_root = _require_inside(args.tokenizer, local_data_root, label="tokenizer")
-    train_path = _require_inside(
-        args.train_order_manifest, local_data_root, label="training order manifest"
-    )
-    validation_path = _require_inside(
-        args.validation_order_manifest,
-        local_data_root,
-        label="validation order manifest",
-    )
-
     network_mount = launch.inspect_mount(network_root)
     work_mount = launch.inspect_mount(local_work_root)
     data_mount = launch.inspect_mount(local_data_root)
@@ -898,6 +901,20 @@ def _inspect_storage_and_data(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "receipt_parent": str(receipt_parent),
     }
+    return storage, local_data_root, network_root
+
+
+def _inspect_storage_and_data(args: argparse.Namespace) -> dict[str, Any]:
+    storage, local_data_root, _ = _inspect_storage_roots(args)
+    tokenizer_root = _require_inside(args.tokenizer, local_data_root, label="tokenizer")
+    train_path = _require_inside(
+        args.train_order_manifest, local_data_root, label="training order manifest"
+    )
+    validation_path = _require_inside(
+        args.validation_order_manifest,
+        local_data_root,
+        label="validation order manifest",
+    )
 
     try:
         train = launch.inspect_order(
@@ -941,6 +958,102 @@ def _inspect_storage_and_data(args: argparse.Namespace) -> dict[str, Any]:
         "payload_checksum_scope": (
             "metadata and recorded sizes only; immutable full-data certification "
             "receipts remain mandatory for launch"
+        ),
+    }
+    return {"storage": storage, "data": data}
+
+
+def _inspect_provisional_storage_and_data(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Validate packed inputs without pretending final orders already exist."""
+
+    storage, local_data_root, _ = _inspect_storage_roots(args)
+    tokenizer_root = _require_inside(args.tokenizer, local_data_root, label="tokenizer")
+    manifest_arguments = {
+        "python": args.python_packed_manifest,
+        "other_code": args.other_code_packed_manifest,
+        "english": args.english_packed_manifest,
+    }
+    records: dict[str, Any] = {}
+    common: dict[str, Any] | None = None
+    for domain, raw_path in manifest_arguments.items():
+        path = _require_inside(
+            raw_path, local_data_root, label=f"{domain} packed manifest"
+        )
+        if path.is_symlink() or not path.is_file():
+            raise PodQualificationError(
+                f"{domain} packed manifest must be a regular file: {path}"
+            )
+        descriptor = _artifact(path, label=f"{domain} packed manifest")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8", errors="strict"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise PodQualificationError(
+                f"Cannot read {domain} packed manifest: {exc}"
+            ) from exc
+        if not isinstance(payload, dict) or (
+            payload.get("format") != "packed-document-causal"
+            or payload.get("domain") != domain
+            or payload.get("split") != "train"
+            or not _plain_int(payload.get("rows"), minimum=1)
+        ):
+            raise PodQualificationError(
+                f"Packed manifest does not identify non-empty train/{domain}"
+            )
+        if common is None:
+            common = payload
+        else:
+            for field in (
+                "split",
+                "sequence_length",
+                "vocab_size",
+                "eos_token_id",
+                "tokenizer_manifest_sha256",
+            ):
+                if payload.get(field) != common.get(field):
+                    raise PodQualificationError(
+                        f"Packed manifests disagree on {field}"
+                    )
+        records[domain] = {
+            "manifest": descriptor,
+            "rows": payload["rows"],
+        }
+    assert common is not None
+    try:
+        tokenizer = verify_tokenizer_identity(
+            tokenizer_root,
+            expected_manifest_sha256=common.get("tokenizer_manifest_sha256"),
+            expected_vocab_size=common.get("vocab_size"),
+        )
+    except (TokenizerIdentityError, RuntimeError, OSError, ValueError) as exc:
+        raise PodQualificationError(
+            f"Tokenizer/packed-manifest validation failed: {exc}"
+        ) from exc
+    data = {
+        "status": "pass",
+        "qualification_scope": (
+            "provisional-packed-inputs-without-final-train-or-validation-orders"
+        ),
+        "local_data_root": str(local_data_root),
+        "packed_manifests": records,
+        "common": {
+            "split": common["split"],
+            "sequence_length": common["sequence_length"],
+            "vocab_size": common["vocab_size"],
+            "eos_token_id": common["eos_token_id"],
+            "tokenizer_manifest_sha256": common["tokenizer_manifest_sha256"],
+        },
+        "tokenizer": {
+            "path": str(tokenizer_root),
+            "manifest_path": str(tokenizer.manifest_path.resolve(strict=True)),
+            "manifest_sha256": tokenizer.manifest_sha256,
+            "vocabulary_sha256": tokenizer.vocabulary_sha256,
+            "vocab_size": tokenizer.vocab_size,
+        },
+        "payload_checksum_scope": (
+            "manifest bytes and tokenizer identity only; final order inspection and "
+            "full-data certification remain mandatory for launch"
         ),
     }
     return {"storage": storage, "data": data}
@@ -1167,7 +1280,7 @@ def _collect_gpu_observation(
 def collect_observation(args: argparse.Namespace) -> dict[str, Any]:
     if not sys.platform.startswith("linux"):
         raise PodQualificationError("Final RunPod qualification requires Linux")
-    if not _plain_int(args.eval_batches, minimum=1):
+    if args.command == "verify" and not _plain_int(args.eval_batches, minimum=1):
         raise PodQualificationError("eval_batches must be positive")
     if not _plain_int(args.minimum_nofile, minimum=1):
         raise PodQualificationError("minimum_nofile must be positive")
@@ -1179,7 +1292,11 @@ def collect_observation(args: argparse.Namespace) -> dict[str, Any]:
         wandb_mode=args.wandb_mode,
         omp_threads=args.omp_threads,
     )
-    storage_data = _inspect_storage_and_data(args)
+    storage_data = (
+        _inspect_provisional_storage_and_data(args)
+        if args.command == "bootstrap"
+        else _inspect_storage_and_data(args)
+    )
     network_root = Path(storage_data["storage"]["network"]["path"])
     wandb_dir = args.wandb_dir.resolve(strict=True)
     try:
@@ -1321,33 +1438,57 @@ def _nccl_worker(output_dir: Path) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+
+    def add_common(child: argparse.ArgumentParser) -> None:
+        child.add_argument("--network-root", type=Path, required=True)
+        child.add_argument("--local-work-root", type=Path, required=True)
+        child.add_argument("--local-data-root", type=Path, required=True)
+        child.add_argument("--tokenizer", type=Path, required=True)
+        child.add_argument("--package-lock", type=Path, required=True)
+        child.add_argument("--wandb-dir", type=Path, required=True)
+        child.add_argument("--receipt", type=Path, required=True)
+        child.add_argument(
+            "--wandb-mode", choices=("disabled", "offline", "online"), required=True
+        )
+        child.add_argument(
+            "--nvlink-policy",
+            choices=("observe", "require-any", "require-all"),
+            required=True,
+        )
+        child.add_argument("--omp-threads", type=int, required=True)
+        child.add_argument(
+            "--minimum-network-free-bytes", type=parse_bytes, required=True
+        )
+        child.add_argument(
+            "--minimum-local-free-bytes", type=parse_bytes, required=True
+        )
+        child.add_argument(
+            "--minimum-shm-bytes", type=parse_bytes, default=16 * 1024**3
+        )
+        child.add_argument("--minimum-nofile", type=int, default=65_536)
+        child.add_argument(
+            "--minimum-stack-bytes", type=parse_bytes, default=8 * 1024**2
+        )
+
+    bootstrap = commands.add_parser(
+        "bootstrap",
+        help=(
+            "qualify the real pod and packed inputs before final orders exist; "
+            "the provisional receipt cannot authorize training"
+        ),
+    )
+    add_common(bootstrap)
+    bootstrap.add_argument("--python-packed-manifest", type=Path, required=True)
+    bootstrap.add_argument("--other-code-packed-manifest", type=Path, required=True)
+    bootstrap.add_argument("--english-packed-manifest", type=Path, required=True)
+
     verify = commands.add_parser(
         "verify", help="run final read-only pod checks and publish a hardware receipt"
     )
-    verify.add_argument("--network-root", type=Path, required=True)
-    verify.add_argument("--local-work-root", type=Path, required=True)
-    verify.add_argument("--local-data-root", type=Path, required=True)
-    verify.add_argument("--tokenizer", type=Path, required=True)
+    add_common(verify)
     verify.add_argument("--train-order-manifest", type=Path, required=True)
     verify.add_argument("--validation-order-manifest", type=Path, required=True)
-    verify.add_argument("--package-lock", type=Path, required=True)
-    verify.add_argument("--wandb-dir", type=Path, required=True)
-    verify.add_argument("--receipt", type=Path, required=True)
-    verify.add_argument(
-        "--wandb-mode", choices=("disabled", "offline", "online"), required=True
-    )
-    verify.add_argument(
-        "--nvlink-policy",
-        choices=("observe", "require-any", "require-all"),
-        required=True,
-    )
-    verify.add_argument("--omp-threads", type=int, required=True)
     verify.add_argument("--eval-batches", type=int, required=True)
-    verify.add_argument("--minimum-network-free-bytes", type=parse_bytes, required=True)
-    verify.add_argument("--minimum-local-free-bytes", type=parse_bytes, required=True)
-    verify.add_argument("--minimum-shm-bytes", type=parse_bytes, default=16 * 1024**3)
-    verify.add_argument("--minimum-nofile", type=int, default=65_536)
-    verify.add_argument("--minimum-stack-bytes", type=parse_bytes, default=8 * 1024**2)
 
     worker = commands.add_parser("_nccl-worker", help=argparse.SUPPRESS)
     worker.add_argument("--output-dir", type=Path, required=True)
@@ -1360,11 +1501,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "_nccl-worker":
         return _nccl_worker(args.output_dir)
     try:
+        provisional = args.command == "bootstrap"
         observation = collect_observation(args)
         receipt = build_hardware_receipt(
-            observation, nvlink_policy=args.nvlink_policy
+            observation,
+            nvlink_policy=args.nvlink_policy,
+            provisional=provisional,
         )
-        result = publish_receipt(args.receipt, receipt)
+        result = publish_receipt(args.receipt, receipt, provisional=provisional)
     except (PodQualificationError, OSError, RuntimeError, ValueError) as exc:
         print(f"pod-qualification: ERROR: {exc}", file=sys.stderr, flush=True)
         return 2
