@@ -12,7 +12,7 @@ datasets:
 ---
 
 <!-- RELEASE_BLOCKER: Add a user-approved model-weight `license:` field to the YAML metadata before a public release. -->
-<!-- RELEASE_BLOCKER: Replace every {{PLACEHOLDER}} with evidence from the accepted final checkpoint and evaluation artifacts. -->
+<!-- RELEASE_BLOCKER: Assign a model-weight license and add final evaluation results before making this repository public. -->
 
 # Transcendent Logic Model
 
@@ -26,12 +26,12 @@ model.
 
 | Field | Value |
 |---|---|
-| Authors | {{MODEL_AUTHORS}} |
-| Final optimizer step | {{FINAL_OPTIMIZER_STEP}} |
-| Consumed input positions | {{FINAL_INPUT_POSITIONS}} |
-| Final validation loss | {{FINAL_VALIDATION_LOSS}} |
-| Weight license | {{MODEL_WEIGHT_LICENSE}} |
-| Release revision | {{HUGGING_FACE_COMMIT}} |
+| Author | [BosonicJustin](https://huggingface.co/BosonicJustin) |
+| Final optimizer step | 66,858 |
+| Consumed input positions | 52,579,270,656 |
+| Final validation loss | 1.0700281209201152 |
+| Weight license | Not yet assigned — private research draft |
+| Initial weight-upload revision | `b8f50a9bc5b639b4ca40da7cd9208024dbee4df2` |
 
 The values above must be copied from the accepted final checkpoint, structured
 training log, evaluation result, or Hugging Face commit receipt. They must not
@@ -168,9 +168,9 @@ semantic paraphrase.
 
 | Benchmark | Protocol | Result |
 |---|---|---:|
-| Original Google MBPP, 500-task test set | Three-shot prompt using task IDs 2, 3, and 4; greedy one completion per task; pass@1 | {{MBPP_PASS_AT_1}} |
+| Original Google MBPP, 500-task test set | Three-shot prompt using task IDs 2, 3, and 4; greedy one completion per task; pass@1 | Not evaluated yet |
 
-Evaluation artifact or immutable report: {{MBPP_RESULT_ARTIFACT}}
+Evaluation artifact or immutable report: pending.
 
 Generated code must be executed only in an isolated sandbox with network access
 disabled and strict time, memory, and process limits.
