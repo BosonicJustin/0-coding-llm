@@ -1,0 +1,11 @@
+# Install the exact platform-appropriate PyTorch wheel separately. The release
+# tooling loads a native checkpoint and must not replace the qualified H100 CUDA
+# wheel with a wheel selected implicitly by pip.
+#
+# These versions are pinned for reproducible native-to-Hugging-Face export,
+# safetensors sharding, Hub upload, and clean-snapshot verification.
+huggingface_hub[hf_xet]==1.29.0
+hf-xet==1.6.0
+safetensors==0.7.0
+tokenizers==0.23.1
+transformers==5.16.1
