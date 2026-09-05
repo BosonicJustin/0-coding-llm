@@ -194,7 +194,7 @@ def _verify_remote_against_staging(
     with tempfile.TemporaryDirectory(prefix="hf-rename-verify-") as temporary:
         download_root = Path(temporary)
         for filename, record in sorted(records.items()):
-            if filename == MODEL_CARD_NAME:
+            if filename in _METADATA_COMMIT_PATHS:
                 continue
             expected_size = record.get("bytes")
             expected_sha = record.get("sha256")

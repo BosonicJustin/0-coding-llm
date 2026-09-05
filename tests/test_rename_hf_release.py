@@ -277,6 +277,30 @@ class RenameHuggingFaceReleaseTest(unittest.TestCase):
         self.assertEqual(len(fake.commits), 1)
         self.assertEqual(result["visibility"], "public")
 
+    def test_all_three_old_remote_metadata_files_may_differ(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            release = _make_release(Path(temporary) / "release")
+            fake = FakeHub(release)
+            for filename in (
+                "README.md",
+                "HF_RELEASE_MANIFEST.json",
+                "HF_RELEASE_MANIFEST.sha256",
+            ):
+                self.assertNotEqual(fake.files[filename], (release / filename).read_bytes())
+
+            result = self._run(fake, _args(release))
+
+        self.assertEqual(result["new_commit_sha"], NEW_SHA)
+        self.assertEqual(len(fake.commits), 1)
+        self.assertEqual(
+            fake.commits[0]["paths"],
+            [
+                "README.md",
+                "HF_RELEASE_MANIFEST.json",
+                "HF_RELEASE_MANIFEST.sha256",
+            ],
+        )
+
     def test_confirmation_parent_visibility_and_destination_guards_fail_before_move(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             release = _make_release(Path(temporary) / "release")
