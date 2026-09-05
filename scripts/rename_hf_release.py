@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Rename a private Hugging Face model and commit only authenticated card metadata.
+"""Rename a Hugging Face model while preserving explicitly confirmed visibility.
 
 The Hub rename is server-side.  This command never places a safetensors file in
 an upload operation.  It verifies the existing immutable revision against a
 freshly validated release directory, performs the rename, and then commits only
 ``README.md``, ``HF_RELEASE_MANIFEST.json``, and
-``HF_RELEASE_MANIFEST.sha256``.
+``HF_RELEASE_MANIFEST.sha256``.  It does not change repository visibility and
+fails unless the source, renamed repository, and final commit all have the
+explicitly requested visibility.
 """
 
 from __future__ import annotations
@@ -71,6 +73,8 @@ def _validate_repo_ids(args: argparse.Namespace) -> None:
         raise ReleaseError("--confirm-from-repo-id must exactly repeat --from-repo-id")
     if args.confirm_to_repo_id != args.to_repo_id:
         raise ReleaseError("--confirm-to-repo-id must exactly repeat --to-repo-id")
+    if args.confirm_visibility != args.visibility:
+        raise ReleaseError("--confirm-visibility must exactly repeat --visibility")
     if args.from_repo_id == args.to_repo_id:
         raise ReleaseError("source and destination repository IDs must differ")
     for label, repo_id in (
@@ -242,14 +246,31 @@ def _verify_remote_against_staging(
     return tuple(weights)
 
 
-def _private_info(api: Any, *, repo_id: str, revision: str | None = None) -> Any:
+def _visibility_info(
+    api: Any,
+    *,
+    repo_id: str,
+    visibility: str,
+    revision: str | None = None,
+) -> Any:
     info = api.model_info(
         repo_id=repo_id,
         revision=revision,
         files_metadata=True,
     )
-    if _value(info, "private") is not True:
-        raise ReleaseError(f"repository must remain private: {repo_id}")
+    private = _value(info, "private")
+    expected_private = visibility == "private"
+    if type(private) is not bool or private is not expected_private:
+        if private is True:
+            actual = "private"
+        elif private is False:
+            actual = "public"
+        else:
+            actual = "unknown"
+        raise ReleaseError(
+            f"repository visibility differs for {repo_id}: "
+            f"expected {visibility}, found {actual}"
+        )
     return info
 
 
@@ -271,7 +292,11 @@ def rename_release(args: argparse.Namespace) -> Mapping[str, Any]:
         raise ReleaseError("Install requirements-release.txt before renaming") from exc
 
     api = HfApi(token=token)
-    before = _private_info(api, repo_id=args.from_repo_id)
+    before = _visibility_info(
+        api,
+        repo_id=args.from_repo_id,
+        visibility=args.visibility,
+    )
     before_sha = _value(before, "sha")
     if before_sha != args.expected_parent_sha:
         raise ReleaseError(
@@ -300,7 +325,11 @@ def rename_release(args: argparse.Namespace) -> Mapping[str, Any]:
         repo_type=MODEL_REPO_TYPE,
         token=token,
     )
-    moved = _private_info(api, repo_id=args.to_repo_id)
+    moved = _visibility_info(
+        api,
+        repo_id=args.to_repo_id,
+        visibility=args.visibility,
+    )
     moved_sha = _value(moved, "sha")
     if moved_sha != before_sha:
         raise ReleaseError(
@@ -342,7 +371,11 @@ def rename_release(args: argparse.Namespace) -> Mapping[str, Any]:
     if not isinstance(new_sha, str) or _COMMIT_SHA.fullmatch(new_sha) is None:
         raise ReleaseError("Hub metadata commit returned no immutable commit SHA")
 
-    after = _private_info(api, repo_id=args.to_repo_id)
+    after = _visibility_info(
+        api,
+        repo_id=args.to_repo_id,
+        visibility=args.visibility,
+    )
     if _value(after, "sha") != new_sha:
         raise ReleaseError("destination HEAD does not equal the metadata commit SHA")
     after_weights = _verify_remote_against_staging(
@@ -364,7 +397,7 @@ def rename_release(args: argparse.Namespace) -> Mapping[str, Any]:
         "old_commit_sha": before_sha,
         "new_commit_sha": new_sha,
         "commit_url": _value(commit, "commit_url"),
-        "visibility": "private",
+        "visibility": args.visibility,
         "metadata_files_committed": list(operation_paths),
         "weight_files": [
             {"path": path, "bytes": size, "sha256": sha}
@@ -381,6 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--to-repo-id", required=True)
     parser.add_argument("--confirm-from-repo-id", required=True)
     parser.add_argument("--confirm-to-repo-id", required=True)
+    parser.add_argument("--visibility", choices=("private", "public"), required=True)
+    parser.add_argument("--confirm-visibility", required=True)
     parser.add_argument("--expected-parent-sha", required=True)
     parser.add_argument("--expected-model-name", required=True)
     parser.add_argument("--token-env", default="HF_TOKEN")

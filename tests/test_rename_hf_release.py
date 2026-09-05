@@ -117,6 +117,8 @@ class FakeHub:
         self.files[RELEASE_MANIFEST_SIDECAR_NAME] = b"old manifest sidecar\n"
         self.weight_sha_overrides: dict[str, str] = {}
         self.mutate_weights_during_move = False
+        self.mutate_visibility_during_move = False
+        self.mutate_visibility_during_commit = False
 
     def model_info(
         self,
@@ -168,6 +170,8 @@ class FakeHub:
             raise AssertionError("unexpected move")
         self.moves.append((str(kwargs["from_id"]), str(kwargs["to_id"])))
         self.repo_id = str(kwargs["to_id"])
+        if self.mutate_visibility_during_move:
+            self.private = not self.private
         if self.mutate_weights_during_move:
             filename = "model-00001-of-00002.safetensors"
             self.weight_sha_overrides[filename] = "f" * 64
@@ -187,6 +191,8 @@ class FakeHub:
                 source if isinstance(source, bytes) else Path(source).read_bytes()
             )
         self.sha = NEW_SHA
+        if self.mutate_visibility_during_commit:
+            self.private = not self.private
         return types.SimpleNamespace(
             oid=NEW_SHA,
             commit_url=f"https://huggingface.co/{self.repo_id}/commit/{NEW_SHA}",
@@ -207,6 +213,8 @@ def _args(release: Path, **overrides: object) -> argparse.Namespace:
         "to_repo_id": NEW_REPO,
         "confirm_from_repo_id": OLD_REPO,
         "confirm_to_repo_id": NEW_REPO,
+        "visibility": "private",
+        "confirm_visibility": "private",
         "expected_parent_sha": OLD_SHA,
         "expected_model_name": MODEL_NAME,
         "token_env": "TEST_HF_TOKEN",
@@ -247,14 +255,34 @@ class RenameHuggingFaceReleaseTest(unittest.TestCase):
         self.assertEqual(fake.commits[0]["parent_commit"], OLD_SHA)
         self.assertEqual(result["old_commit_sha"], OLD_SHA)
         self.assertEqual(result["new_commit_sha"], NEW_SHA)
+        self.assertEqual(result["visibility"], "private")
         self.assertEqual(result["weight_files_uploaded"], False)
         self.assertEqual(len(result["weight_files"]), 2)
 
-    def test_confirmation_parent_privacy_and_destination_guards_fail_before_move(self) -> None:
+    def test_public_visibility_is_preserved_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            release = _make_release(Path(temporary) / "release")
+            fake = FakeHub(release)
+            fake.private = False
+            result = self._run(
+                fake,
+                _args(
+                    release,
+                    visibility="public",
+                    confirm_visibility="public",
+                ),
+            )
+
+        self.assertEqual(fake.moves, [(OLD_REPO, NEW_REPO)])
+        self.assertEqual(len(fake.commits), 1)
+        self.assertEqual(result["visibility"], "public")
+
+    def test_confirmation_parent_visibility_and_destination_guards_fail_before_move(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             release = _make_release(Path(temporary) / "release")
             cases = (
                 ({"confirm_to_repo_id": "BosonicJustin/wrong"}, "confirm-to-repo-id"),
+                ({"confirm_visibility": "public"}, "confirm-visibility"),
                 ({"expected_parent_sha": "3" * 40}, "source HEAD changed"),
                 ({"expected_parent_sha": "not-a-sha"}, "40-character SHA"),
             )
@@ -266,7 +294,7 @@ class RenameHuggingFaceReleaseTest(unittest.TestCase):
 
             fake = FakeHub(release)
             fake.private = False
-            with self.assertRaisesRegex(ReleaseError, "must remain private"):
+            with self.assertRaisesRegex(ReleaseError, "visibility differs"):
                 self._run(fake, _args(release))
             self.assertEqual(fake.moves, [])
 
@@ -300,6 +328,38 @@ class RenameHuggingFaceReleaseTest(unittest.TestCase):
                 self._run(fake, _args(release))
             self.assertEqual(fake.moves, [(OLD_REPO, NEW_REPO)])
             self.assertEqual(fake.commits, [])
+
+    def test_visibility_is_rechecked_after_move_and_after_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            release = _make_release(Path(temporary) / "release")
+
+            fake = FakeHub(release)
+            fake.private = False
+            fake.mutate_visibility_during_move = True
+            with self.assertRaisesRegex(ReleaseError, "visibility differs"):
+                self._run(
+                    fake,
+                    _args(
+                        release,
+                        visibility="public",
+                        confirm_visibility="public",
+                    ),
+                )
+            self.assertEqual(fake.commits, [])
+
+            fake = FakeHub(release)
+            fake.private = False
+            fake.mutate_visibility_during_commit = True
+            with self.assertRaisesRegex(ReleaseError, "visibility differs"):
+                self._run(
+                    fake,
+                    _args(
+                        release,
+                        visibility="public",
+                        confirm_visibility="public",
+                    ),
+                )
+            self.assertEqual(len(fake.commits), 1)
 
     def test_model_card_must_name_destination_and_exact_model_title(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
