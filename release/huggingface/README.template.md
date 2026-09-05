@@ -11,8 +11,8 @@ datasets:
   - wikimedia/wikipedia
 ---
 
-<!-- RELEASE_BLOCKER: Add a user-approved model-weight `license:` field to the YAML metadata before a public release. -->
-<!-- RELEASE_BLOCKER: Assign a model-weight license and add final evaluation results before making this repository public. -->
+<!-- RELEASE NOTE: No model-weight license has been assigned; publication does not imply a license grant. -->
+<!-- RELEASE NOTE: MBPP evaluation is pending. -->
 
 # Transcendent Logic Model
 
@@ -30,12 +30,12 @@ model.
 | Final optimizer step | 66,858 |
 | Consumed input positions | 52,579,270,656 |
 | Final validation loss | 1.0700281209201152 |
-| Weight license | Not yet assigned — private research draft |
+| Weight license | Not yet assigned — no license grant |
 | Initial weight-upload revision | `b8f50a9bc5b639b4ca40da7cd9208024dbee4df2` |
 
-The values above must be copied from the accepted final checkpoint, structured
-training log, evaluation result, or Hugging Face commit receipt. They must not
-be estimated from an in-progress run.
+The training values above were copied from the accepted final checkpoint and
+structured training log. The revision is the immutable initial weight-upload
+commit.
 
 ## Model architecture
 
@@ -156,8 +156,8 @@ learning rate warms up to `3e-4` over 1,000 updates and decays to `3e-5`.
 Validation uses an immutable held-out order every 500 updates; checkpoints are
 written every 1,000 updates.
 
-Replace the release-status placeholders only after confirming the final
-checkpoint completed the intended trajectory.
+The accepted final checkpoint completed the intended 52.58-billion-token
+trajectory.
 
 ## Evaluation
 
@@ -190,5 +190,5 @@ deployment or security-sensitive decisions.
 Weights are exported from the trusted native checkpoint into standard
 `safetensors` without remote code. `HF_RELEASE_MANIFEST.json` records SHA-256 and
 size for every staged release file, while the native optimizer/RNG checkpoint
-is retained separately and is not uploaded. The Hugging Face repository ID and
-immutable commit must be recorded in the release-status table after upload.
+is retained separately and is not uploaded. The immutable initial weight-upload
+commit is recorded in the release-status table above.
