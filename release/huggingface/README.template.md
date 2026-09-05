@@ -14,9 +14,9 @@ datasets:
 <!-- RELEASE_BLOCKER: Add a user-approved model-weight `license:` field to the YAML metadata before a public release. -->
 <!-- RELEASE_BLOCKER: Replace every {{PLACEHOLDER}} with evidence from the accepted final checkpoint and evaluation artifacts. -->
 
-# {{MODEL_NAME}}
+# Transcendent Logic Model
 
-`{{MODEL_NAME}}` is a 1,283,557,376-parameter decoder-only base language model
+**Transcendent Logic Model** is a 1,283,557,376-parameter decoder-only base language model
 trained from scratch for code completion and general text continuation. It is
 Llama-architecture compatible, but it does not contain or derive from Meta
 Llama weights. This is a pretrained base model, not an instruction-tuned chat
@@ -71,7 +71,7 @@ Use completion-style prompts and do not prepend a chat or instruction wrapper:
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model_id = "{{HUGGING_FACE_REPO_ID}}"
+model_id = "BosonicJustin/transcendent-logic-model"
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False)
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
